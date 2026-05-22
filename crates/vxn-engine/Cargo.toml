@@ -9,3 +9,10 @@ description = "VXN1 synth engine: parameters, voice allocation, and block render
 
 [dependencies]
 vxn-dsp = { workspace = true }
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "render"
+harness = false
