@@ -15,7 +15,12 @@ use vxn_dsp::{
 
 /// Everything a voice needs for one control block.
 pub struct BlockCtx {
-    pub sample_rate: f32,
+    /// Oversampled sample rate (`base_rate * oversample`). Oscillators and the
+    /// filter run at this rate; envelopes run at the base rate.
+    pub os_sample_rate: f32,
+    /// Oversampling factor (1, 2 or 4): the number of audio samples produced
+    /// per base-rate frame.
+    pub os: usize,
     pub osc1_wave: Waveform,
     pub osc2_wave: Waveform,
     pub osc1_level: f32,
@@ -133,7 +138,12 @@ impl Voice {
         (self.note as f32 - 60.0) / 12.0
     }
 
-    /// Render one control block, accumulating into `out` (mono).
+    /// Render one control block, accumulating into the oversampled `out` buffer
+    /// (mono, length = `base_frames * ctx.os`).
+    ///
+    /// Envelopes tick once per base frame; the oscillators and filter run at the
+    /// oversampled rate (`ctx.os` samples per base frame). The amp envelope is
+    /// held across the oversampled subframes (it is far slower than audio rate).
     pub fn render_block(&mut self, out: &mut [f32], ctx: &BlockCtx) {
         if !self.active {
             return;
@@ -142,6 +152,7 @@ impl Voice {
         let kf = self.key_follow();
         let lfo = ctx.lfo_val;
         let vel = self.velocity;
+        let os = ctx.os;
 
         // Block-start source vector (env levels sampled now). Order must match
         // ModSource: [Env1, Env2, Lfo, Velocity, KeyFollow].
@@ -153,36 +164,42 @@ impl Voice {
         let note = self.note as f32;
         let semis1 = ctx.base_semis + note + ctx.osc1_semi + pitch_mod;
         let semis2 = ctx.base_semis + note + ctx.osc2_semi + pitch_mod;
-        self.osc1.set_increment(note_to_hz(semis1) / ctx.sample_rate);
-        self.osc2.set_increment(note_to_hz(semis2) / ctx.sample_rate);
+        // Increments are relative to the oversampled rate.
+        self.osc1.set_increment(note_to_hz(semis1) / ctx.os_sample_rate);
+        self.osc2.set_increment(note_to_hz(semis2) / ctx.os_sample_rate);
         self.osc1.pulse_width = (ctx.osc1_pw + pwm_mod).clamp(0.05, 0.95);
         self.osc2.pulse_width = (ctx.osc2_pw + pwm_mod).clamp(0.05, 0.95);
 
-        // Cutoff modulation is in semitones above the base cutoff.
+        // Cutoff modulation is in semitones above the base cutoff; coeffs at the
+        // oversampled rate.
         let cutoff_hz = ctx.cutoff * fast_exp2(cutoff_mod / 12.0);
         self.ladder.set_coeffs(LadderCoeffs::new(
             cutoff_hz,
-            ctx.sample_rate,
+            ctx.os_sample_rate,
             ctx.resonance,
             ctx.drive,
             ctx.variant,
         ));
 
         let trig_at_start = std::mem::take(&mut self.trigger_pending);
+        let base_frames = out.len() / os;
 
-        for (i, slot) in out.iter_mut().enumerate() {
-            let trg = trig_at_start && i == 0;
-            let s1 = self.osc1.next(ctx.osc1_wave) * ctx.osc1_level;
-            let s2 = self.osc2.next(ctx.osc2_wave) * ctx.osc2_level;
-            let nz = self.noise.next(ctx.noise_color) * ctx.noise_level;
-            let filtered = self.ladder.tick(s1 + s2 + nz);
-
+        for base_i in 0..base_frames {
+            let trg = trig_at_start && base_i == 0;
             let e1 = self.env1.tick(trg, self.gate);
             let e2 = self.env2.tick(trg, self.gate);
-            // VCA gain = the Amp column of the matrix, summed per sample so the
-            // amp envelope is sample-smooth. ENV-2→Amp defaults to 1.0.
+            // VCA gain = the Amp column of the matrix; held across oversampled
+            // subframes. ENV-2→Amp defaults to 1.0.
             let amp = ctx.matrix.dest(ModDest::Amp, &[e1, e2, lfo, vel, kf]).max(0.0);
-            *slot += filtered * amp;
+
+            let frame = base_i * os;
+            for k in 0..os {
+                let s1 = self.osc1.next(ctx.osc1_wave) * ctx.osc1_level;
+                let s2 = self.osc2.next(ctx.osc2_wave) * ctx.osc2_level;
+                let nz = self.noise.next(ctx.noise_color) * ctx.noise_level;
+                let filtered = self.ladder.tick(s1 + s2 + nz);
+                out[frame + k] += filtered * amp;
+            }
         }
 
         // Free the voice once both envelopes have released and the gate is off.

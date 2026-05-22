@@ -89,10 +89,12 @@ pub enum ParamId {
     DelayFeedback,
     DelayMix,
     DelayPingPong,
+    // Quality
+    Oversample,
 }
 
 impl ParamId {
-    pub const COUNT: usize = ParamId::DelayPingPong as usize + 1;
+    pub const COUNT: usize = ParamId::Oversample as usize + 1;
 
     /// Index of the first modulation-matrix parameter (`Env1Pitch`).
     pub const MATRIX_BASE: usize = ParamId::Env1Pitch as usize;
@@ -170,6 +172,7 @@ const NOISE_LABELS: &[&str] = &["White", "Pink", "Brown"];
 const VARIANT_LABELS: &[&str] = &["Sharp", "Smooth"];
 const SHAPE_LABELS: &[&str] = &["Linear", "Exponential"];
 const LFO_LABELS: &[&str] = &["Sine", "Tri", "Saw+", "Saw-", "Square", "S&H"];
+const OVERSAMPLE_LABELS: &[&str] = &["Off", "2x", "4x"];
 
 #[allow(clippy::too_many_arguments)]
 const fn f(id: ParamId, name: &'static str, label: &'static str, min: f32, max: f32, default: f32, unit: &'static str, log: bool) -> ParamDesc {
@@ -264,6 +267,7 @@ pub static PARAMS: [ParamDesc; ParamId::COUNT] = {
         f(DelayFeedback, "delay_feedback", "Delay FB", 0.0, 0.95, 0.4, "", false),
         f(DelayMix, "delay_mix", "Delay Mix", 0.0, 1.0, 0.25, "", false),
         b(DelayPingPong, "delay_pingpong", "Ping-Pong", 1.0),
+        e(Oversample, "oversample", "Oversample", OVERSAMPLE_LABELS, 1.0),
     ]
 };
 
@@ -333,6 +337,15 @@ impl ParamValues {
 
     pub fn lfo_shape(&self) -> LfoShape {
         LfoShape::ALL[self.enum_index(ParamId::LfoShape, LfoShape::ALL.len() - 1)]
+    }
+
+    /// Oversampling factor for the synthesis path: 1 (Off), 2 or 4.
+    pub fn oversample_factor(&self) -> usize {
+        match self.enum_index(ParamId::Oversample, 2) {
+            0 => 1,
+            1 => 2,
+            _ => 4,
+        }
     }
 
     pub fn env1_shape(&self) -> AdsrShape {

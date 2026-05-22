@@ -11,7 +11,10 @@ pub mod voice;
 pub use modmatrix::{ModDest, ModMatrix, ModSource};
 pub use params::{PARAMS, ParamDesc, ParamId, ParamKind, ParamValues};
 
-use vxn_dsp::{AdsrShape, CONTROL_BLOCK, LfoCore, MAX_VOICES, StereoChorus, StereoDelay, note_to_hz};
+use vxn_dsp::{
+    AdsrShape, CONTROL_BLOCK, LfoCore, MAX_OVERSAMPLE, MAX_VOICES, Oversampler, StereoChorus,
+    StereoDelay, note_to_hz,
+};
 use voice::{BlockCtx, Voice};
 
 /// Snapshot of the envelope-shaping parameters. Used to skip recomputing ADSR
@@ -36,11 +39,15 @@ pub struct Synth {
     lfo: LfoCore,
     chorus: StereoChorus,
     delay: StereoDelay,
+    /// Anti-aliasing decimator for the oversampled synthesis path.
+    oversampler: Oversampler,
     /// Pitch bend in semitones (±2 by default range).
     bend_semis: f32,
     alloc_counter: u64,
     /// Last envelope params pushed to the voices; `None` forces a refresh.
     last_env: Option<EnvSnapshot>,
+    /// Oversampling factor in effect last block; a change resets the decimator.
+    last_os: usize,
 }
 
 impl Synth {
@@ -58,9 +65,11 @@ impl Synth {
             lfo: LfoCore::new(control_rate, 0x51A7),
             chorus: StereoChorus::new(sample_rate),
             delay: StereoDelay::new(sample_rate, 2.0),
+            oversampler: Oversampler::new(),
             bend_semis: 0.0,
             alloc_counter: 0,
             last_env: None,
+            last_os: 1,
         }
     }
 
@@ -75,6 +84,7 @@ impl Synth {
         self.lfo = LfoCore::new(sample_rate / CONTROL_BLOCK as f32, 0x51A7);
         self.chorus = StereoChorus::new(sample_rate);
         self.delay = StereoDelay::new(sample_rate, 2.0);
+        self.oversampler.reset();
         // Envelope cores were recreated with zeroed coefficients; force a refresh.
         self.last_env = None;
     }
@@ -125,6 +135,7 @@ impl Synth {
         self.chorus.clear();
         self.delay.clear();
         self.lfo.reset();
+        self.oversampler.reset();
     }
 
     /// Pick a voice: prefer a free one, else steal the oldest (lowest stamp).
@@ -155,18 +166,30 @@ impl Synth {
         // most once, and only when they actually changed.
         self.sync_envelopes();
 
+        // Oversampling factor for this call; a change resets the decimator.
+        let os = self.params.oversample_factor();
+        if os != self.last_os {
+            self.oversampler.reset();
+            self.last_os = os;
+        }
+
         let n = out_l.len().min(out_r.len());
         let mut start = 0;
         while start < n {
             let block = (n - start).min(CONTROL_BLOCK);
-            let ctx = self.build_ctx();
+            let ctx = self.build_ctx(os);
 
-            // Per-voice mono mix for this control block.
+            // Voices render into an oversampled mono mix, which is then decimated
+            // back to the base rate before the effects.
+            let mut mono_os = [0.0f32; CONTROL_BLOCK * MAX_OVERSAMPLE];
+            let mono_os = &mut mono_os[..block * os];
+            for v in &mut self.voices {
+                v.render_block(mono_os, &ctx);
+            }
+
             let mut mono = [0.0f32; CONTROL_BLOCK];
             let mono = &mut mono[..block];
-            for v in &mut self.voices {
-                v.render_block(mono, &ctx);
-            }
+            self.oversampler.decimate(mono_os, mono, os);
 
             // Effects (stereo), then write out.
             let chorus_on = self.params.bool(ParamId::ChorusOn);
@@ -237,7 +260,7 @@ impl Synth {
         );
     }
 
-    fn build_ctx(&mut self) -> BlockCtx {
+    fn build_ctx(&mut self, os: usize) -> BlockCtx {
         let p = &self.params;
         let lfo_val = self.lfo.next(p.lfo_shape());
         self.lfo.set_rate(p.get(ParamId::LfoRate));
@@ -251,7 +274,8 @@ impl Synth {
         }
 
         BlockCtx {
-            sample_rate: self.sample_rate,
+            os_sample_rate: self.sample_rate * os as f32,
+            os,
             osc1_wave: p.osc_wave(ParamId::Osc1Wave),
             osc2_wave: p.osc_wave(ParamId::Osc2Wave),
             osc1_level: p.get(ParamId::Osc1Level),

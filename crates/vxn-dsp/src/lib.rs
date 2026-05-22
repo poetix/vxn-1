@@ -21,6 +21,7 @@
 pub mod adsr;
 pub mod chorus;
 pub mod delay;
+pub mod halfband;
 pub mod ladder;
 pub mod lfo;
 pub mod math;
@@ -33,6 +34,10 @@ pub mod smoothing;
 /// compiler can unroll/vectorise voice loops.
 pub const MAX_VOICES: usize = 16;
 
+/// Maximum oversampling factor for the synthesis path. Bounds the size of the
+/// oversampled scratch buffer (`CONTROL_BLOCK * MAX_OVERSAMPLE`).
+pub const MAX_OVERSAMPLE: usize = 4;
+
 /// Engine control-block size in samples. Modulation and coefficients are
 /// recomputed once per block; the per-sample inner loop runs this many times.
 /// 32 @ 48 kHz ≈ 0.67 ms — well below any audible zipper threshold for the
@@ -42,6 +47,7 @@ pub const CONTROL_BLOCK: usize = 32;
 pub use adsr::{AdsrCore, AdsrShape, AdsrStage};
 pub use chorus::StereoChorus;
 pub use delay::{DelayLine, StereoDelay};
+pub use halfband::{HalfbandFir, Oversampler};
 pub use ladder::{LadderCoeffs, LadderKernel, LadderVariant};
 pub use lfo::{LfoCore, LfoShape};
 pub use math::{fast_exp2, fast_sine, fast_tanh, lookup_sine};

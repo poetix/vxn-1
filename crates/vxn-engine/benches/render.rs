@@ -14,11 +14,12 @@ const SR: f32 = 48_000.0;
 const FRAMES: usize = 512;
 
 /// Build a synth with 16 voices held at sustain. `fx` toggles chorus + delay;
-/// `res` sets filter resonance (high resonance exercises the ladder hardest).
-fn setup(fx: bool, res: f32) -> Synth {
+/// `res` sets filter resonance; `os` is the oversampling factor (1/2/4).
+fn setup(fx: bool, res: f32, os: f32) -> Synth {
     let mut s = Synth::new(SR);
     s.set_param(ParamId::ChorusOn.index(), if fx { 1.0 } else { 0.0 });
     s.set_param(ParamId::DelayOn.index(), if fx { 1.0 } else { 0.0 });
+    s.set_param(ParamId::Oversample.index(), os);
     s.set_param(ParamId::Resonance.index(), res);
     s.set_param(ParamId::NoiseLevel.index(), 0.2);
     // Route ENV-1 -> cutoff and LFO -> pitch so the matrix is doing real work.
@@ -42,12 +43,15 @@ fn bench(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
     group.sample_size(60);
 
-    for (name, fx, res) in [
-        ("dry_lowres", false, 0.2),
-        ("dry_selfosc", false, 1.0),
-        ("with_fx", true, 0.2),
+    // os param value: 0.0=Off(1x), 1.0=2x, 2.0=4x.
+    for (name, fx, res, os) in [
+        ("dry_1x", false, 0.2, 0.0),
+        ("dry_2x", false, 0.2, 1.0),
+        ("dry_4x", false, 0.2, 2.0),
+        ("selfosc_4x", false, 1.0, 2.0),
+        ("with_fx_2x", true, 0.2, 1.0),
     ] {
-        let mut s = setup(fx, res);
+        let mut s = setup(fx, res, os);
         let mut l = vec![0.0; FRAMES];
         let mut r = vec![0.0; FRAMES];
         group.bench_function(name, |b| {
