@@ -1,0 +1,26 @@
+[package]
+name = "vxn-clap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "VXN1 CLAP plugin shell (clack)."
+
+[lib]
+# cdylib for the host-loadable plugin; rlib so integration tests can link it.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+vxn-engine = { workspace = true }
+clack-plugin = { workspace = true }
+clack-extensions = { workspace = true, features = [
+    "audio-ports",
+    "note-ports",
+    "params",
+    "state",
+    "clack-plugin",
+] }
+
+[dev-dependencies]
+clack-host = { git = "https://github.com/prokopyl/clack", rev = "f874e858ad576c601367b3038af5088a4e671744" }

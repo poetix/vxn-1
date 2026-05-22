@@ -1,0 +1,11 @@
+[package]
+name = "vxn-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+description = "VXN1 synth engine: parameters, voice allocation, and block rendering."
+
+[dependencies]
+vxn-dsp = { workspace = true }

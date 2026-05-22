@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vxn-dsp",
+    "crates/vxn-engine",
+    "crates/vxn-clap",
+    "xtask",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Vulpus Labs"]
+rust-version = "1.85"
+
+[workspace.dependencies]
+vxn-dsp = { path = "crates/vxn-dsp" }
+vxn-engine = { path = "crates/vxn-engine" }
+
+# clack — pinned to a known-good main commit (no compatible crates.io release of
+# this API yet). baseview/vizia for the UI are pinned in vxn-ui when added.
+clack-plugin = { git = "https://github.com/prokopyl/clack", rev = "f874e858ad576c601367b3038af5088a4e671744" }
+clack-extensions = { git = "https://github.com/prokopyl/clack", rev = "f874e858ad576c601367b3038af5088a4e671744" }
+
+# Release profile tuned for real-time audio DSP.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"   # ADR-style: plugins must unwind, never abort.
