@@ -7,11 +7,15 @@
 //! Values are stored as `f32` in *plain* units (Hz, seconds, semitones, …),
 //! matching CLAP's plain-value convention. Enum/bool params store the variant
 //! index / 0.0|1.0 and are read back through typed accessors.
+//!
+//! The 20 modulation-depth params (`Env1Pitch` … `KeyPwm`) are laid out
+//! source-major, destination-minor so the engine can address them by
+//! `MATRIX_BASE + source*ModDest::COUNT + dest` (see [`crate::modmatrix`]).
 
-use vxn_dsp::{LadderVariant, LfoShape, NoiseColor, Waveform};
+use crate::modmatrix::{ModDest, ModSource};
+use vxn_dsp::{AdsrShape, LadderVariant, LfoShape, NoiseColor, Waveform};
 
 /// Stable parameter identifiers. Discriminant = CLAP param id = table index.
-/// Append-only: never reorder or remove (would break saved automation).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(usize)]
 pub enum ParamId {
@@ -35,25 +39,42 @@ pub enum ParamId {
     Resonance,
     Drive,
     FilterVariant,
-    // Amplitude envelope
-    AmpAttack,
-    AmpDecay,
-    AmpSustain,
-    AmpRelease,
-    AmpShape,
-    // Pitch (frequency) envelope
-    PitchAttack,
-    PitchDecay,
-    PitchSustain,
-    PitchRelease,
-    PitchShape,
-    PitchEnvAmount,
+    // Envelope 1 (assignable — defaults unrouted)
+    Env1Attack,
+    Env1Decay,
+    Env1Sustain,
+    Env1Release,
+    Env1Shape,
+    // Envelope 2 (defaults to the VCA amp envelope)
+    Env2Attack,
+    Env2Decay,
+    Env2Sustain,
+    Env2Release,
+    Env2Shape,
+    // ── Modulation matrix: source-major, dest-minor (Pitch, Cutoff, Amp, Pwm) ──
+    Env1Pitch,
+    Env1Cutoff,
+    Env1Amp,
+    Env1Pwm,
+    Env2Pitch,
+    Env2Cutoff,
+    Env2Amp,
+    Env2Pwm,
+    LfoPitch,
+    LfoCutoff,
+    LfoAmp,
+    LfoPwm,
+    VelPitch,
+    VelCutoff,
+    VelAmp,
+    VelPwm,
+    KeyPitch,
+    KeyCutoff,
+    KeyAmp,
+    KeyPwm,
     // LFO
     LfoShape,
     LfoRate,
-    LfoToAmp,
-    LfoToBaseFreq,
-    LfoToPitch,
     // Global
     MasterTune,
     MasterVolume,
@@ -71,10 +92,11 @@ pub enum ParamId {
 }
 
 impl ParamId {
-    /// Total parameter count.
     pub const COUNT: usize = ParamId::DelayPingPong as usize + 1;
 
-    /// All ids in table order.
+    /// Index of the first modulation-matrix parameter (`Env1Pitch`).
+    pub const MATRIX_BASE: usize = ParamId::Env1Pitch as usize;
+
     pub fn all() -> impl Iterator<Item = ParamId> {
         (0..Self::COUNT).map(|i| Self::from_index(i).unwrap())
     }
@@ -86,11 +108,16 @@ impl ParamId {
 
     pub fn from_index(i: usize) -> Option<ParamId> {
         if i < Self::COUNT {
-            // Safe: ParamId is repr(usize), contiguous 0..COUNT.
             Some(unsafe { std::mem::transmute::<usize, ParamId>(i) })
         } else {
             None
         }
+    }
+
+    /// Table index of the depth param for a `(source, destination)` route.
+    #[inline]
+    pub fn matrix_index(src: ModSource, dest: ModDest) -> usize {
+        Self::MATRIX_BASE + (src as usize) * ModDest::COUNT + (dest as usize)
     }
 
     pub fn desc(self) -> &'static ParamDesc {
@@ -98,25 +125,18 @@ impl ParamId {
     }
 }
 
-/// Parameter value kind, with the metadata the UI/host need.
 #[derive(Clone, Copy, Debug)]
 pub enum ParamKind {
-    /// Continuous. `log` requests logarithmic mapping in the UI (e.g. cutoff).
     Float { unit: &'static str, log: bool },
-    /// Integer steps (inclusive range).
     Int { unit: &'static str },
     Bool,
-    /// Enumerated choice; `variants` are the display labels.
     Enum { variants: &'static [&'static str] },
 }
 
-/// Static description of one parameter.
 #[derive(Clone, Copy, Debug)]
 pub struct ParamDesc {
     pub id: ParamId,
-    /// Stable machine name (for state save/restore by name).
     pub name: &'static str,
-    /// Human label for the UI.
     pub label: &'static str,
     pub min: f32,
     pub max: f32,
@@ -130,7 +150,6 @@ impl ParamDesc {
         v.clamp(self.min, self.max)
     }
 
-    /// Plain value → normalised `[0, 1]` (linear; log mapping is a UI concern).
     #[inline]
     pub fn to_normalized(&self, v: f32) -> f32 {
         if self.max > self.min {
@@ -140,7 +159,6 @@ impl ParamDesc {
         }
     }
 
-    /// Normalised `[0, 1]` → plain value.
     #[inline]
     pub fn from_normalized(&self, n: f32) -> f32 {
         self.min + n.clamp(0.0, 1.0) * (self.max - self.min)
@@ -166,8 +184,23 @@ const fn b(id: ParamId, name: &'static str, label: &'static str, default: f32) -
 const fn i(id: ParamId, name: &'static str, label: &'static str, min: f32, max: f32, default: f32, unit: &'static str) -> ParamDesc {
     ParamDesc { id, name, label, min, max, default, kind: ParamKind::Int { unit } }
 }
+/// Pitch-destination depth param (semitones).
+const fn mp(id: ParamId, name: &'static str, label: &'static str) -> ParamDesc {
+    f(id, name, label, -48.0, 48.0, 0.0, "st", false)
+}
+/// Cutoff-destination depth param (semitones of cutoff).
+const fn mc(id: ParamId, name: &'static str, label: &'static str) -> ParamDesc {
+    f(id, name, label, -96.0, 96.0, 0.0, "st", false)
+}
+/// Amp-destination depth param (gain). `default` lets ENV-2→Amp seed to 1.0.
+const fn ma(id: ParamId, name: &'static str, label: &'static str, default: f32) -> ParamDesc {
+    f(id, name, label, -1.0, 1.0, default, "", false)
+}
+/// PWM-destination depth param (pulse-width fraction).
+const fn mw(id: ParamId, name: &'static str, label: &'static str) -> ParamDesc {
+    f(id, name, label, -0.5, 0.5, 0.0, "", false)
+}
 
-/// The full parameter table. Order must match [`ParamId`] discriminants.
 pub static PARAMS: [ParamDesc; ParamId::COUNT] = {
     use ParamId::*;
     [
@@ -187,22 +220,39 @@ pub static PARAMS: [ParamDesc; ParamId::COUNT] = {
         f(Resonance, "resonance", "Resonance", 0.0, 1.0, 0.2, "", false),
         f(Drive, "drive", "Drive", 0.1, 4.0, 1.0, "", false),
         e(FilterVariant, "filter_variant", "Filter Type", VARIANT_LABELS, 0.0),
-        f(AmpAttack, "amp_attack", "Amp Attack", 0.001, 10.0, 0.005, "s", true),
-        f(AmpDecay, "amp_decay", "Amp Decay", 0.001, 10.0, 0.2, "s", true),
-        f(AmpSustain, "amp_sustain", "Amp Sustain", 0.0, 1.0, 0.8, "", false),
-        f(AmpRelease, "amp_release", "Amp Release", 0.001, 10.0, 0.3, "s", true),
-        e(AmpShape, "amp_shape", "Amp Shape", SHAPE_LABELS, 1.0),
-        f(PitchAttack, "pitch_attack", "Pitch Attack", 0.001, 10.0, 0.005, "s", true),
-        f(PitchDecay, "pitch_decay", "Pitch Decay", 0.001, 10.0, 0.2, "s", true),
-        f(PitchSustain, "pitch_sustain", "Pitch Sustain", 0.0, 1.0, 0.0, "", false),
-        f(PitchRelease, "pitch_release", "Pitch Release", 0.001, 10.0, 0.3, "s", true),
-        e(PitchShape, "pitch_shape", "Pitch Shape", SHAPE_LABELS, 0.0),
-        f(PitchEnvAmount, "pitch_env_amt", "Pitch Env Amt", -48.0, 48.0, 0.0, "st", false),
+        f(Env1Attack, "env1_attack", "Env 1 Attack", 0.001, 10.0, 0.005, "s", true),
+        f(Env1Decay, "env1_decay", "Env 1 Decay", 0.001, 10.0, 0.3, "s", true),
+        f(Env1Sustain, "env1_sustain", "Env 1 Sustain", 0.0, 1.0, 0.0, "", false),
+        f(Env1Release, "env1_release", "Env 1 Release", 0.001, 10.0, 0.3, "s", true),
+        e(Env1Shape, "env1_shape", "Env 1 Shape", SHAPE_LABELS, 0.0),
+        f(Env2Attack, "env2_attack", "Env 2 Attack", 0.001, 10.0, 0.005, "s", true),
+        f(Env2Decay, "env2_decay", "Env 2 Decay", 0.001, 10.0, 0.2, "s", true),
+        f(Env2Sustain, "env2_sustain", "Env 2 Sustain", 0.0, 1.0, 0.8, "", false),
+        f(Env2Release, "env2_release", "Env 2 Release", 0.001, 10.0, 0.3, "s", true),
+        e(Env2Shape, "env2_shape", "Env 2 Shape", SHAPE_LABELS, 1.0),
+        // Modulation matrix (source-major, dest-minor). ENV-2→Amp seeds to 1.0.
+        mp(Env1Pitch, "env1_pitch", "Env1→Pitch"),
+        mc(Env1Cutoff, "env1_cutoff", "Env1→Cutoff"),
+        ma(Env1Amp, "env1_amp", "Env1→Amp", 0.0),
+        mw(Env1Pwm, "env1_pwm", "Env1→PWM"),
+        mp(Env2Pitch, "env2_pitch", "Env2→Pitch"),
+        mc(Env2Cutoff, "env2_cutoff", "Env2→Cutoff"),
+        ma(Env2Amp, "env2_amp", "Env2→Amp", 1.0),
+        mw(Env2Pwm, "env2_pwm", "Env2→PWM"),
+        mp(LfoPitch, "lfo_pitch", "LFO→Pitch"),
+        mc(LfoCutoff, "lfo_cutoff", "LFO→Cutoff"),
+        ma(LfoAmp, "lfo_amp", "LFO→Amp", 0.0),
+        mw(LfoPwm, "lfo_pwm", "LFO→PWM"),
+        mp(VelPitch, "vel_pitch", "Vel→Pitch"),
+        mc(VelCutoff, "vel_cutoff", "Vel→Cutoff"),
+        ma(VelAmp, "vel_amp", "Vel→Amp", 0.0),
+        mw(VelPwm, "vel_pwm", "Vel→PWM"),
+        mp(KeyPitch, "key_pitch", "Key→Pitch"),
+        mc(KeyCutoff, "key_cutoff", "Key→Cutoff"),
+        ma(KeyAmp, "key_amp", "Key→Amp", 0.0),
+        mw(KeyPwm, "key_pwm", "Key→PWM"),
         e(LfoShape, "lfo_shape", "LFO Shape", LFO_LABELS, 0.0),
         f(LfoRate, "lfo_rate", "LFO Rate", 0.01, 40.0, 5.0, "Hz", true),
-        f(LfoToAmp, "lfo_to_amp", "LFO→Amp", 0.0, 1.0, 0.0, "", false),
-        f(LfoToBaseFreq, "lfo_to_basefreq", "LFO→Freq", 0.0, 12.0, 0.0, "st", false),
-        f(LfoToPitch, "lfo_to_pitch", "LFO→Pitch", 0.0, 12.0, 0.0, "st", false),
         f(MasterTune, "master_tune", "Master Tune", -12.0, 12.0, 0.0, "st", false),
         f(MasterVolume, "master_volume", "Volume", 0.0, 1.0, 0.7, "", false),
         b(ChorusOn, "chorus_on", "Chorus", 1.0),
@@ -217,7 +267,6 @@ pub static PARAMS: [ParamDesc; ParamId::COUNT] = {
     ]
 };
 
-/// Live parameter values in plain units. Cheap to clone (one array).
 #[derive(Clone)]
 pub struct ParamValues {
     v: [f32; ParamId::COUNT],
@@ -237,6 +286,11 @@ impl ParamValues {
     #[inline]
     pub fn get(&self, id: ParamId) -> f32 {
         self.v[id.index()]
+    }
+
+    #[inline]
+    pub fn get_index(&self, index: usize) -> f32 {
+        self.v[index]
     }
 
     #[inline]
@@ -281,19 +335,19 @@ impl ParamValues {
         LfoShape::ALL[self.enum_index(ParamId::LfoShape, LfoShape::ALL.len() - 1)]
     }
 
-    pub fn amp_shape(&self) -> vxn_dsp::AdsrShape {
-        self.adsr_shape(ParamId::AmpShape)
+    pub fn env1_shape(&self) -> AdsrShape {
+        self.adsr_shape(ParamId::Env1Shape)
     }
 
-    pub fn pitch_shape(&self) -> vxn_dsp::AdsrShape {
-        self.adsr_shape(ParamId::PitchShape)
+    pub fn env2_shape(&self) -> AdsrShape {
+        self.adsr_shape(ParamId::Env2Shape)
     }
 
-    fn adsr_shape(&self, id: ParamId) -> vxn_dsp::AdsrShape {
+    fn adsr_shape(&self, id: ParamId) -> AdsrShape {
         if self.enum_index(id, 1) == 0 {
-            vxn_dsp::AdsrShape::Linear
+            AdsrShape::Linear
         } else {
-            vxn_dsp::AdsrShape::Exponential
+            AdsrShape::Exponential
         }
     }
 }
@@ -330,5 +384,17 @@ mod tests {
             let val = p.get(id);
             assert!(val >= d.min && val <= d.max, "{} default OOR", d.name);
         }
+    }
+
+    #[test]
+    fn matrix_layout_is_contiguous_and_ordered() {
+        // The 20 matrix params must sit at MATRIX_BASE in source-major,
+        // dest-minor order so matrix_index() addresses them correctly.
+        assert_eq!(ParamId::MATRIX_BASE, ParamId::Env1Pitch.index());
+        assert_eq!(ParamId::matrix_index(ModSource::Env2, ModDest::Amp), ParamId::Env2Amp.index());
+        assert_eq!(ParamId::matrix_index(ModSource::KeyFollow, ModDest::Pwm), ParamId::KeyPwm.index());
+        assert_eq!(ParamId::matrix_index(ModSource::Lfo, ModDest::Cutoff), ParamId::LfoCutoff.index());
+        // ENV-2→Amp is the only route that defaults non-zero.
+        assert_eq!(ParamValues::default().get(ParamId::Env2Amp), 1.0);
     }
 }

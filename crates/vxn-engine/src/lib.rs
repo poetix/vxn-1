@@ -4,10 +4,12 @@
 //! in fixed control blocks. The CLAP layer drives it with note/param events
 //! and contiguous output slices; the UI reads and writes [`ParamValues`].
 
+pub mod modmatrix;
 pub mod params;
 pub mod voice;
 
-pub use params::{ParamDesc, ParamId, ParamKind, ParamValues, PARAMS};
+pub use modmatrix::{ModDest, ModMatrix, ModSource};
+pub use params::{PARAMS, ParamDesc, ParamId, ParamKind, ParamValues};
 
 use vxn_dsp::{CONTROL_BLOCK, LfoCore, MAX_VOICES, StereoChorus, StereoDelay, note_to_hz};
 use voice::{BlockCtx, Voice};
@@ -192,9 +194,13 @@ impl Synth {
         let lfo_val = self.lfo.next(p.lfo_shape());
         self.lfo.set_rate(p.get(ParamId::LfoRate));
 
-        let lfo_pitch_semis =
-            lfo_val * (p.get(ParamId::LfoToBaseFreq) + p.get(ParamId::LfoToPitch));
-        let amp_mod = (1.0 + lfo_val * p.get(ParamId::LfoToAmp)).max(0.0);
+        // Pull the 20 depth params into the matrix (source-major, dest-minor).
+        let mut matrix = ModMatrix::new();
+        for (s, row) in matrix.depth.iter_mut().enumerate() {
+            for (d, cell) in row.iter_mut().enumerate() {
+                *cell = p.get_index(ParamId::MATRIX_BASE + s * ModDest::COUNT + d);
+            }
+        }
 
         BlockCtx {
             sample_rate: self.sample_rate,
@@ -212,24 +218,23 @@ impl Synth {
             resonance: p.get(ParamId::Resonance),
             drive: p.get(ParamId::Drive),
             variant: p.filter_variant(),
-            pitch_env_amt: p.get(ParamId::PitchEnvAmount),
-            lfo_pitch_semis,
-            amp_mod,
             base_semis: p.get(ParamId::MasterTune) + self.bend_semis,
-            amp_adsr: (
-                p.get(ParamId::AmpAttack),
-                p.get(ParamId::AmpDecay),
-                p.get(ParamId::AmpSustain),
-                p.get(ParamId::AmpRelease),
+            env1_adsr: (
+                p.get(ParamId::Env1Attack),
+                p.get(ParamId::Env1Decay),
+                p.get(ParamId::Env1Sustain),
+                p.get(ParamId::Env1Release),
             ),
-            amp_shape: p.amp_shape(),
-            pitch_adsr: (
-                p.get(ParamId::PitchAttack),
-                p.get(ParamId::PitchDecay),
-                p.get(ParamId::PitchSustain),
-                p.get(ParamId::PitchRelease),
+            env1_shape: p.env1_shape(),
+            env2_adsr: (
+                p.get(ParamId::Env2Attack),
+                p.get(ParamId::Env2Decay),
+                p.get(ParamId::Env2Sustain),
+                p.get(ParamId::Env2Release),
             ),
-            pitch_shape: p.pitch_shape(),
+            env2_shape: p.env2_shape(),
+            lfo_val,
+            matrix,
         }
     }
 }
@@ -269,9 +274,9 @@ mod tests {
     #[test]
     fn note_produces_sound_then_releases_to_silence() {
         let mut s = Synth::new(48_000.0);
-        // Fast envelope so the test is short.
-        s.set_param(ParamId::AmpAttack.index(), 0.001);
-        s.set_param(ParamId::AmpRelease.index(), 0.01);
+        // Fast amp envelope (ENV-2 drives the VCA by default) so the test is short.
+        s.set_param(ParamId::Env2Attack.index(), 0.001);
+        s.set_param(ParamId::Env2Release.index(), 0.01);
         s.set_param(ParamId::ChorusOn.index(), 0.0);
         s.note_on(69, 1.0);
         let (l, _) = render(&mut s, 4800);
@@ -297,6 +302,18 @@ mod tests {
         assert!(l.iter().chain(r.iter()).all(|x| x.is_finite()), "non-finite output");
         let peak = l.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
         assert!(peak < 20.0, "output blew up: peak {peak}");
+    }
+
+    #[test]
+    fn vca_is_driven_by_env2_to_amp_route() {
+        // Zeroing the ENV-2→Amp route should silence the voice even while held,
+        // proving the VCA gain comes from the modulation matrix.
+        let mut s = Synth::new(48_000.0);
+        s.set_param(ParamId::ChorusOn.index(), 0.0);
+        s.set_param(ParamId::Env2Amp.index(), 0.0);
+        s.note_on(69, 1.0);
+        let (l, _) = render(&mut s, 4800);
+        assert!(rms(&l) < 1e-6, "Env2→Amp=0 should be silent, got {}", rms(&l));
     }
 
     #[test]
