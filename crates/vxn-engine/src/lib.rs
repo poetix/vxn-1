@@ -219,9 +219,13 @@ impl Synth {
 
     /// Start a note on a specific layer. [`Self::note_on`] calls this per the
     /// key-mode routing policy; exposed for tests and future per-layer drivers.
+    /// The assign mode (Poly/Unison) is read live from the layer's param source
+    /// (ADR 0003 §4) so it always reflects the current patch.
     pub fn note_on_layer(&mut self, layer: usize, note: u8, velocity: f32) {
         self.alloc_counter += 1;
-        self.banks[layer].note_on(note, velocity, self.alloc_counter);
+        let src = Self::param_source(layer, self.key_mode);
+        let mode = self.params.layer(src).assign_mode();
+        self.banks[layer].note_on(mode, note, velocity, self.alloc_counter);
     }
 
     pub fn note_off(&mut self, note: u8) {
@@ -1043,6 +1047,61 @@ mod tests {
         assert_eq!(s.active_count(), 1);
         let (l, _) = render(&mut s, 2400);
         assert!(rms(&l) > 0.001, "held note went silent across the change");
+    }
+
+    // ── E003 / 0010: per-layer assign-mode processor (poly) ─────────────────
+
+    #[test]
+    fn poly_layer_holds_eight_then_steals_oldest() {
+        // Dual so each note hits both layers; one layer's allocation is confined
+        // to its 8 channels and the 9th note steals (never exceeds 8).
+        let mut s = Synth::new(48_000.0);
+        s.set_key_mode(KeyMode::Dual);
+        for n in 60..68 {
+            s.note_on(n, 1.0); // 8 distinct notes
+        }
+        assert_eq!(layer_active(&s, 0), 8, "layer A should be full at 8");
+        assert_eq!(layer_active(&s, 1), 8, "layer B should be full at 8");
+        // 9th note steals rather than growing the layer past its 8 channels.
+        s.note_on(68, 1.0);
+        assert_eq!(layer_active(&s, 0), 8, "layer A must stay bounded to 8");
+        assert_eq!(layer_active(&s, 1), 8, "layer B must stay bounded to 8");
+    }
+
+    #[test]
+    fn layer_allocation_is_independent() {
+        // Split: low notes → Lower, high → Upper. Flooding one layer never
+        // touches the other's channels (independent per-layer allocation).
+        let mut s = Synth::new(48_000.0);
+        s.set_key_mode(KeyMode::Split);
+        s.set_split_point(60);
+        for n in 36..50 {
+            s.note_on(n, 1.0); // all below split → Lower only
+        }
+        assert_eq!(
+            layer_active(&s, Layer::Lower as usize),
+            8,
+            "Lower bounded to 8"
+        );
+        assert_eq!(
+            layer_active(&s, Layer::Upper as usize),
+            0,
+            "Upper untouched by Lower's flood"
+        );
+    }
+
+    #[test]
+    fn assign_mode_param_reads_unison() {
+        let mut p = ParamValues::default();
+        assert_eq!(
+            p.layer(Layer::Upper).assign_mode(),
+            crate::params::AssignMode::Poly
+        );
+        p.layer_mut(Layer::Upper).set(PatchParam::AssignMode, 1.0);
+        assert_eq!(
+            p.layer(Layer::Upper).assign_mode(),
+            crate::params::AssignMode::Unison
+        );
     }
 
     #[test]

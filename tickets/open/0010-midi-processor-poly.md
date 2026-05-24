@@ -16,18 +16,18 @@ allocator, scoped to a layer's 8 channels) and establishes the seam that unison
 
 ## Acceptance criteria
 
-- [ ] A per-layer processor type owns the layer's note→channel allocation.
+- [x] A per-layer processor type owns the layer's note→channel allocation.
       Poly mode = first-free / oldest-steal across the layer's **8** channels
       (port the current `allocate` logic, bounded to `CHANNELS_PER_LAYER`).
-- [ ] New per-patch param `AssignMode` (enum; at least `Poly` now, with
+- [x] New per-patch param `AssignMode` (enum; at least `Poly` now, with
       `Unison` reserved for 0011), appended within the per-patch block (0007).
-- [ ] The processor exposes a clean interface (`note_on` / `note_off` →
+- [x] The processor exposes a clean interface (`note_on` / `note_off` →
       channel(s)) so 0011/0012 add behaviour without touching the router (0009)
       or render (0008). Document an arpeggiation hook (stream transform before
       allocation) without implementing it.
-- [ ] Per-layer allocation is independent: layer A stealing a channel never
+- [x] Per-layer allocation is independent: layer A stealing a channel never
       affects layer B.
-- [ ] Tests: a layer plays up to 8 simultaneous notes then steals oldest;
+- [x] Tests: a layer plays up to 8 simultaneous notes then steals oldest;
       allocation is confined to the layer's channel range; behaviour matches the
       pre-refactor single-pool allocator when only one layer is active.
 

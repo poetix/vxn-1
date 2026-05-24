@@ -15,6 +15,7 @@ use vxn_dsp::{
 };
 
 use crate::modmatrix::{ModDest, ModMatrix, ModSource};
+use crate::params::AssignMode;
 
 /// One [`VoiceBank`] is a single layer: its channels render together as a
 /// homogeneous group (ADR 0003 §10).
@@ -129,6 +130,9 @@ pub struct VoiceBank {
     active: [bool; N],
     trigger_pending: [bool; N],
     alloc_tick: [u64; N],
+    /// Per-channel detune (cents), added to both oscillators. Zero for Poly;
+    /// the Unison assign mode (0011) spreads channels with it.
+    detune_cents: [f32; N],
     /// LFO modulation fade-in after note-on (`ctx.lfo_delay`).
     lfo_fade: LfoFadeIn,
 }
@@ -151,6 +155,7 @@ impl VoiceBank {
             active: [false; N],
             trigger_pending: [false; N],
             alloc_tick: [0; N],
+            detune_cents: [0.0; N],
             lfo_fade: LfoFadeIn::new(),
         }
     }
@@ -175,6 +180,7 @@ impl VoiceBank {
         }
         self.active = [false; N];
         self.gate = [false; N];
+        self.detune_cents = [0.0; N];
         self.lfo_fade.reset();
     }
 
@@ -201,16 +207,41 @@ impl VoiceBank {
         }
     }
 
-    /// Start a note. Phases reset (DCO behaviour); envelopes retrigger from
-    /// their current level.
-    pub fn note_on(&mut self, note: u8, velocity: f32, alloc_tick: u64) {
-        let v = self.allocate(note);
+    /// Start a note under assign mode `mode` — the per-layer MIDI processor seam
+    /// (ADR 0003 §4). **Poly** allocates one channel (first-free / oldest-steal
+    /// across the layer's 8). **Unison** stacks the note across all channels with
+    /// per-channel detune (0011 fills the spread; here it stacks undetuned).
+    /// Phases reset (DCO behaviour); envelopes retrigger from their current level.
+    ///
+    /// Arp hook (deferred, ADR 0003 §4): a future arpeggiator is a *stream
+    /// transform before allocation* — it would turn held notes into a timed
+    /// sequence and feed each step here as an ordinary `note_on`, so neither the
+    /// event router (0009) nor the render path (0008) changes.
+    pub fn note_on(&mut self, mode: AssignMode, note: u8, velocity: f32, alloc_tick: u64) {
+        match mode {
+            AssignMode::Poly => {
+                let v = self.allocate(note);
+                self.trigger(v, note, velocity, alloc_tick, 0.0);
+            }
+            AssignMode::Unison => {
+                for v in 0..N {
+                    self.trigger(v, note, velocity, alloc_tick, unison_detune_cents(v));
+                }
+            }
+        }
+    }
+
+    /// Trigger a specific channel: the lowest level of the assign seam. Poly hits
+    /// one channel, Unison hits all; both route through here so per-channel state
+    /// (gate, detune, phase reset) is set in exactly one place.
+    fn trigger(&mut self, v: usize, note: u8, velocity: f32, alloc_tick: u64, detune_cents: f32) {
         self.note[v] = note;
         self.velocity[v] = velocity;
         self.gate[v] = true;
         self.active[v] = true;
         self.trigger_pending[v] = true;
         self.alloc_tick[v] = alloc_tick;
+        self.detune_cents[v] = detune_cents;
         self.lfo_fade.retrigger(v);
         self.osc1.reset(v);
         self.osc2.reset(v);
@@ -288,8 +319,9 @@ impl VoiceBank {
             let pwm_mod = ctx.matrix.dest(ModDest::Pwm, &srcs);
 
             let nf = self.note[v] as f32;
-            let s1 = ctx.base_semis + nf + ctx.osc1_semi + pitch_mod;
-            let s2 = ctx.base_semis + nf + ctx.osc2_semi + pitch_mod;
+            let detune = self.detune_cents[v] * 0.01; // cents → semitones (Unison)
+            let s1 = ctx.base_semis + nf + ctx.osc1_semi + pitch_mod + detune;
+            let s2 = ctx.base_semis + nf + ctx.osc2_semi + pitch_mod + detune;
             self.osc1.inc[v] = note_to_hz(s1) / ctx.os_sample_rate;
             self.osc2.inc[v] = note_to_hz(s2) / ctx.os_sample_rate;
             pw1[v] = (ctx.osc1_pw + pwm_mod).clamp(0.05, 0.95);
@@ -412,4 +444,11 @@ impl VoiceBank {
 #[inline]
 fn key_follow(note: u8) -> f32 {
     (note as f32 - 60.0) / 12.0
+}
+
+/// Per-channel detune (cents) for Unison. **0010 placeholder**: stacks the
+/// channels with no detune; the symmetric detune spread is ticket 0011.
+#[inline]
+fn unison_detune_cents(_channel: usize) -> f32 {
+    0.0
 }

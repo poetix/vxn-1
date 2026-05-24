@@ -89,6 +89,28 @@ impl KeyMode {
 /// Default split point (MIDI note) when none has been set — middle C.
 pub const DEFAULT_SPLIT_POINT: u8 = 60;
 
+/// Per-layer voice-assignment mode (ADR 0003 §4): how one logical note maps to
+/// the layer's 8 channels. The per-layer MIDI processor (0010) implements it;
+/// unison (0011) stacks all channels with detune, portamento (0012) glides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[repr(usize)]
+pub enum AssignMode {
+    /// First-free / oldest-steal across the layer's 8 channels (today's poly).
+    #[default]
+    Poly,
+    /// One note stacked across all 8 channels with per-channel detune (0011).
+    Unison,
+}
+
+impl AssignMode {
+    pub fn from_index(i: usize) -> AssignMode {
+        match i {
+            1 => AssignMode::Unison,
+            _ => AssignMode::Poly,
+        }
+    }
+}
+
 /// Per-patch parameter ids. Discriminant = index into the per-patch block (and
 /// into [`PATCH_PARAMS`]). Instantiated once per [`Layer`]; the CLAP id is
 /// derived via [`patch_clap_id`].
@@ -168,10 +190,13 @@ pub enum PatchParam {
     ModWheelDest,
     /// Mod-wheel modulation depth (semitone-domain: cutoff octaves or osc2 st).
     ModWheelDepth,
+    // ── E003 (offsets stay stable above this line) ──
+    /// Voice-assignment mode for this layer (Poly / Unison — ADR 0003 §4).
+    AssignMode,
 }
 
 impl PatchParam {
-    pub const COUNT: usize = PatchParam::ModWheelDepth as usize + 1;
+    pub const COUNT: usize = PatchParam::AssignMode as usize + 1;
 
     /// In-block offset of the first modulation-matrix parameter (`Env1Pitch`).
     pub const MATRIX_BASE: usize = PatchParam::Env1Pitch as usize;
@@ -405,6 +430,7 @@ const SHAPE_LABELS: &[&str] = &["Linear", "Exponential"];
 const LFO_LABELS: &[&str] = &["Sine", "Tri", "Saw+", "Saw-", "Square", "S&H"];
 const OVERSAMPLE_LABELS: &[&str] = &["Off", "2x", "4x"];
 const MOD_WHEEL_DEST_LABELS: &[&str] = &["Off", "Cutoff", "Osc2 Pitch"];
+const ASSIGN_LABELS: &[&str] = &["Poly", "Unison"];
 
 const fn f(
     name: &'static str,
@@ -554,6 +580,8 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
         "st",
         false,
     ),
+    // ── E003 (offsets stay stable above this line) ──
+    e("assign_mode", "Assign", ASSIGN_LABELS, 0.0),
 ];
 
 /// Global descriptor table; indexed by [`GlobalParam`].
@@ -643,6 +671,10 @@ impl PatchValues {
 
     pub fn lfo_shape(&self) -> LfoShape {
         LfoShape::ALL[enum_index(self.get(PatchParam::LfoShape), LfoShape::ALL.len() - 1)]
+    }
+
+    pub fn assign_mode(&self) -> AssignMode {
+        AssignMode::from_index(enum_index(self.get(PatchParam::AssignMode), 1))
     }
 
     pub fn env1_shape(&self) -> AdsrShape {
