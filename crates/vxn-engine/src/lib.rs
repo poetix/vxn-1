@@ -76,13 +76,16 @@ pub struct Synth {
     /// Mod-wheel (CC1) position in `[0, 1]`, smoothed at the control rate.
     /// Global value; each layer applies it via its own routing params.
     mod_wheel: Smoothed,
-    /// Current key mode (ADR 0003 §3). Decides each layer's param source via
-    /// [`Synth::param_source`]; the event router that also depends on it is 0009.
+    /// Current key mode (ADR 0003 §3). Drives both the per-layer param source
+    /// ([`Synth::param_source`]) and note routing ([`Synth::note_on`]).
     key_mode: KeyMode,
+    /// Split point (MIDI note) for [`KeyMode::Split`]: notes below go to Lower,
+    /// at/above to Upper (ADR 0003 §8). Non-automatable shared state.
+    split_point: u8,
     alloc_counter: u64,
-    /// Round-robin layer cursor for note-on. **Temporary**: it spreads incoming
-    /// notes 8+8 across the two layers, reproducing today's 16-voice behaviour
-    /// until the key-mode event router replaces it (0009).
+    /// Round-robin layer cursor for Whole-mode note-on: alternates layers so
+    /// notes spread 8+8, giving 16-voice polyphony with both layers reading
+    /// layer A's params (0008). Reset on `reset`.
     rr_layer: usize,
     /// Last envelope params pushed to each layer's voices; `None` forces a refresh.
     last_env: [Option<EnvSnapshot>; LAYERS],
@@ -108,6 +111,7 @@ impl Synth {
             bend_semis: 0.0,
             mod_wheel: Smoothed::new(0.0, MOD_WHEEL_SMOOTH_MS, control_rate),
             key_mode: KeyMode::Whole,
+            split_point: DEFAULT_SPLIT_POINT,
             alloc_counter: 0,
             rr_layer: 0,
             last_env: [None; LAYERS],
@@ -159,14 +163,20 @@ impl Synth {
         self.mod_wheel.set_target(normalized.clamp(0.0, 1.0));
     }
 
-    /// Set the key mode (ADR 0003 §3). Cheap; the event router (0009) reads the
-    /// same mode to decide note routing.
+    /// Set the key mode (ADR 0003 §3). Cheap; the seed-on-entry copy lives in
+    /// the shared store ([`SharedParams::set_key_mode_seeded`]) so it persists
+    /// and is echoed to the host — the engine just reads the mode it is given.
     pub fn set_key_mode(&mut self, mode: KeyMode) {
         self.key_mode = mode;
     }
 
     pub fn key_mode(&self) -> KeyMode {
         self.key_mode
+    }
+
+    /// Set the split point (MIDI note) used by [`KeyMode::Split`] routing.
+    pub fn set_split_point(&mut self, note: u8) {
+        self.split_point = note.min(127);
     }
 
     /// Which param block layer `layer` reads under `key_mode` (ADR 0003 §3):
@@ -180,16 +190,35 @@ impl Synth {
         }
     }
 
+    /// Route a note-on to the layer(s) chosen by the current key mode (ADR 0003
+    /// §3): Whole round-robins across the layers (16-voice), Dual duplicates to
+    /// both (layered 8+8), Split partitions at the split point (Lower below,
+    /// Upper at/above). Note-offs broadcast, so each layer releases only the
+    /// note it actually started.
     pub fn note_on(&mut self, note: u8, velocity: f32) {
-        // Temporary round-robin (0009 replaces this with the key-mode router):
-        // alternate layers so notes spread 8+8, reproducing 16-voice polyphony.
-        let layer = self.rr_layer;
-        self.rr_layer ^= 1;
-        self.note_on_layer(layer, note, velocity);
+        match self.key_mode {
+            KeyMode::Whole => {
+                let layer = self.rr_layer;
+                self.rr_layer ^= 1;
+                self.note_on_layer(layer, note, velocity);
+            }
+            KeyMode::Dual => {
+                self.note_on_layer(Layer::Upper as usize, note, velocity);
+                self.note_on_layer(Layer::Lower as usize, note, velocity);
+            }
+            KeyMode::Split => {
+                let layer = if note < self.split_point {
+                    Layer::Lower
+                } else {
+                    Layer::Upper
+                };
+                self.note_on_layer(layer as usize, note, velocity);
+            }
+        }
     }
 
-    /// Start a note on a specific layer. The event router (0009) calls this per
-    /// its key-mode policy; until then [`Self::note_on`] round-robins here.
+    /// Start a note on a specific layer. [`Self::note_on`] calls this per the
+    /// key-mode routing policy; exposed for tests and future per-layer drivers.
     pub fn note_on_layer(&mut self, layer: usize, note: u8, velocity: f32) {
         self.alloc_counter += 1;
         self.banks[layer].note_on(note, velocity, self.alloc_counter);
@@ -222,6 +251,7 @@ impl Synth {
         self.delay.clear();
         self.oversampler.reset();
         self.smoother.snap_all(&self.params);
+        self.rr_layer = 0;
     }
 
     /// Render `out_l`/`out_r` (equal length). No events occur within this span;
@@ -941,6 +971,78 @@ mod tests {
             .fold(0.0f32, f32::max);
         assert!(max_err < 1e-4, "layers do not superpose: max_err {max_err}");
         assert!(combined.iter().all(|x| x.is_finite()), "non-finite sum");
+    }
+
+    // ── E003 / 0009: event router & key mode ────────────────────────────────
+
+    fn layer_active(s: &Synth, layer: usize) -> usize {
+        s.banks[layer].active_count()
+    }
+
+    #[test]
+    fn whole_round_robins_successive_note_ons() {
+        let mut s = Synth::new(48_000.0);
+        s.set_key_mode(KeyMode::Whole);
+        s.note_on(60, 1.0);
+        s.note_on(62, 1.0);
+        // Two notes, alternating layers → one channel active in each.
+        assert_eq!(layer_active(&s, 0), 1);
+        assert_eq!(layer_active(&s, 1), 1);
+    }
+
+    #[test]
+    fn dual_triggers_both_layers_per_note() {
+        let mut s = Synth::new(48_000.0);
+        s.set_key_mode(KeyMode::Dual);
+        s.note_on(60, 1.0);
+        // One note → both layers play it.
+        assert_eq!(layer_active(&s, 0), 1);
+        assert_eq!(layer_active(&s, 1), 1);
+    }
+
+    #[test]
+    fn split_routes_by_pitch_about_the_split_point() {
+        let mut s = Synth::new(48_000.0);
+        s.set_key_mode(KeyMode::Split);
+        s.set_split_point(60);
+        s.note_on(48, 1.0); // below → Lower (layer 1)
+        s.note_on(72, 1.0); // at/above → Upper (layer 0)
+        assert_eq!(layer_active(&s, Layer::Lower as usize), 1);
+        assert_eq!(layer_active(&s, Layer::Upper as usize), 1);
+        // A note exactly at the split point goes to Upper.
+        s.note_on(60, 1.0);
+        assert_eq!(layer_active(&s, Layer::Upper as usize), 2);
+    }
+
+    #[test]
+    fn note_off_releases_only_the_layer_that_started_it() {
+        let mut s = Synth::new(48_000.0);
+        s.set_key_mode(KeyMode::Split);
+        s.set_split_point(60);
+        s.note_on(48, 1.0); // Lower
+        s.note_off(48); // broadcast; only Lower holds it
+        // Gate cleared on Lower; Upper never had it. Render the release out.
+        s.set_param(pp(PatchParam::Env2Release), 0.001);
+        s.set_param(lo(PatchParam::Env2Release), 0.001);
+        let (l, _) = render(&mut s, 4800);
+        assert!(rms(&l[2400..]) < 1e-4, "note did not release");
+    }
+
+    #[test]
+    fn held_notes_survive_a_mode_and_split_change() {
+        // A sounding note keeps playing through a key-mode / split-point change;
+        // only new note-ons follow the new routing (ADR 0003 §Consequences).
+        let mut s = Synth::new(48_000.0);
+        s.set_key_mode(KeyMode::Whole);
+        s.note_on(64, 1.0);
+        let before = s.active_count();
+        assert_eq!(before, 1);
+        s.set_key_mode(KeyMode::Split);
+        s.set_split_point(72);
+        // Still sounding (not stranded).
+        assert_eq!(s.active_count(), 1);
+        let (l, _) = render(&mut s, 2400);
+        assert!(rms(&l) > 0.001, "held note went silent across the change");
     }
 
     #[test]

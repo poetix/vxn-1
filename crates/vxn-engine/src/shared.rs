@@ -23,7 +23,9 @@
 //! Kept in `vxn-engine` (framework-free) so both `vxn-clap` and `vxn-ui` share
 //! one definition without depending on each other.
 
-use crate::params::{KeyMode, ParamValues, TOTAL_PARAMS, desc_for_clap_id};
+use crate::params::{
+    KeyMode, Layer, ParamValues, PatchParam, TOTAL_PARAMS, desc_for_clap_id, patch_clap_id,
+};
 use crate::state::PluginState;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
@@ -111,6 +113,33 @@ impl SharedParams {
         self.key_mode.store(mode as u8, Ordering::Relaxed);
     }
 
+    /// Set the key mode from a **discrete UI edit**, performing the one-shot
+    /// seed-on-entry copy (ADR 0003 §3): the first transition out of Whole copies
+    /// layer A (Upper) → layer B (Lower) so Lower starts equal to Upper and then
+    /// diverges. Editing in the store (not just the engine) means the copy
+    /// persists and the CLAP layer echoes the seeded Lower values to the host.
+    /// `Dual ↔ Split` does not re-seed; state load uses [`Self::set_key_mode`].
+    pub fn set_key_mode_seeded(&self, mode: KeyMode) {
+        if self.key_mode() == KeyMode::Whole && mode != KeyMode::Whole {
+            self.seed_lower_from_upper();
+        }
+        self.set_key_mode(mode);
+    }
+
+    /// Copy every Upper per-patch value into the corresponding Lower slot. The
+    /// two per-patch blocks are contiguous CLAP-id ranges (0007), so Lower's id
+    /// is its Upper id plus one block width.
+    fn seed_lower_from_upper(&self) {
+        for p in 0..crate::params::PATCH_COUNT {
+            let upper = patch_clap_id(Layer::Upper, PatchParam::from_index(p).unwrap());
+            let lower = patch_clap_id(Layer::Lower, PatchParam::from_index(p).unwrap());
+            self.values[lower].store(
+                self.values[upper].load(Ordering::Relaxed),
+                Ordering::Relaxed,
+            );
+        }
+    }
+
     #[inline]
     pub fn split_point(&self) -> u8 {
         self.split_point.load(Ordering::Relaxed)
@@ -166,6 +195,38 @@ mod tests {
         let reso = patch_clap_id(Layer::Upper, PatchParam::Resonance);
         s.set(reso, 5.0);
         assert_eq!(s.get(reso), 1.0);
+    }
+
+    #[test]
+    fn whole_to_dual_seeds_lower_from_upper_once() {
+        let s = SharedParams::new();
+        let up = patch_clap_id(Layer::Upper, PatchParam::Cutoff);
+        let lo = patch_clap_id(Layer::Lower, PatchParam::Cutoff);
+        s.set(up, 1234.0);
+        s.set(lo, 9999.0);
+        // Whole → Dual seeds Lower from Upper.
+        s.set_key_mode_seeded(KeyMode::Dual);
+        assert_eq!(s.get(lo), 1234.0, "Lower not seeded from Upper");
+        assert_eq!(s.key_mode(), KeyMode::Dual);
+
+        // Diverge Lower, then Dual → Split must NOT re-seed.
+        s.set(lo, 555.0);
+        s.set_key_mode_seeded(KeyMode::Split);
+        assert_eq!(s.get(lo), 555.0, "Dual→Split should not re-seed");
+    }
+
+    #[test]
+    fn returning_to_whole_then_out_seeds_again() {
+        let s = SharedParams::new();
+        let up = patch_clap_id(Layer::Upper, PatchParam::Cutoff);
+        let lo = patch_clap_id(Layer::Lower, PatchParam::Cutoff);
+        s.set_key_mode_seeded(KeyMode::Dual);
+        s.set_key_mode_seeded(KeyMode::Whole);
+        s.set(up, 4000.0);
+        s.set(lo, 1.0);
+        // Leaving Whole again re-seeds from the current Upper.
+        s.set_key_mode_seeded(KeyMode::Split);
+        assert_eq!(s.get(lo), 4000.0);
     }
 
     #[test]

@@ -15,23 +15,23 @@ store the split point as opaque saved state.
 
 ## Acceptance criteria
 
-- [ ] Note events are routed per `KeyMode`:
+- [x] Note events are routed per `KeyMode`:
       - **Whole** — round-robin note-ons across the two layers (→ 16-voice poly,
         both layers reading layer A's params per 0008).
       - **Dual** — every note-on goes to **both** layers (layered, 8 each).
       - **Split** — note-on goes to Lower if `note < split_point`, else Upper.
       Note-offs follow their note-ons to the correct layer(s).
-- [ ] **Seed-on-entry:** transitioning Whole → Dual/Split copies layer A's
+- [x] **Seed-on-entry:** transitioning Whole → Dual/Split copies layer A's
       per-patch values into layer B once (ADR 0003 §3), so Lower starts equal to
       Upper and then diverges.
-- [ ] `KeyMode` and **split point** are read from the non-automatable shared
+- [x] `KeyMode` and **split point** are read from the non-automatable shared
       state defined in 0007 (not CLAP params), set discretely via the editor
       (0013). Split point is a MIDI note 0–127, default a sensible middle
       (e.g. 60).
-- [ ] Mode transitions and a moving split point do not strand voices: notes
+- [x] Mode transitions and a moving split point do not strand voices: notes
       already sounding continue to their natural release on the layer that
       started them; only **new** note-ons follow the new routing.
-- [ ] Tests: Whole alternates layers across successive note-ons; Dual triggers
+- [x] Tests: Whole alternates layers across successive note-ons; Dual triggers
       both layers per note; Split directs notes by pitch about the split point;
       Whole→Dual seeds B from A; held notes survive a mode/split-point change.
 

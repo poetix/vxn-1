@@ -49,7 +49,7 @@ stops being mono-timbral. It also **absorbs Unison and Portamento** from ADR
 
 - [x] [0007 — Parameter model: per-patch blocks + global block](../../tickets/open/0007-param-block-split.md)
 - [x] [0008 — Two-layer engine render](../../tickets/open/0008-two-layer-render.md)
-- [ ] [0009 — MIDI event router & key mode](../../tickets/open/0009-event-router-key-mode.md)
+- [x] [0009 — MIDI event router & key mode](../../tickets/open/0009-event-router-key-mode.md)
 - [ ] [0010 — Per-layer MIDI processor (poly)](../../tickets/open/0010-midi-processor-poly.md)
 - [ ] [0011 — Unison assign mode](../../tickets/open/0011-unison.md)
 - [ ] [0012 — Portamento](../../tickets/open/0012-portamento.md)

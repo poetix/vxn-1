@@ -136,6 +136,12 @@ impl<'a> PluginAudioProcessor<'a, VxnShared, VxnMainThread<'a>> for VxnAudioProc
         self.local.fetch_ui_changes(&self.shared.params);
         self.local.write_to(self.synth.params_mut());
 
+        // Key mode + split point are non-automatable shared state (ADR 0003
+        // §3/§8): push them to the engine so note routing and per-layer param
+        // sourcing follow the current mode. Seed-on-entry happened in the store.
+        self.synth.set_key_mode(self.shared.params.key_mode());
+        self.synth.set_split_point(self.shared.params.split_point());
+
         let mut output_port = audio
             .output_port(0)
             .ok_or(PluginError::Message("No output port"))?;
