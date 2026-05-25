@@ -208,10 +208,16 @@ pub enum PatchParam {
     PortamentoOn,
     /// Portamento glide time (s); 0 = instant (today's behaviour).
     PortamentoTime,
+    // ── E004 / 0015: per-LFO host-tempo sync ──
+    /// LFO 1 host-sync on/off. When on, its rate knob selects a musical
+    /// subdivision locked to host tempo instead of free Hz.
+    LfoSync,
+    /// LFO 2 host-sync on/off (mirrors [`PatchParam::LfoSync`]).
+    Lfo2Sync,
 }
 
 impl PatchParam {
-    pub const COUNT: usize = PatchParam::PortamentoTime as usize + 1;
+    pub const COUNT: usize = PatchParam::Lfo2Sync as usize + 1;
 
     /// In-block offset of the first modulation-matrix parameter (`Env1Pitch`).
     pub const MATRIX_BASE: usize = PatchParam::Env1Pitch as usize;
@@ -609,6 +615,9 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
     b("portamento_on", "Glide", 0.0),
     // Linear (not log) so 0 = instant is representable; range covers musical glides.
     f("portamento_time", "Glide Time", 0.0, 5.0, 0.0, "s", false),
+    // ── E004 / 0015: per-LFO host-tempo sync ──
+    b("lfo_sync", "LFO 1 Sync", 0.0),
+    b("lfo2_sync", "LFO 2 Sync", 0.0),
 ];
 
 /// Global descriptor table; indexed by [`GlobalParam`].

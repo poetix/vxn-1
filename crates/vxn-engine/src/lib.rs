@@ -9,6 +9,7 @@ pub mod params;
 pub mod shared;
 pub mod smoothing;
 pub mod state;
+pub mod sync;
 pub mod voice;
 
 pub use modmatrix::{ModDest, ModMatrix, ModSource};
@@ -84,6 +85,9 @@ pub struct Synth {
     /// Split point (MIDI note) for [`KeyMode::Split`]: notes below go to Lower,
     /// at/above to Upper (ADR 0003 §8). Non-automatable shared state.
     split_point: u8,
+    /// Host tempo (BPM) for LFO host-sync (E004 / 0015), fed from the CLAP
+    /// transport each block. Defaults to a sane tempo when the host has none.
+    tempo_bpm: f32,
     alloc_counter: u64,
     /// Round-robin layer cursor for Whole-mode note-on: alternates layers so
     /// notes spread 8+8, giving 16-voice polyphony with both layers reading
@@ -116,6 +120,7 @@ impl Synth {
             mod_wheel: Smoothed::new(0.0, MOD_WHEEL_SMOOTH_MS, control_rate),
             key_mode: KeyMode::Whole,
             split_point: DEFAULT_SPLIT_POINT,
+            tempo_bpm: sync::DEFAULT_TEMPO_BPM,
             alloc_counter: 0,
             rr_layer: 0,
             last_env: [None; LAYERS],
@@ -181,6 +186,17 @@ impl Synth {
     /// Set the split point (MIDI note) used by [`KeyMode::Split`] routing.
     pub fn set_split_point(&mut self, note: u8) {
         self.split_point = note.min(127);
+    }
+
+    /// Host tempo (BPM) for LFO host-sync (E004 / 0015), pushed each block from
+    /// the CLAP transport. Non-finite or non-positive input falls back to the
+    /// default so a synced LFO never produces NaN/Inf.
+    pub fn set_tempo(&mut self, bpm: f32) {
+        self.tempo_bpm = if bpm.is_finite() && bpm > 0.0 {
+            bpm
+        } else {
+            sync::DEFAULT_TEMPO_BPM
+        };
     }
 
     /// Which param block layer `layer` reads under `key_mode` (ADR 0003 §3):
@@ -393,10 +409,13 @@ impl Synth {
         let vals = self.smoother.values();
         let p = vals.layer(src);
         let g = vals.global();
+        let tempo = self.tempo_bpm;
         let lfo_val = self.lfos[layer][0].next(p.lfo_shape());
-        self.lfos[layer][0].set_rate(p.get(PatchParam::LfoRate));
+        self.lfos[layer][0]
+            .set_rate(lfo_rate(p, PatchParam::LfoRate, PatchParam::LfoSync, tempo));
         let lfo2_val = self.lfos[layer][1].next(p.lfo2_shape());
-        self.lfos[layer][1].set_rate(p.get(PatchParam::Lfo2Rate));
+        self.lfos[layer][1]
+            .set_rate(lfo_rate(p, PatchParam::Lfo2Rate, PatchParam::Lfo2Sync, tempo));
 
         // Pull the depth params into the matrix via the layout's own index
         // mapping: iterating `ModSource::ALL` now picks up the Lfo2 row (6×4)
@@ -457,6 +476,20 @@ impl Synth {
     }
 }
 
+/// Resolve an LFO's rate in Hz for this block (E004 / 0015). Sync off: the rate
+/// knob is free-running Hz, exactly as before. Sync on: the knob's normalised
+/// position selects a musical subdivision locked to `tempo_bpm`. The LFO core
+/// clamps the result to its valid Hz range.
+#[inline]
+fn lfo_rate(p: &PatchValues, rate: PatchParam, sync_flag: PatchParam, tempo_bpm: f32) -> f32 {
+    if p.bool(sync_flag) {
+        let norm = rate.desc().to_normalized(p.get(rate));
+        sync::synced_hz(tempo_bpm, sync::index_from_norm(norm))
+    } else {
+        p.get(rate)
+    }
+}
+
 /// Convenience: A4 = 440 Hz reference, exposed for tests/tools.
 pub fn a4_hz() -> f32 {
     note_to_hz(69.0)
@@ -465,7 +498,9 @@ pub fn a4_hz() -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::{GlobalParam, Layer, PatchParam, global_clap_id, patch_clap_id};
+    use crate::params::{
+        GlobalParam, Layer, PatchParam, PatchValues, global_clap_id, patch_clap_id,
+    };
 
     /// Upper-layer per-patch CLAP id (tests drive the single render path = Upper).
     fn pp(p: PatchParam) -> usize {
@@ -924,6 +959,78 @@ mod tests {
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
         assert!(max_err == 0.0, "zero-depth LFO2 changed output: {max_err}");
+    }
+
+    // ── E004 / 0015: host-tempo sync ────────────────────────────────────────
+
+    /// Set the rate knob so its normalised position lands exactly on
+    /// subdivision `idx` (the inverse of `sync::index_from_norm`).
+    fn rate_for_subdiv(idx: usize) -> f32 {
+        let last = (sync::SUBDIVISIONS.len() - 1) as f32;
+        PatchParam::LfoRate
+            .desc()
+            .from_normalized(idx as f32 / last)
+    }
+
+    #[test]
+    fn lfo_sync_off_is_free_running_hz() {
+        let mut p = PatchValues::default();
+        p.set(PatchParam::LfoRate, 7.3);
+        // Sync off (default): the rate knob is taken as literal Hz, tempo ignored.
+        assert_eq!(
+            lfo_rate(&p, PatchParam::LfoRate, PatchParam::LfoSync, 120.0),
+            7.3
+        );
+    }
+
+    #[test]
+    fn lfo_sync_on_resolves_subdivision_from_tempo() {
+        // Indices of the quarter-note family in the subdivision table.
+        let q = sync::SUBDIVISIONS.iter().position(|s| s.label == "1/4").unwrap();
+        let qd = sync::SUBDIVISIONS.iter().position(|s| s.label == "1/4.").unwrap();
+        let qt = sync::SUBDIVISIONS.iter().position(|s| s.label == "1/4T").unwrap();
+
+        let mut p = PatchValues::default();
+        p.set(PatchParam::LfoSync, 1.0);
+        let resolve = |p: &PatchValues, bpm| lfo_rate(p, PatchParam::LfoRate, PatchParam::LfoSync, bpm);
+
+        // Straight quarter: one cycle per beat.
+        p.set(PatchParam::LfoRate, rate_for_subdiv(q));
+        assert!((resolve(&p, 120.0) - 2.0).abs() < 1e-4, "1/4 @120");
+        assert!((resolve(&p, 90.0) - 1.5).abs() < 1e-4, "1/4 @90");
+        // Dotted (×1.5 length) and triplet (×2/3 length) at 140 BPM.
+        p.set(PatchParam::LfoRate, rate_for_subdiv(qd));
+        assert!((resolve(&p, 140.0) - (140.0 / 60.0) / 1.5).abs() < 1e-4, "1/4. @140");
+        p.set(PatchParam::LfoRate, rate_for_subdiv(qt));
+        assert!((resolve(&p, 140.0) - (140.0 / 60.0) / (2.0 / 3.0)).abs() < 1e-4, "1/4T @140");
+    }
+
+    #[test]
+    fn set_tempo_rejects_nonfinite_and_nonpositive() {
+        let mut s = Synth::new(48_000.0);
+        s.set_tempo(f32::NAN);
+        assert_eq!(s.tempo_bpm, sync::DEFAULT_TEMPO_BPM);
+        s.set_tempo(0.0);
+        assert_eq!(s.tempo_bpm, sync::DEFAULT_TEMPO_BPM);
+        s.set_tempo(128.0);
+        assert_eq!(s.tempo_bpm, 128.0);
+    }
+
+    #[test]
+    fn synced_lfo_renders_finite_and_audible() {
+        // End-to-end: a synced LFO→cutoff route at a fast subdivision drives the
+        // filter and stays finite (the rate path never NaNs through the engine).
+        let mut s = pitched_synth();
+        s.set_param(pp(PatchParam::Osc1Wave), 2.0); // saw
+        s.set_param(pp(PatchParam::Cutoff), 1200.0);
+        s.set_param(pp(PatchParam::LfoCutoff), 36.0);
+        s.set_param(pp(PatchParam::LfoSync), 1.0);
+        s.set_param(pp(PatchParam::LfoRate), rate_for_subdiv(9)); // 1/8
+        s.set_tempo(128.0);
+        s.note_on(45, 1.0);
+        let (l, _) = render(&mut s, 24_000);
+        assert!(l.iter().all(|x| x.is_finite()), "synced LFO output not finite");
+        assert!(rms(&l) > 0.01, "synced LFO produced no sound");
     }
 
     #[test]

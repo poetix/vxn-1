@@ -53,7 +53,7 @@ independent **envelope time-scaling by key** (§5) remains on that roadmap.
 ## Tickets
 
 - [x] [0014 — Second routable LFO (engine + params + 6×4 matrix)](../../tickets/closed/0014-second-lfo.md)
-- [ ] [0015 — Host tempo plumbing + LFO host-sync](../../tickets/open/0015-lfo-host-sync.md)
+- [x] [0015 — Host tempo plumbing + LFO host-sync](../../tickets/closed/0015-lfo-host-sync.md)
 - [ ] [0016 — LFO reset on note start](../../tickets/open/0016-lfo-reset.md)
 - [ ] [0017 — Editor: LFO2, matrix row, sync/reset controls](../../tickets/open/0017-ui-lfo2.md)
 

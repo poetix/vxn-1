@@ -14,6 +14,7 @@ use clack_extensions::gui::PluginGui;
 use clack_extensions::state::{PluginState, PluginStateImpl};
 use clack_extensions::{audio_ports::*, note_ports::*, params::*};
 use clack_plugin::events::Match;
+use clack_plugin::events::event_types::TransportFlags;
 use clack_plugin::events::spaces::CoreEventSpace;
 use clack_plugin::prelude::*;
 use clack_plugin::stream::{InputStream, OutputStream};
@@ -121,7 +122,7 @@ impl<'a> PluginAudioProcessor<'a, VxnShared, VxnMainThread<'a>> for VxnAudioProc
 
     fn process(
         &mut self,
-        _process: Process,
+        process: Process,
         mut audio: Audio,
         events: Events,
     ) -> Result<ProcessStatus, PluginError> {
@@ -141,6 +142,15 @@ impl<'a> PluginAudioProcessor<'a, VxnShared, VxnMainThread<'a>> for VxnAudioProc
         // sourcing follow the current mode. Seed-on-entry happened in the store.
         self.synth.set_key_mode(self.shared.params.key_mode());
         self.synth.set_split_point(self.shared.params.split_point());
+
+        // Host transport → engine tempo for LFO host-sync (E004 / 0015). Use the
+        // BPM only when the transport actually carries a tempo; otherwise the
+        // engine keeps its sane default (never NaN).
+        if let Some(t) = process.transport {
+            if t.flags.contains(TransportFlags::HAS_TEMPO) {
+                self.synth.set_tempo(t.tempo as f32);
+            }
+        }
 
         let mut output_port = audio
             .output_port(0)
