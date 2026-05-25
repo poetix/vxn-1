@@ -203,7 +203,11 @@ impl PolyOscillator {
     ///   reset sprayed.
     ///
     /// Sync and PM are mutually exclusive at the engine (the `CrossModType`
-    /// selector picks one), but the kernel handles both at once and stays finite.
+    /// selector picks one), so the render path dispatches to the specialised
+    /// [`process_sync`](Self::process_sync) / [`process_pm`](Self::process_pm)
+    /// kernels (each sheds the other's work); this combined form is kept as the
+    /// readable reference and the differential-test oracle. It handles both at
+    /// once and stays finite.
     /// osc2 is evaluated first because it is the PM source for osc1. This is the
     /// slow path, taken only when `sync` is on **or** `pm_index != 0`; plain
     /// patches keep the vectorised [`process`](Self::process) fast path. The
@@ -291,6 +295,116 @@ impl PolyOscillator {
             let np2 = p2 + dt2;
             let free_phase = np2 - (np2 >= 1.0) as u32 as f32;
             slave.phase[v] = free_phase * (1.0 - reset) + post_phase * reset;
+        }
+    }
+
+    /// Sync-only specialisation of [`process_pair`](Self::process_pair) (the
+    /// engine picks Sync **or** PM, never both, so PM is statically absent here).
+    /// Identical to the combined kernel with `pm_index == 0`: the master read
+    /// phase is just its accumulator phase (no PM offset, no two-sided wrap), and
+    /// `reset == wrapped` since sync is always on. Drops the dead `pm_index · s2`
+    /// term and its `floor` per voice per sample; the band-limited sub-sample sync
+    /// machinery is all live and kept verbatim. Profiled as the dominant hot path
+    /// for sync patches (`busy_profile`), so it sheds exactly the PM-only work.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_sync(
+        &mut self,
+        slave: &mut PolyOscillator,
+        wave1: Waveform,
+        wave2: Waveform,
+        pw1: &[f32; N],
+        pw2: &[f32; N],
+        o1: &mut [f32; N],
+        o2: &mut [f32; N],
+    ) {
+        for v in 0..N {
+            let dt2 = slave.inc[v];
+            let p2 = slave.phase[v];
+
+            // osc2 (slave): free value, or the deferred bare post-reset value on
+            // the sample after a sub-sample sync reset (`sync_pending`).
+            let pend = slave.sync_pending[v];
+            let free_val = osc_sample(wave2, p2, pw2[v], dt2);
+            let bare_val = naive_osc(wave2, p2, pw2[v]) + slave.sync_resid[v];
+            let s2 = free_val * (1.0 - pend) + bare_val * pend;
+            o2[v] = s2;
+
+            // osc1 (master): no PM, so the read phase is the accumulator phase.
+            let inc1 = self.inc[v];
+            o1[v] = osc_sample(wave1, self.phase[v], pw1[v], inc1);
+
+            // Advance the master, capturing the wrap and its sub-sample fraction.
+            let np1 = self.phase[v] + inc1;
+            let wrapped = (np1 >= 1.0) as u32 as f32;
+            self.phase[v] = np1 - wrapped;
+            let frac = (1.0 - (np1 - 1.0) / inc1.max(1.0e-12)).clamp(f32::MIN_POSITIVE, 1.0);
+
+            // Sync always on here: the reset mask is the bare master wrap.
+            let reset = wrapped;
+            let post_phase = (1.0 - frac) * dt2;
+            let pre_raw = p2 + frac * dt2;
+            let pre_phase = pre_raw - (pre_raw >= 1.0) as u32 as f32;
+            let delta = naive_osc(wave2, pre_phase, pw2[v]) - naive_osc(wave2, post_phase, pw2[v]);
+            slave.sync_resid[v] = -pblep(post_phase, dt2) * 0.5 * delta;
+            slave.sync_pending[v] = reset;
+            let before_phase = 1.0 - frac * dt2;
+            o2[v] -= pblep(before_phase, dt2) * 0.5 * delta * reset;
+
+            let np2 = p2 + dt2;
+            let free_phase = np2 - (np2 >= 1.0) as u32 as f32;
+            slave.phase[v] = free_phase * (1.0 - reset) + post_phase * reset;
+        }
+    }
+
+    /// Phase-mod-only specialisation of [`process_pair`](Self::process_pair).
+    /// With sync statically off the slave is a plain free-running oscillator (its
+    /// output is the PM source), so the entire sub-sample reset apparatus — the
+    /// `frac` solve, the `delta` (two extra [`naive_osc`]), the two [`pblep`]
+    /// residuals — collapses to nothing and is dropped. That dead-but-computed
+    /// work was ~half the combined kernel's cost (see `busy_profile`), so PM
+    /// patches roughly halve their oscillator time.
+    ///
+    /// Bit-identical to the combined kernel in steady PM state: there `sync == 0`
+    /// forces `reset == 0`, so `sync_pending` reads 0 and the slave emits its free
+    /// value. The one stored `sync_pending = 0` keeps a later switch back to sync
+    /// clean (a fresh note resets the rest via [`reset`](Self::reset)).
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_pm(
+        &mut self,
+        slave: &mut PolyOscillator,
+        pm_index: f32,
+        wave1: Waveform,
+        wave2: Waveform,
+        pw1: &[f32; N],
+        pw2: &[f32; N],
+        o1: &mut [f32; N],
+        o2: &mut [f32; N],
+    ) {
+        for v in 0..N {
+            let dt2 = slave.inc[v];
+            let p2 = slave.phase[v];
+
+            // osc2 (slave): free-running PM source. No sync ⇒ no deferred reset;
+            // clear any `sync_pending` a prior sync block left so a later switch
+            // back to sync starts clean.
+            let s2 = osc_sample(wave2, p2, pw2[v], dt2);
+            o2[v] = s2;
+            slave.sync_pending[v] = 0.0;
+            let np2 = p2 + dt2;
+            slave.phase[v] = np2 - (np2 >= 1.0) as u32 as f32;
+
+            // osc1 (master): through-zero phase mod. The accumulator advances at
+            // the base increment; the slave offsets only the read, which wraps
+            // two-sided so it can run backward through zero.
+            let inc1 = self.inc[v];
+            let read = {
+                let x = self.phase[v] + pm_index * s2;
+                x - x.floor()
+            };
+            o1[v] = osc_sample(wave1, read, pw1[v], inc1);
+            self.phase[v] = advance(self.phase[v], inc1);
         }
     }
 }
@@ -596,6 +710,75 @@ mod tests {
         for _ in 0..100 {
             poly.process(Waveform::Pulse, &pw, &mut out);
             assert!(out.iter().all(|s| s.is_finite()));
+        }
+    }
+
+    /// The specialised `process_sync` / `process_pm` kernels must match the
+    /// combined `process_pair` oracle: sync ≡ `process_pair(sync=true, pm=0)`,
+    /// PM ≡ `process_pair(sync=false, pm=index)`. Drives detuned master/slave
+    /// across every osc1×osc2 waveform pair and a moving pulse width so the BLEP
+    /// and reset branches all fire, and checks both osc outputs every sample.
+    #[test]
+    fn specialised_cross_mod_kernels_match_combined() {
+        fn pair() -> (PolyOscillator, PolyOscillator) {
+            let mut m = PolyOscillator::new();
+            let mut s = PolyOscillator::new();
+            for v in 0..N {
+                // Distinct, detuned incs per lane; slave runs higher (sync/PM
+                // motion). Lane 0 left at inc 0 to exercise the frozen guard.
+                if v > 0 {
+                    m.inc[v] = (60.0 + v as f32 * 30.0) / 48_000.0;
+                    s.inc[v] = (90.0 + v as f32 * 55.0) / 48_000.0;
+                }
+            }
+            (m, s)
+        }
+
+        for wave1 in Waveform::ALL {
+            for wave2 in Waveform::ALL {
+                // Sync: combined(sync=true, pm=0) vs process_sync.
+                let (mut ma, mut sa) = pair();
+                let (mut mb, mut sb) = pair();
+                // PM: combined(sync=false, pm=index) vs process_pm.
+                let (mut mc, mut sc) = pair();
+                let (mut md, mut sd) = pair();
+                let (mut oa1, mut oa2) = ([0.0; N], [0.0; N]);
+                let (mut ob1, mut ob2) = ([0.0; N], [0.0; N]);
+                let (mut oc1, mut oc2) = ([0.0; N], [0.0; N]);
+                let (mut od1, mut od2) = ([0.0; N], [0.0; N]);
+
+                for i in 0..2000 {
+                    // Sweep pulse width so the pulse BLEP edges move.
+                    let w = 0.3 + 0.4 * (i as f32 * 0.01).sin().abs();
+                    let pw1 = [w; N];
+                    let pw2 = [0.5; N];
+
+                    ma.process_pair(
+                        &mut sa, true, 0.0, wave1, wave2, &pw1, &pw2, &mut oa1, &mut oa2,
+                    );
+                    mb.process_sync(&mut sb, wave1, wave2, &pw1, &pw2, &mut ob1, &mut ob2);
+
+                    mc.process_pair(
+                        &mut sc, false, 0.7, wave1, wave2, &pw1, &pw2, &mut oc1, &mut oc2,
+                    );
+                    md.process_pm(&mut sd, 0.7, wave1, wave2, &pw1, &pw2, &mut od1, &mut od2);
+
+                    for v in 0..N {
+                        assert!(
+                            (oa1[v] - ob1[v]).abs() < 1e-6 && (oa2[v] - ob2[v]).abs() < 1e-6,
+                            "sync mismatch {wave1:?}/{wave2:?} lane {v} i {i}: \
+                             o1 {} vs {}, o2 {} vs {}",
+                            oa1[v], ob1[v], oa2[v], ob2[v]
+                        );
+                        assert!(
+                            (oc1[v] - od1[v]).abs() < 1e-6 && (oc2[v] - od2[v]).abs() < 1e-6,
+                            "pm mismatch {wave1:?}/{wave2:?} lane {v} i {i}: \
+                             o1 {} vs {}, o2 {} vs {}",
+                            oc1[v], od1[v], oc2[v], od2[v]
+                        );
+                    }
+                }
+            }
         }
     }
 

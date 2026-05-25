@@ -197,6 +197,10 @@ pub struct VoiceBank {
     /// Output level compensation for the channel sum: 1.0 for Poly, ~1/√N for
     /// Unison so stacking all channels on one note isn't an N× level jump.
     level_comp: f32,
+    /// Whether the last note was triggered in Unison mode. Drives the gentler
+    /// unison glide scaling (the whole detuned stack slides at once, so the same
+    /// knob position wants a far subtler time) — set per `note_on`.
+    unison: bool,
     /// Per-channel glided pitch (MIDI note as f32). With portamento it ramps
     /// toward the target note at control-block rate; without, it tracks the note.
     glide_semi: [f32; N],
@@ -243,6 +247,7 @@ impl VoiceBank {
             alloc_tick: [0; N],
             detune_cents: [0.0; N],
             level_comp: 1.0,
+            unison: false,
             glide_semi: [0.0; N],
             glide_valid: [false; N],
             lfo1: std::array::from_fn(|i| LfoCore::new(control_rate, lfo1_seed(noise_seed, i))),
@@ -276,6 +281,7 @@ impl VoiceBank {
         self.gate = [false; N];
         self.detune_cents = [0.0; N];
         self.level_comp = 1.0;
+        self.unison = false;
         self.glide_semi = [0.0; N];
         self.glide_valid = [false; N];
         for lfo in &mut self.lfo1 {
@@ -336,17 +342,30 @@ impl VoiceBank {
         match mode {
             AssignMode::Poly => {
                 let v = self.allocate(note);
-                self.trigger(v, note, velocity, alloc_tick, 0.0, lfo1);
+                // DCO behaviour: phase resets to zero on every Poly note.
+                self.trigger(v, note, velocity, alloc_tick, 0.0, 0.0, lfo1);
                 self.level_comp = 1.0;
+                self.unison = false;
             }
             AssignMode::Unison => {
                 // Last-note priority: every channel retriggers to the new note
                 // (the prior note is not stacked). Per-channel detune fans the 8
-                // copies out for chorusing thickness.
+                // copies out, and a spread of start phases (rather than the Poly
+                // phase-0 reset) decorrelates the detuned copies' beating so they
+                // don't comb into synchronised nulls and thin the sound out.
                 for v in 0..N {
-                    self.trigger(v, note, velocity, alloc_tick, unison_spread(v) * unison_detune, lfo1);
+                    self.trigger(
+                        v,
+                        note,
+                        velocity,
+                        alloc_tick,
+                        unison_spread(v) * unison_detune,
+                        unison_phase(v),
+                        lfo1,
+                    );
                 }
                 self.level_comp = 1.0 / (N as f32).sqrt();
+                self.unison = true;
             }
         }
     }
@@ -361,6 +380,7 @@ impl VoiceBank {
         velocity: f32,
         alloc_tick: u64,
         detune_cents: f32,
+        start_phase: f32,
         lfo1: Lfo1Trigger,
     ) {
         self.note[v] = note;
@@ -378,6 +398,11 @@ impl VoiceBank {
         }
         self.osc1.reset(v);
         self.osc2.reset(v);
+        // Offset the (otherwise zeroed) start phase per channel. Same offset for
+        // both oscillators so a voice's osc1/osc2 relationship is preserved; the
+        // offset only decorrelates voices from each other (Unison). Poly passes 0.
+        self.osc1.phase[v] = start_phase;
+        self.osc2.phase[v] = start_phase;
     }
 
     pub fn note_off(&mut self, note: u8) {
@@ -392,13 +417,26 @@ impl VoiceBank {
         self.gate = [false; N];
     }
 
-    /// Pick a voice: re-use one already playing this note, else a free voice,
-    /// else steal the oldest.
+    /// Pick a voice: re-use one already playing this note, else the free voice
+    /// whose last pitch sits nearest the new note, else steal the oldest.
+    ///
+    /// Choosing the *nearest* free voice (by its glide source `glide_semi`, the
+    /// pitch it would sweep from) keeps Poly glide musical: a new note slides the
+    /// shortest distance, and a free voice already at that pitch snaps cleanly
+    /// instead of some far-off voice sweeping across the keyboard.
     fn allocate(&self, note: u8) -> usize {
         if let Some(v) = (0..N).find(|&v| self.active[v] && self.note[v] == note) {
             return v;
         }
-        if let Some(v) = (0..N).find(|&v| !self.active[v]) {
+        if let Some(v) = (0..N)
+            .filter(|&v| !self.active[v])
+            .min_by(|&a, &b| {
+                let target = note as f32;
+                (self.glide_semi[a] - target)
+                    .abs()
+                    .total_cmp(&(self.glide_semi[b] - target).abs())
+            })
+        {
             return v;
         }
         let mut best = 0;
@@ -434,9 +472,17 @@ impl VoiceBank {
         // note). `dt` is the block's wall-clock duration, so the glide rate is
         // independent of block size. 0 (or glide off) means snap to target.
         let glide = ctx.portamento_on && ctx.portamento_time > 0.0;
+        // The whole detuned Unison stack glides together, so the same knob
+        // position reads far stronger than one Poly voice — scale the time right
+        // down so Unison glide is a subtle scoop, not an audible stack slide.
+        let glide_time = if self.unison {
+            ctx.portamento_time * UNISON_GLIDE_SCALE
+        } else {
+            ctx.portamento_time
+        };
         let glide_coeff = if glide {
             let dt = base_frames as f32 / base_rate;
-            1.0 - (-dt / ctx.portamento_time).exp()
+            1.0 - (-dt / glide_time).exp()
         } else {
             1.0
         };
@@ -554,11 +600,23 @@ impl VoiceBank {
             for k in 0..os {
                 // Coupled osc2→osc1 path when sync is engaged or the PM index is
                 // non-zero; otherwise the independent, vectorised fast path —
-                // no cost for plain patches.
-                if ctx.sync || ctx.pm_index != 0.0 {
-                    self.osc1.process_pair(
+                // no cost for plain patches. Sync and PM are mutually exclusive at
+                // the engine (`CrossModType`), so each picks its specialised kernel
+                // and pays for only its own work (the combined `process_pair` is
+                // kept as the reference oracle).
+                if ctx.sync {
+                    self.osc1.process_sync(
                         &mut self.osc2,
-                        ctx.sync,
+                        ctx.osc1_wave,
+                        ctx.osc2_wave,
+                        &pw1,
+                        &pw2,
+                        &mut o1,
+                        &mut o2,
+                    );
+                } else if ctx.pm_index != 0.0 {
+                    self.osc1.process_pm(
+                        &mut self.osc2,
                         ctx.pm_index,
                         ctx.osc1_wave,
                         ctx.osc2_wave,
@@ -648,3 +706,25 @@ fn unison_spread(v: usize) -> f32 {
         (v as f32 / (N - 1) as f32) * 2.0 - 1.0
     }
 }
+
+/// Fixed Unison start phase for channel `v`, spread across the first **half**
+/// cycle `[0, 0.5]`. Offsetting the start phases (rather than the Poly phase-0
+/// reset for all) staggers when each detuned ± pair reaches its beat trough, so
+/// they no longer comb into one synchronised null that thins the sound. A half
+/// cycle (not the full circle) is deliberate: a full even spread sums to zero for
+/// coherent copies (detune 0), gutting the level, whereas a half-cycle spread
+/// keeps a strong coherent sum while still decorrelating the beating. Deterministic
+/// per channel, so the unison sum is reproducible / testable.
+#[inline]
+fn unison_phase(v: usize) -> f32 {
+    if N <= 1 {
+        0.0
+    } else {
+        0.5 * v as f32 / (N - 1) as f32
+    }
+}
+
+/// Unison glide-time scaling: the detuned stack slides together and reads far
+/// stronger than one Poly voice, so its effective portamento time is cut to this
+/// fraction of the knob value for a subtle scoop rather than an audible slide.
+const UNISON_GLIDE_SCALE: f32 = 0.15;
