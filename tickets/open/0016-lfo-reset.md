@@ -4,7 +4,13 @@ title: LFO reset on note start
 priority: low
 created: 2026-05-25
 epic: E004
+status: superseded
 ---
+
+> **Superseded by [E005](../../epics/open/E005-per-voice-and-global-lfo.md) /
+> [0018](0018-per-voice-lfo1.md).** A shared-phase reset jolts every held voice;
+> the per-voice LFO 1 retriggers intrinsically at each note-on instead. The
+> committed 0016 work was reverted and its zero-crossing logic folded into 0018.
 
 ## Summary
 
