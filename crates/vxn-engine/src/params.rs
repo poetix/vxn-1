@@ -195,10 +195,14 @@ pub enum PatchParam {
     AssignMode,
     /// Unison per-channel detune spread (cents); 0 = all channels in tune.
     UnisonDetune,
+    /// Portamento (pitch glide) on/off for this layer (ADR 0003 §4).
+    PortamentoOn,
+    /// Portamento glide time (s); 0 = instant (today's behaviour).
+    PortamentoTime,
 }
 
 impl PatchParam {
-    pub const COUNT: usize = PatchParam::UnisonDetune as usize + 1;
+    pub const COUNT: usize = PatchParam::PortamentoTime as usize + 1;
 
     /// In-block offset of the first modulation-matrix parameter (`Env1Pitch`).
     pub const MATRIX_BASE: usize = PatchParam::Env1Pitch as usize;
@@ -585,6 +589,9 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
     // ── E003 (offsets stay stable above this line) ──
     e("assign_mode", "Assign", ASSIGN_LABELS, 0.0),
     f("unison_detune", "Detune", 0.0, 50.0, 12.0, "ct", false),
+    b("portamento_on", "Glide", 0.0),
+    // Linear (not log) so 0 = instant is representable; range covers musical glides.
+    f("portamento_time", "Glide Time", 0.0, 5.0, 0.0, "s", false),
 ];
 
 /// Global descriptor table; indexed by [`GlobalParam`].

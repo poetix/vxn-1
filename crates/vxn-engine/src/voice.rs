@@ -111,6 +111,11 @@ pub struct BlockCtx {
     /// Cross-mod / linear FM depth (osc2 → osc1 pitch). 0 = off. Engages the
     /// coupled path alongside `sync` (E002 ticket 0005).
     pub cross_mod: f32,
+    /// Portamento (pitch glide) enabled for this layer.
+    pub portamento_on: bool,
+    /// Portamento glide time (s); 0 = instant. Glide is per channel, resolved at
+    /// control-block rate so it feeds osc pitch, sync and cross-mod consistently.
+    pub portamento_time: f32,
     pub matrix: ModMatrix,
 }
 
@@ -136,6 +141,12 @@ pub struct VoiceBank {
     /// Output level compensation for the channel sum: 1.0 for Poly, ~1/√N for
     /// Unison so stacking all channels on one note isn't an N× level jump.
     level_comp: f32,
+    /// Per-channel glided pitch (MIDI note as f32). With portamento it ramps
+    /// toward the target note at control-block rate; without, it tracks the note.
+    glide_semi: [f32; N],
+    /// Whether a channel has a previous pitch to glide *from*. False until its
+    /// first note, so the first note never sweeps up from zero.
+    glide_valid: [bool; N],
     /// LFO modulation fade-in after note-on (`ctx.lfo_delay`).
     lfo_fade: LfoFadeIn,
 }
@@ -160,6 +171,8 @@ impl VoiceBank {
             alloc_tick: [0; N],
             detune_cents: [0.0; N],
             level_comp: 1.0,
+            glide_semi: [0.0; N],
+            glide_valid: [false; N],
             lfo_fade: LfoFadeIn::new(),
         }
     }
@@ -186,6 +199,8 @@ impl VoiceBank {
         self.gate = [false; N];
         self.detune_cents = [0.0; N];
         self.level_comp = 1.0;
+        self.glide_semi = [0.0; N];
+        self.glide_valid = [false; N];
         self.lfo_fade.reset();
     }
 
@@ -332,6 +347,17 @@ impl VoiceBank {
         let base_rate = ctx.os_sample_rate / os as f32;
         let lfo_gain_inc = self.lfo_fade.begin_block(ctx.lfo_delay, base_rate);
 
+        // Portamento glide coefficient for this block (one-pole toward the target
+        // note). `dt` is the block's wall-clock duration, so the glide rate is
+        // independent of block size. 0 (or glide off) means snap to target.
+        let glide = ctx.portamento_on && ctx.portamento_time > 0.0;
+        let glide_coeff = if glide {
+            let dt = base_frames as f32 / base_rate;
+            1.0 - (-dt / ctx.portamento_time).exp()
+        } else {
+            1.0
+        };
+
         // ── Per-voice control-rate resolution (block start) ──
         let mut pw1 = [0.5f32; N];
         let mut pw2 = [0.5f32; N];
@@ -341,7 +367,19 @@ impl VoiceBank {
             let cutoff_mod = ctx.matrix.dest(ModDest::Cutoff, &srcs);
             let pwm_mod = ctx.matrix.dest(ModDest::Pwm, &srcs);
 
-            let nf = self.note[v] as f32;
+            // Portamento: glide each channel's pitch toward its target note. A
+            // freshly triggered channel snaps to target when glide is off, the
+            // time is 0, or it has no previous pitch (its first note); otherwise
+            // it ramps from where it was, giving JP-8 polyphonic glide per voice.
+            let target = self.note[v] as f32;
+            if self.trigger_pending[v] {
+                if !glide || !self.glide_valid[v] {
+                    self.glide_semi[v] = target;
+                }
+                self.glide_valid[v] = true;
+            }
+            self.glide_semi[v] += glide_coeff * (target - self.glide_semi[v]);
+            let nf = self.glide_semi[v];
             let detune = self.detune_cents[v] * 0.01; // cents → semitones (Unison)
             let s1 = ctx.base_semis + nf + ctx.osc1_semi + pitch_mod + detune;
             let s2 = ctx.base_semis + nf + ctx.osc2_semi + pitch_mod + detune;

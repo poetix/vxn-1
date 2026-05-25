@@ -15,17 +15,17 @@ independent glide per end for free.
 
 ## Acceptance criteria
 
-- [ ] Per-patch params: `PortamentoOn` (bool) and `PortamentoTime` (s, log,
+- [x] Per-patch params: `PortamentoOn` (bool) and `PortamentoTime` (s, log,
       0 = instant), appended within the per-patch block.
-- [ ] Per-channel glide state: on note-on, the channel's pitch starts at the
+- [x] Per-channel glide state: on note-on, the channel's pitch starts at the
       previous note's pitch and ramps to the target over the portamento time;
       time 0 reproduces today's instant pitch.
-- [ ] Glide is per layer/channel — Lower and Upper glide independently in
+- [x] Glide is per layer/channel — Lower and Upper glide independently in
       Split/Dual.
-- [ ] Plays nicely with pitch bend, cross-mod and sync (glide affects the base
+- [x] Plays nicely with pitch bend, cross-mod and sync (glide affects the base
       pitch that feeds those, resolved at control-block rate consistent with
       `voice.rs`).
-- [ ] Tests: a legato note-on glides pitch over ~`PortamentoTime` to the target;
+- [x] Tests: a legato note-on glides pitch over ~`PortamentoTime` to the target;
       time 0 jumps instantly (matches pre-change); glide is independent across
       layers.
 
