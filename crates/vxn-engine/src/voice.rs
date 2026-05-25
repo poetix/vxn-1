@@ -26,63 +26,6 @@ const N: usize = CHANNELS_PER_LAYER;
 /// the `HpfCutoff` param minimum (its default, ≈ fully open).
 const HPF_OFF_HZ: f32 = 20.0;
 
-/// Per-voice LFO modulation fade-in (the JP-8 "LFO delay"): each voice's gain
-/// ramps 0→1 over a settable time after note-on, scaling the LFO source seen by
-/// the matrix so the LFO-driven destinations fade in together.
-///
-/// Used by the **global LFO 2** (E005 / 0019 keeps LFO 2 shared; until then it
-/// is per layer). LFO 1 is per-voice (E005 / 0018) with its own two-stage onset
-/// — see [`Lfo1Onset`].
-#[derive(Clone)]
-struct LfoFadeIn {
-    gain: [f32; N],
-}
-
-impl LfoFadeIn {
-    fn new() -> Self {
-        Self { gain: [0.0; N] }
-    }
-
-    fn reset(&mut self) {
-        self.gain = [0.0; N];
-    }
-
-    /// Restart voice `v`'s fade from zero (call on note-on).
-    #[inline]
-    fn retrigger(&mut self, v: usize) {
-        self.gain[v] = 0.0;
-    }
-
-    #[inline]
-    fn gain(&self, v: usize) -> f32 {
-        self.gain[v]
-    }
-
-    /// Prepare the block: returns the per-base-frame ramp increment for
-    /// `delay_s`. A delay of 0 pins every voice to full depth and returns 0,
-    /// reproducing the undelayed path exactly.
-    #[inline]
-    fn begin_block(&mut self, delay_s: f32, base_rate: f32) -> f32 {
-        if delay_s > 0.0 {
-            1.0 / (delay_s * base_rate)
-        } else {
-            self.gain = [1.0; N];
-            0.0
-        }
-    }
-
-    /// Advance every voice's fade one base frame toward full depth. `inc == 0`
-    /// (no delay) is a no-op.
-    #[inline]
-    fn advance(&mut self, inc: f32) {
-        if inc > 0.0 {
-            for g in &mut self.gain {
-                *g = (*g + inc).min(1.0);
-            }
-        }
-    }
-}
-
 /// Per-voice LFO 1 retrigger policy at a note-on (E005 / 0018): the shape (for
 /// the zero-crossing restart) and whether the phase free-runs instead.
 #[derive(Clone, Copy)]
@@ -174,10 +117,9 @@ pub struct BlockCtx {
     /// over `lfo1_fade` s. Both 0 = full depth immediately.
     pub lfo1_delay_time: f32,
     pub lfo1_fade: f32,
-    /// LFO 2 sampled value this block (still shared — E004 / 0014, E005 / 0019).
+    /// Global LFO 2 sampled value this block (one instrument-wide LFO, sampled
+    /// once and broadcast to both layers — E005 / 0019). Constant depth, no delay.
     pub lfo2_val: f32,
-    /// LFO 2 modulation fade-in time after note-on (s); 0 = no delay.
-    pub lfo2_delay: f32,
     /// Hard sync on: osc2 (slave) phase resets each osc1 (master) cycle. Off
     /// keeps the independent, vectorised osc fast path (E002 ticket 0004).
     pub sync: bool,
@@ -228,8 +170,6 @@ pub struct VoiceBank {
     /// Seed base for the per-channel LFO 1 cores; kept so they can be rebuilt at
     /// the new control rate on a sample-rate change.
     lfo1_seed: u64,
-    /// LFO 2 modulation fade-in after note-on (`ctx.lfo2_delay`) — still shared.
-    lfo2_fade: LfoFadeIn,
 }
 
 /// Decorrelated per-channel LFO 1 seed from the layer's base seed.
@@ -267,7 +207,6 @@ impl VoiceBank {
             lfo1: std::array::from_fn(|i| LfoCore::new(control_rate, lfo1_seed(noise_seed, i))),
             lfo1_onset: Lfo1Onset::new(),
             lfo1_seed: noise_seed,
-            lfo2_fade: LfoFadeIn::new(),
         }
     }
 
@@ -302,7 +241,6 @@ impl VoiceBank {
             lfo.reset();
         }
         self.lfo1_onset.reset();
-        self.lfo2_fade.reset();
     }
 
     pub fn active_count(&self) -> usize {
@@ -397,7 +335,6 @@ impl VoiceBank {
         if !lfo1.free_run {
             self.lfo1[v].retrigger(lfo1.shape);
         }
-        self.lfo2_fade.retrigger(v);
         self.osc1.reset(v);
         self.osc2.reset(v);
     }
@@ -439,7 +376,7 @@ impl VoiceBank {
     /// because the two call sites differ — block-start resolution reads the
     /// stored ENV level and the block-start onset gain, the per-frame amp path
     /// the just-ticked ENV and the per-frame onset gain — while velocity,
-    /// key-follow and the (shared, faded) LFO 2 are common to both.
+    /// key-follow and the shared global LFO 2 (constant depth) are common to both.
     #[inline]
     fn mod_sources(
         &self,
@@ -453,7 +390,7 @@ impl VoiceBank {
             env1,
             env2,
             lfo1,
-            ctx.lfo2_val * self.lfo2_fade.gain(v),
+            ctx.lfo2_val,
             self.velocity[v],
             key_follow(self.note[v]),
         ]
@@ -465,7 +402,6 @@ impl VoiceBank {
         let os = ctx.os;
         let base_frames = out.len() / os;
         let base_rate = ctx.os_sample_rate / os as f32;
-        let lfo2_gain_inc = self.lfo2_fade.begin_block(ctx.lfo2_delay, base_rate);
 
         // Per-voice LFO 1: tick each channel's phase once for this block (held
         // across the block's frames, like the old per-layer LFO). The onset gain
@@ -618,9 +554,8 @@ impl VoiceBank {
                 out[frame + k] += sum * self.level_comp;
             }
 
-            // Advance the per-voice LFO 1 onset and the LFO 2 fade one base frame.
+            // Advance the per-voice LFO 1 onset one base frame.
             self.lfo1_onset.advance(onset_dt, onset_cap);
-            self.lfo2_fade.advance(lfo2_gain_inc);
 
             // Free voices whose envelopes have fully released.
             for v in 0..N {

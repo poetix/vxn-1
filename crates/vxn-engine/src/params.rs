@@ -174,12 +174,11 @@ pub enum PatchParam {
     KeyCutoff,
     KeyAmp,
     KeyPwm,
-    // LFO (per-layer — ADR 0003 §5)
+    // LFO 1 (per-voice — E005 / 0018). LFO 2's shape/rate/sync are global
+    // (instrument-wide LFO — E005 / 0019); only its matrix-routing depths
+    // (Lfo2Pitch … Lfo2Pwm, above) are per-patch.
     LfoShape,
     LfoRate,
-    // Second LFO (E004 / 0014) — beside LFO 1; own shape / rate, delay below.
-    Lfo2Shape,
-    Lfo2Rate,
     // ── Appended after v1 to keep earlier in-block offsets stable (E001) ──
     /// Pre-VCF high-pass cutoff (Hz). 20 ≈ fully open / "off".
     HpfCutoff,
@@ -194,8 +193,6 @@ pub enum PatchParam {
     /// LFO 1 free-run: when on, the per-voice phase persists across note-ons
     /// instead of retriggering to the shape's zero crossing.
     Lfo1FreeRun,
-    /// Per-voice fade-in of LFO 2 modulation after note-on (s) — E004 / 0014.
-    Lfo2Delay,
     // ── E002: oscillator interaction ──
     /// Hard sync: osc2 (slave) phase resets each osc1 (master) cycle.
     OscSync,
@@ -214,16 +211,14 @@ pub enum PatchParam {
     PortamentoOn,
     /// Portamento glide time (s); 0 = instant (today's behaviour).
     PortamentoTime,
-    // ── E004 / 0015: per-LFO host-tempo sync ──
+    // ── E004 / 0015: LFO 1 host-tempo sync (LFO 2's sync is global) ──
     /// LFO 1 host-sync on/off. When on, its rate knob selects a musical
     /// subdivision locked to host tempo instead of free Hz.
     LfoSync,
-    /// LFO 2 host-sync on/off (mirrors [`PatchParam::LfoSync`]).
-    Lfo2Sync,
 }
 
 impl PatchParam {
-    pub const COUNT: usize = PatchParam::Lfo2Sync as usize + 1;
+    pub const COUNT: usize = PatchParam::LfoSync as usize + 1;
 
     /// In-block offset of the first modulation-matrix parameter (`Env1Pitch`).
     pub const MATRIX_BASE: usize = PatchParam::Env1Pitch as usize;
@@ -293,10 +288,15 @@ pub enum GlobalParam {
     DelayPingPong,
     // Quality
     Oversample,
+    // Global LFO 2 (E005 / 0019): a single instrument-wide LFO. Its routing
+    // depths (Lfo2Pitch … Lfo2Pwm) stay per-patch; shape/rate/sync are global.
+    Lfo2Shape,
+    Lfo2Rate,
+    Lfo2Sync,
 }
 
 impl GlobalParam {
-    pub const COUNT: usize = GlobalParam::Oversample as usize + 1;
+    pub const COUNT: usize = GlobalParam::Lfo2Sync as usize + 1;
 
     pub fn all() -> impl Iterator<Item = GlobalParam> {
         (0..Self::COUNT).map(|i| Self::from_index(i).unwrap())
@@ -594,8 +594,6 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
     mw("key_pwm", "Key→PWM"),
     e("lfo_shape", "LFO 1 Shape", LFO_LABELS, 0.0),
     f("lfo_rate", "LFO 1 Rate", 0.01, 40.0, 5.0, "Hz", true),
-    e("lfo2_shape", "LFO 2 Shape", LFO_LABELS, 0.0),
-    f("lfo2_rate", "LFO 2 Rate", 0.01, 40.0, 5.0, "Hz", true),
     // ── Appended after v1 (E001); in-block offsets stay stable above this line. ──
     f("hpf_cutoff", "HPF Cutoff", 20.0, 18000.0, 20.0, "Hz", true),
     i("osc1_octave", "Osc 1 Octave", -4.0, 4.0, 0.0, "oct"),
@@ -603,7 +601,6 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
     f("lfo1_delay_time", "LFO 1 Delay", 0.0, 4.0, 0.0, "s", false),
     f("lfo1_fade", "LFO 1 Fade", 0.0, 4.0, 0.0, "s", false),
     b("lfo1_free_run", "LFO 1 Free", 0.0),
-    f("lfo2_delay", "LFO 2 Delay", 0.0, 4.0, 0.0, "s", false),
     // ── E002 (offsets stay stable above this line) ──
     b("osc_sync", "Sync", 0.0),
     f("cross_mod", "Cross Mod", 0.0, 1.0, 0.0, "", false),
@@ -623,9 +620,8 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
     b("portamento_on", "Glide", 0.0),
     // Linear (not log) so 0 = instant is representable; range covers musical glides.
     f("portamento_time", "Glide Time", 0.0, 5.0, 0.0, "s", false),
-    // ── E004 / 0015: per-LFO host-tempo sync ──
+    // ── E004 / 0015: LFO 1 host-tempo sync (LFO 2's sync is global) ──
     b("lfo_sync", "LFO 1 Sync", 0.0),
-    b("lfo2_sync", "LFO 2 Sync", 0.0),
 ];
 
 /// Global descriptor table; indexed by [`GlobalParam`].
@@ -642,6 +638,10 @@ pub static GLOBAL_PARAMS: [ParamDesc; GlobalParam::COUNT] = [
     f("delay_mix", "Delay Mix", 0.0, 1.0, 0.25, "", false),
     b("delay_pingpong", "Ping-Pong", 1.0),
     e("oversample", "Oversample", OVERSAMPLE_LABELS, 1.0),
+    // Global LFO 2 (E005 / 0019).
+    e("lfo2_shape", "LFO 2 Shape", LFO_LABELS, 0.0),
+    f("lfo2_rate", "LFO 2 Rate", 0.01, 40.0, 5.0, "Hz", true),
+    b("lfo2_sync", "LFO 2 Sync", 0.0),
 ];
 
 // ── Value storage ─────────────────────────────────────────────────────────────
@@ -717,10 +717,6 @@ impl PatchValues {
         LfoShape::ALL[enum_index(self.get(PatchParam::LfoShape), LfoShape::ALL.len() - 1)]
     }
 
-    pub fn lfo2_shape(&self) -> LfoShape {
-        LfoShape::ALL[enum_index(self.get(PatchParam::Lfo2Shape), LfoShape::ALL.len() - 1)]
-    }
-
     pub fn assign_mode(&self) -> AssignMode {
         AssignMode::from_index(enum_index(self.get(PatchParam::AssignMode), 1))
     }
@@ -793,6 +789,11 @@ impl GlobalValues {
             1 => 2,
             _ => 4,
         }
+    }
+
+    /// Global LFO 2 shape (E005 / 0019).
+    pub fn lfo2_shape(&self) -> LfoShape {
+        LfoShape::ALL[enum_index(self.get(GlobalParam::Lfo2Shape), LfoShape::ALL.len() - 1)]
     }
 }
 

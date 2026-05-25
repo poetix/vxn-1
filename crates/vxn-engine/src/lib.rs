@@ -50,9 +50,9 @@ pub use vxn_dsp::{ScopedFlushToZero, enable_flush_to_zero};
 /// Number of always-present layers (ADR 0003 §1). Indexed by [`Layer`].
 const LAYERS: usize = Layer::COUNT;
 
-/// Per-layer LFO 2 seeds (decorrelate the S&H shape across layers). LFO 1 is now
-/// per-voice and seeded inside each [`VoiceBank`] (E005 / 0018).
-const LFO2_SEEDS: [u64; LAYERS] = [0x7E5D, 0x1CE9];
+/// Seed for the single global LFO 2 (E005 / 0019). LFO 1 is per-voice and seeded
+/// inside each [`VoiceBank`] (E005 / 0018).
+const LFO2_SEED: u64 = 0x7E5D;
 /// Per-layer noise seeds (decorrelate the two layers' noise generators).
 const NOISE_SEEDS: [u64; LAYERS] = [0x9E37_79B9, 0x2545_F491];
 
@@ -66,10 +66,10 @@ pub struct Synth {
     /// Two always-present layers of 8 channels each (ADR 0003 §2). Each is a
     /// complete patch; both sum into the global FX bus.
     banks: [VoiceBank; LAYERS],
-    /// LFO 2 per layer (E004 / 0014). LFO 1 is now per-voice, living inside each
-    /// [`VoiceBank`] (E005 / 0018); LFO 2 stays shared here (E005 / 0019 makes it
-    /// a single instrument-wide LFO).
-    lfo2s: [LfoCore; LAYERS],
+    /// A single instrument-wide global LFO 2 (E005 / 0019), shared across both
+    /// layers and all voices: sampled once per block and broadcast. LFO 1 is
+    /// per-voice, living inside each [`VoiceBank`] (E005 / 0018).
+    lfo2: LfoCore,
     chorus: StereoChorus,
     delay: StereoDelay,
     /// Anti-aliasing decimator for the oversampled synthesis path.
@@ -111,7 +111,7 @@ impl Synth {
             smoother: ParamSmoother::new(sample_rate, &params),
             params,
             banks: std::array::from_fn(|i| VoiceBank::new(sample_rate, NOISE_SEEDS[i])),
-            lfo2s: std::array::from_fn(|i| LfoCore::new(control_rate, LFO2_SEEDS[i])),
+            lfo2: LfoCore::new(control_rate, LFO2_SEED),
             chorus: StereoChorus::new(sample_rate),
             delay: StereoDelay::new(sample_rate, 2.0),
             oversampler: Oversampler::new(),
@@ -133,10 +133,10 @@ impl Synth {
         }
         self.sample_rate = sample_rate;
         let control_rate = sample_rate / CONTROL_BLOCK as f32;
-        for (i, bank) in self.banks.iter_mut().enumerate() {
+        for bank in self.banks.iter_mut() {
             bank.set_sample_rate(sample_rate);
-            self.lfo2s[i] = LfoCore::new(control_rate, LFO2_SEEDS[i]);
         }
+        self.lfo2 = LfoCore::new(control_rate, LFO2_SEED);
         self.chorus = StereoChorus::new(sample_rate);
         self.delay = StereoDelay::new(sample_rate, 2.0);
         self.oversampler.reset();
@@ -275,10 +275,10 @@ impl Synth {
     }
 
     pub fn reset(&mut self) {
-        for (i, bank) in self.banks.iter_mut().enumerate() {
+        for bank in self.banks.iter_mut() {
             bank.reset_all();
-            self.lfo2s[i].reset();
         }
+        self.lfo2.reset();
         self.chorus.clear();
         self.delay.clear();
         self.oversampler.reset();
@@ -313,12 +313,26 @@ impl Synth {
             // apply per layer (each layer routes it via its own params §9).
             let wheel = self.mod_wheel.tick();
 
+            // Global LFO 2 (E005 / 0019): one instrument-wide LFO, sampled once
+            // per block and broadcast to both layers. Its shape/rate/sync are
+            // global params; host-sync resolves its rate from the engine tempo.
+            let gv = self.smoother.values().global();
+            let lfo2_shape = gv.lfo2_shape();
+            let lfo2_rate = lfo_rate_from(
+                GlobalParam::Lfo2Rate.desc(),
+                gv.get(GlobalParam::Lfo2Rate),
+                gv.bool(GlobalParam::Lfo2Sync),
+                self.tempo_bpm,
+            );
+            let lfo2_val = self.lfo2.next(lfo2_shape);
+            self.lfo2.set_rate(lfo2_rate);
+
             // Both layers render (summed) into one oversampled mono mix, then
             // decimated back to the base rate before the global FX bus (§7).
             let mut mono_os = [0.0f32; CONTROL_BLOCK * MAX_OVERSAMPLE];
             let mono_os = &mut mono_os[..block * os];
             for layer in 0..LAYERS {
-                let ctx = self.build_ctx(layer, key_mode, os, wheel);
+                let ctx = self.build_ctx(layer, key_mode, os, wheel, lfo2_val);
                 self.banks[layer].render_block(mono_os, &ctx);
             }
 
@@ -405,10 +419,18 @@ impl Synth {
         );
     }
 
-    /// Build one layer's control-block context from its param source (§3), its
-    /// own LFO (§5) and the global block. `wheel` is the once-per-block global
-    /// mod-wheel value, applied here via this layer's routing params (§9).
-    fn build_ctx(&mut self, layer: usize, key_mode: KeyMode, os: usize, wheel: f32) -> BlockCtx {
+    /// Build one layer's control-block context from its param source (§3) and the
+    /// global block. `wheel` is the once-per-block global mod-wheel value, applied
+    /// here via this layer's routing params (§9). `lfo2_val` is the single global
+    /// LFO 2 value, sampled once per block in `process` and broadcast (§5, E005).
+    fn build_ctx(
+        &self,
+        layer: usize,
+        key_mode: KeyMode,
+        os: usize,
+        wheel: f32,
+        lfo2_val: f32,
+    ) -> BlockCtx {
         let src = Self::param_source(layer, key_mode);
         let vals = self.smoother.values();
         let p = vals.layer(src);
@@ -416,10 +438,8 @@ impl Synth {
         let tempo = self.tempo_bpm;
         // LFO 1 is per-voice (E005 / 0018): the bank ticks each channel's phase.
         // Resolve its shared rate (post host-sync) here and hand the bank LFO 1's
-        // shape + onset times. LFO 2 stays shared, sampled here.
+        // shape + onset times. LFO 2 is the global LFO, already sampled.
         let lfo1_rate_hz = lfo_rate(p, PatchParam::LfoRate, PatchParam::LfoSync, tempo);
-        let lfo2_val = self.lfo2s[layer].next(p.lfo2_shape());
-        self.lfo2s[layer].set_rate(lfo_rate(p, PatchParam::Lfo2Rate, PatchParam::Lfo2Sync, tempo));
 
         // Pull the depth params into the matrix via the layout's own index
         // mapping: iterating `ModSource::ALL` now picks up the Lfo2 row (6×4)
@@ -472,7 +492,6 @@ impl Synth {
             lfo1_delay_time: p.get(PatchParam::Lfo1DelayTime),
             lfo1_fade: p.get(PatchParam::Lfo1Fade),
             lfo2_val,
-            lfo2_delay: p.get(PatchParam::Lfo2Delay),
             sync: p.bool(PatchParam::OscSync),
             cross_mod: p.get(PatchParam::CrossMod),
             portamento_on: p.bool(PatchParam::PortamentoOn),
@@ -484,16 +503,23 @@ impl Synth {
 
 /// Resolve an LFO's rate in Hz for this block (E004 / 0015). Sync off: the rate
 /// knob is free-running Hz, exactly as before. Sync on: the knob's normalised
-/// position selects a musical subdivision locked to `tempo_bpm`. The LFO core
-/// clamps the result to its valid Hz range.
+/// position (over `desc`'s range) selects a musical subdivision locked to
+/// `tempo_bpm`. The LFO core clamps the result to its valid Hz range. Works for
+/// both the per-patch LFO 1 rate and the global LFO 2 rate via their descriptors.
 #[inline]
-fn lfo_rate(p: &PatchValues, rate: PatchParam, sync_flag: PatchParam, tempo_bpm: f32) -> f32 {
-    if p.bool(sync_flag) {
-        let norm = rate.desc().to_normalized(p.get(rate));
+fn lfo_rate_from(desc: &ParamDesc, rate_value: f32, sync_on: bool, tempo_bpm: f32) -> f32 {
+    if sync_on {
+        let norm = desc.to_normalized(rate_value);
         sync::synced_hz(tempo_bpm, sync::index_from_norm(norm))
     } else {
-        p.get(rate)
+        rate_value
     }
+}
+
+/// [`lfo_rate_from`] for a per-patch LFO rate/sync pair (LFO 1).
+#[inline]
+fn lfo_rate(p: &PatchValues, rate: PatchParam, sync_flag: PatchParam, tempo_bpm: f32) -> f32 {
+    lfo_rate_from(rate.desc(), p.get(rate), p.bool(sync_flag), tempo_bpm)
 }
 
 /// Convenience: A4 = 440 Hz reference, exposed for tests/tools.
@@ -971,22 +997,23 @@ mod tests {
         );
     }
 
-    // ── E004 / 0014: second routable LFO (LFO 2 still shared) ────────────────
+    // ── E005 / 0019: global instrument-wide LFO 2 ────────────────────────────
 
     #[test]
     fn lfo2_zero_depth_matches_pre_change_output() {
-        // With every LFO2 depth at its default 0, the engine reproduces the
-        // single-LFO output bit-for-bit — the new source contributes nothing.
+        // With every LFO2 depth at 0, the engine reproduces the single-LFO output
+        // bit-for-bit — the global LFO 2 contributes nothing. (Its shape/rate are
+        // global params now.)
         let mut a = pitched_synth();
         a.set_param(pp(PatchParam::LfoCutoff), 24.0);
         a.note_on(57, 1.0);
         let (base, _) = render(&mut a, 12_000);
 
-        // Same patch, but tick LFO2 with a live rate/shape (depths stay 0).
+        // Same patch, but tick the global LFO 2 with a live rate/shape (depths 0).
         let mut b = pitched_synth();
         b.set_param(pp(PatchParam::LfoCutoff), 24.0);
-        b.set_param(pp(PatchParam::Lfo2Rate), 3.0);
-        b.set_param(pp(PatchParam::Lfo2Shape), 5.0); // S&H — exercises its PRNG
+        b.set_param(gp(GlobalParam::Lfo2Rate), 3.0);
+        b.set_param(gp(GlobalParam::Lfo2Shape), 5.0); // S&H — exercises its PRNG
         b.note_on(57, 1.0);
         let (with_lfo2, _) = render(&mut b, 12_000);
 
@@ -996,6 +1023,45 @@ mod tests {
             .map(|(x, y)| (x - y).abs())
             .fold(0.0f32, f32::max);
         assert!(max_err == 0.0, "zero-depth LFO2 changed output: {max_err}");
+    }
+
+    #[test]
+    fn global_lfo2_is_shared_across_both_layers() {
+        // The global LFO 2 reaches both layers from one shared phase: in Dual
+        // mode, routing LFO2→Amp on each layer and playing the same note on both
+        // yields the combined output = exactly twice one layer's (same LFO2 phase
+        // drives both). Proves a single instrument-wide source, not per-layer.
+        fn configure(s: &mut Synth) {
+            s.set_param(gp(GlobalParam::ChorusOn), 0.0);
+            s.set_key_mode(KeyMode::Dual);
+            for layer in Layer::ALL {
+                s.set_param(patch_clap_id(layer, PatchParam::Osc1Wave), 0.0); // sine
+                s.set_param(patch_clap_id(layer, PatchParam::Osc2Level), 0.0);
+                s.set_param(patch_clap_id(layer, PatchParam::NoiseLevel), 0.0);
+                s.set_param(patch_clap_id(layer, PatchParam::LfoPitch), 0.0);
+                s.set_param(patch_clap_id(layer, PatchParam::Env2Amp), 0.0);
+                s.set_param(patch_clap_id(layer, PatchParam::Lfo2Amp), 1.0); // LFO2→VCA
+            }
+            s.set_param(gp(GlobalParam::Lfo2Rate), 5.0);
+        }
+        let mut one = Synth::new(48_000.0);
+        configure(&mut one);
+        one.note_on_layer(0, 69, 1.0);
+        let (single, _) = render(&mut one, 9600);
+
+        let mut two = Synth::new(48_000.0);
+        configure(&mut two);
+        two.note_on_layer(0, 69, 1.0);
+        two.note_on_layer(1, 69, 1.0);
+        let (both, _) = render(&mut two, 9600);
+
+        assert!(rms(&single) > 0.01, "LFO2→amp produced no sound");
+        let max_err = single
+            .iter()
+            .zip(&both)
+            .map(|(a, b)| (2.0 * a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 1e-4, "global LFO2 not shared identically: {max_err}");
     }
 
     // ── E004 / 0015: host-tempo sync ────────────────────────────────────────
