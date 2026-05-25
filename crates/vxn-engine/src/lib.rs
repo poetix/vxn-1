@@ -49,8 +49,9 @@ pub use vxn_dsp::{ScopedFlushToZero, enable_flush_to_zero};
 /// Number of always-present layers (ADR 0003 §1). Indexed by [`Layer`].
 const LAYERS: usize = Layer::COUNT;
 
-/// Per-layer LFO seeds (decorrelate the S&H shape between layers).
-const LFO_SEEDS: [u64; LAYERS] = [0x51A7, 0xC0FF];
+/// Per-layer, per-LFO seeds (decorrelate the S&H shape between the two LFOs and
+/// across layers). `[layer][lfo]`.
+const LFO_SEEDS: [[u64; 2]; LAYERS] = [[0x51A7, 0x7E5D], [0xC0FF, 0x1CE9]];
 /// Per-layer noise seeds (decorrelate the two layers' noise generators).
 const NOISE_SEEDS: [u64; LAYERS] = [0x9E37_79B9, 0x2545_F491];
 
@@ -64,8 +65,9 @@ pub struct Synth {
     /// Two always-present layers of 8 channels each (ADR 0003 §2). Each is a
     /// complete patch; both sum into the global FX bus.
     banks: [VoiceBank; LAYERS],
-    /// Per-layer LFO (ADR 0003 §5): each layer modulates from its own LFO.
-    lfos: [LfoCore; LAYERS],
+    /// Per-layer LFOs (ADR 0003 §5): each layer has two independent full LFOs
+    /// (E004 / 0014), indexed `[layer][lfo]`.
+    lfos: [[LfoCore; 2]; LAYERS],
     chorus: StereoChorus,
     delay: StereoDelay,
     /// Anti-aliasing decimator for the oversampled synthesis path.
@@ -104,7 +106,9 @@ impl Synth {
             smoother: ParamSmoother::new(sample_rate, &params),
             params,
             banks: std::array::from_fn(|i| VoiceBank::new(sample_rate, NOISE_SEEDS[i])),
-            lfos: std::array::from_fn(|i| LfoCore::new(control_rate, LFO_SEEDS[i])),
+            lfos: std::array::from_fn(|i| {
+                std::array::from_fn(|j| LfoCore::new(control_rate, LFO_SEEDS[i][j]))
+            }),
             chorus: StereoChorus::new(sample_rate),
             delay: StereoDelay::new(sample_rate, 2.0),
             oversampler: Oversampler::new(),
@@ -127,7 +131,7 @@ impl Synth {
         let control_rate = sample_rate / CONTROL_BLOCK as f32;
         for (i, bank) in self.banks.iter_mut().enumerate() {
             bank.set_sample_rate(sample_rate);
-            self.lfos[i] = LfoCore::new(control_rate, LFO_SEEDS[i]);
+            self.lfos[i] = std::array::from_fn(|j| LfoCore::new(control_rate, LFO_SEEDS[i][j]));
         }
         self.chorus = StereoChorus::new(sample_rate);
         self.delay = StereoDelay::new(sample_rate, 2.0);
@@ -251,7 +255,9 @@ impl Synth {
     pub fn reset(&mut self) {
         for (i, bank) in self.banks.iter_mut().enumerate() {
             bank.reset_all();
-            self.lfos[i].reset();
+            for lfo in &mut self.lfos[i] {
+                lfo.reset();
+            }
         }
         self.chorus.clear();
         self.delay.clear();
@@ -387,12 +393,14 @@ impl Synth {
         let vals = self.smoother.values();
         let p = vals.layer(src);
         let g = vals.global();
-        let lfo_val = self.lfos[layer].next(p.lfo_shape());
-        self.lfos[layer].set_rate(p.get(PatchParam::LfoRate));
+        let lfo_val = self.lfos[layer][0].next(p.lfo_shape());
+        self.lfos[layer][0].set_rate(p.get(PatchParam::LfoRate));
+        let lfo2_val = self.lfos[layer][1].next(p.lfo2_shape());
+        self.lfos[layer][1].set_rate(p.get(PatchParam::Lfo2Rate));
 
         // Pull the depth params into the matrix via the layout's own index
-        // mapping, so an appended source row (future second LFO) needs no change
-        // here — only `PatchParam::matrix_row_base`.
+        // mapping: iterating `ModSource::ALL` now picks up the Lfo2 row (6×4)
+        // with no special-casing here — only `PatchParam::matrix_row_base`.
         let mut matrix = ModMatrix::new();
         for (s, &mod_src) in ModSource::ALL.iter().enumerate() {
             for (d, &dest) in ModDest::ALL.iter().enumerate() {
@@ -438,6 +446,8 @@ impl Synth {
             base_semis: g.get(GlobalParam::MasterTune) + self.bend_semis,
             lfo_val,
             lfo_delay: p.get(PatchParam::LfoDelay),
+            lfo2_val,
+            lfo2_delay: p.get(PatchParam::Lfo2Delay),
             sync: p.bool(PatchParam::OscSync),
             cross_mod: p.get(PatchParam::CrossMod),
             portamento_on: p.bool(PatchParam::PortamentoOn),
@@ -858,6 +868,62 @@ mod tests {
             open > 1.3 * dark,
             "wheel→cutoff did not open the filter: dark {dark}, open {open}"
         );
+    }
+
+    // ── E004 / 0014: second routable LFO ────────────────────────────────────
+
+    #[test]
+    fn lfo2_modulates_identically_to_lfo1() {
+        // LFO 1 and LFO 2 are both free-running sine from phase 0, so routing
+        // either to the (linear) Amp destination at equal depth yields the same
+        // rendered output. Proves the LFO2 source + 6×4 matrix are wired through
+        // build_ctx exactly as LFO1 is. (Amp avoids the filter chaos that would
+        // amplify float noise on a cutoff route.) Both LFOs share one rate so the
+        // residual LFO1→Pitch vibrato (its 0.05 default glides to 0 over the
+        // first ~10 ms) is identical whichever LFO carries the amp route.
+        fn render_via(amp: PatchParam) -> Vec<f32> {
+            let mut s = pitched_synth(); // sine, LfoPitch target 0
+            s.set_param(pp(PatchParam::Env2Amp), 0.0); // VCA driven by the LFO alone
+            s.set_param(pp(PatchParam::LfoRate), 6.0);
+            s.set_param(pp(PatchParam::Lfo2Rate), 6.0);
+            s.set_param(pp(amp), 1.0); // full tremolo
+            s.note_on(57, 1.0);
+            render(&mut s, 24_000).0
+        }
+        let via1 = render_via(PatchParam::LfoAmp);
+        let via2 = render_via(PatchParam::Lfo2Amp);
+        assert!(rms(&via1) > 0.01, "LFO1→amp produced no sound");
+        let max_err = via1
+            .iter()
+            .zip(&via2)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 1e-6, "LFO2 != LFO1 routing: max_err {max_err}");
+    }
+
+    #[test]
+    fn lfo2_zero_depth_matches_pre_change_output() {
+        // With every LFO2 depth at its default 0, the engine reproduces the
+        // single-LFO output bit-for-bit — the new source contributes nothing.
+        let mut a = pitched_synth();
+        a.set_param(pp(PatchParam::LfoCutoff), 24.0);
+        a.note_on(57, 1.0);
+        let (base, _) = render(&mut a, 12_000);
+
+        // Same patch, but tick LFO2 with a live rate/shape (depths stay 0).
+        let mut b = pitched_synth();
+        b.set_param(pp(PatchParam::LfoCutoff), 24.0);
+        b.set_param(pp(PatchParam::Lfo2Rate), 3.0);
+        b.set_param(pp(PatchParam::Lfo2Shape), 5.0); // S&H — exercises its PRNG
+        b.note_on(57, 1.0);
+        let (with_lfo2, _) = render(&mut b, 12_000);
+
+        let max_err = base
+            .iter()
+            .zip(&with_lfo2)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err == 0.0, "zero-depth LFO2 changed output: {max_err}");
     }
 
     #[test]

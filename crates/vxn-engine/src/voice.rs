@@ -4,7 +4,7 @@
 //! tick at the base rate; the oscillators and ladder run at the oversampled
 //! rate.
 //!
-//! Modulation model (Jupiter-8-shaped, generalised): ENV-1, ENV-2, LFO,
+//! Modulation model (Jupiter-8-shaped, generalised): ENV-1, ENV-2, LFO 1, LFO 2,
 //! velocity and key-follow are sources; pitch, cutoff, amp and PWM are
 //! destinations. Pitch/cutoff/PWM are resolved once per control block; amp is
 //! evaluated per base frame (held across oversampled subframes).
@@ -103,8 +103,12 @@ pub struct BlockCtx {
     pub variant: LadderVariant,
     pub base_semis: f32,
     pub lfo_val: f32,
-    /// LFO modulation fade-in time after note-on (s); 0 = no delay.
+    /// LFO 1 modulation fade-in time after note-on (s); 0 = no delay.
     pub lfo_delay: f32,
+    /// LFO 2 sampled value this block (E004 / 0014).
+    pub lfo2_val: f32,
+    /// LFO 2 modulation fade-in time after note-on (s); 0 = no delay.
+    pub lfo2_delay: f32,
     /// Hard sync on: osc2 (slave) phase resets each osc1 (master) cycle. Off
     /// keeps the independent, vectorised osc fast path (E002 ticket 0004).
     pub sync: bool,
@@ -147,8 +151,10 @@ pub struct VoiceBank {
     /// Whether a channel has a previous pitch to glide *from*. False until its
     /// first note, so the first note never sweeps up from zero.
     glide_valid: [bool; N],
-    /// LFO modulation fade-in after note-on (`ctx.lfo_delay`).
+    /// LFO 1 modulation fade-in after note-on (`ctx.lfo_delay`).
     lfo_fade: LfoFadeIn,
+    /// LFO 2 modulation fade-in after note-on (`ctx.lfo2_delay`) — E004 / 0014.
+    lfo2_fade: LfoFadeIn,
 }
 
 impl VoiceBank {
@@ -174,6 +180,7 @@ impl VoiceBank {
             glide_semi: [0.0; N],
             glide_valid: [false; N],
             lfo_fade: LfoFadeIn::new(),
+            lfo2_fade: LfoFadeIn::new(),
         }
     }
 
@@ -202,6 +209,7 @@ impl VoiceBank {
         self.glide_semi = [0.0; N];
         self.glide_valid = [false; N];
         self.lfo_fade.reset();
+        self.lfo2_fade.reset();
     }
 
     pub fn active_count(&self) -> usize {
@@ -281,6 +289,7 @@ impl VoiceBank {
         self.alloc_tick[v] = alloc_tick;
         self.detune_cents[v] = detune_cents;
         self.lfo_fade.retrigger(v);
+        self.lfo2_fade.retrigger(v);
         self.osc1.reset(v);
         self.osc2.reset(v);
     }
@@ -334,6 +343,7 @@ impl VoiceBank {
             env1,
             env2,
             ctx.lfo_val * self.lfo_fade.gain(v),
+            ctx.lfo2_val * self.lfo2_fade.gain(v),
             self.velocity[v],
             key_follow(self.note[v]),
         ]
@@ -346,6 +356,7 @@ impl VoiceBank {
         let base_frames = out.len() / os;
         let base_rate = ctx.os_sample_rate / os as f32;
         let lfo_gain_inc = self.lfo_fade.begin_block(ctx.lfo_delay, base_rate);
+        let lfo2_gain_inc = self.lfo2_fade.begin_block(ctx.lfo2_delay, base_rate);
 
         // Portamento glide coefficient for this block (one-pole toward the target
         // note). `dt` is the block's wall-clock duration, so the glide rate is
@@ -484,8 +495,9 @@ impl VoiceBank {
                 out[frame + k] += sum * self.level_comp;
             }
 
-            // Advance the per-voice LFO fade-in one base frame (held at 1).
+            // Advance the per-voice LFO fade-ins one base frame (held at 1).
             self.lfo_fade.advance(lfo_gain_inc);
+            self.lfo2_fade.advance(lfo2_gain_inc);
 
             // Free voices whose envelopes have fully released.
             for v in 0..N {

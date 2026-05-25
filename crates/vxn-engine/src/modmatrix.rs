@@ -2,7 +2,7 @@
 //! shaped after the Jupiter-8 (assignable envelopes + LFO) and generalised so
 //! every source can reach every destination.
 //!
-//! Sources: ENV-1, ENV-2, LFO, Velocity, KeyFollow.
+//! Sources: ENV-1, ENV-2, LFO 1, LFO 2, Velocity, KeyFollow.
 //! Destinations: Pitch, Cutoff, PWM (additive), Amp (the VCA control sum).
 //!
 //! The matrix itself is pure data: `depth[source][destination]`. Destination
@@ -16,16 +16,18 @@ pub enum ModSource {
     Env1,
     Env2,
     Lfo,
+    Lfo2,
     Velocity,
     KeyFollow,
 }
 
 impl ModSource {
-    pub const COUNT: usize = 5;
+    pub const COUNT: usize = 6;
     pub const ALL: [ModSource; Self::COUNT] = [
         ModSource::Env1,
         ModSource::Env2,
         ModSource::Lfo,
+        ModSource::Lfo2,
         ModSource::Velocity,
         ModSource::KeyFollow,
     ];
@@ -34,7 +36,8 @@ impl ModSource {
         match self {
             ModSource::Env1 => "Env 1",
             ModSource::Env2 => "Env 2",
-            ModSource::Lfo => "LFO",
+            ModSource::Lfo => "LFO 1",
+            ModSource::Lfo2 => "LFO 2",
             ModSource::Velocity => "Velocity",
             ModSource::KeyFollow => "Key Follow",
         }
@@ -122,8 +125,8 @@ mod tests {
         m.set(ModSource::Env2, ModDest::Amp, 1.0);
         m.set(ModSource::Lfo, ModDest::Amp, 0.5);
         m.set(ModSource::Env1, ModDest::Cutoff, 24.0);
-        // srcs: env1=0.5, env2=0.8, lfo=-1, vel=1, key=2
-        let srcs = [0.5, 0.8, -1.0, 1.0, 2.0];
+        // srcs: env1=0.5, env2=0.8, lfo=-1, lfo2=0, vel=1, key=2
+        let srcs = [0.5, 0.8, -1.0, 0.0, 1.0, 2.0];
         assert!((m.dest(ModDest::Amp, &srcs) - (0.8 - 0.5)).abs() < 1e-6);
         assert!((m.dest(ModDest::Cutoff, &srcs) - 12.0).abs() < 1e-6);
         assert_eq!(m.dest(ModDest::Pitch, &srcs), 0.0);

@@ -30,8 +30,8 @@
 //! matching CLAP's plain-value convention. Enum/bool params store the variant
 //! index / 0.0|1.0 and are read back through typed accessors.
 //!
-//! The 20 modulation-depth params (`Env1Pitch` … `KeyPwm`) are laid out
-//! source-major, destination-minor **within** the per-patch block so the engine
+//! The 24 modulation-depth params (`Env1Pitch` … `KeyPwm`, 6 sources × 4 dests)
+//! are laid out source-major, destination-minor **within** the per-patch block so the engine
 //! can address them by `MATRIX_BASE + source*ModDest::COUNT + dest` (see
 //! [`crate::modmatrix`]).
 
@@ -162,6 +162,10 @@ pub enum PatchParam {
     LfoCutoff,
     LfoAmp,
     LfoPwm,
+    Lfo2Pitch,
+    Lfo2Cutoff,
+    Lfo2Amp,
+    Lfo2Pwm,
     VelPitch,
     VelCutoff,
     VelAmp,
@@ -173,6 +177,9 @@ pub enum PatchParam {
     // LFO (per-layer — ADR 0003 §5)
     LfoShape,
     LfoRate,
+    // Second LFO (E004 / 0014) — beside LFO 1; own shape / rate, delay below.
+    Lfo2Shape,
+    Lfo2Rate,
     // ── Appended after v1 to keep earlier in-block offsets stable (E001) ──
     /// Pre-VCF high-pass cutoff (Hz). 20 ≈ fully open / "off".
     HpfCutoff,
@@ -181,6 +188,8 @@ pub enum PatchParam {
     Osc2Octave,
     /// Per-voice fade-in of LFO modulation after note-on (s).
     LfoDelay,
+    /// Per-voice fade-in of LFO 2 modulation after note-on (s) — E004 / 0014.
+    Lfo2Delay,
     // ── E002: oscillator interaction ──
     /// Hard sync: osc2 (slave) phase resets each osc1 (master) cycle.
     OscSync,
@@ -554,10 +563,15 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
     ma("env2_amp", "Env2→Amp", 1.0),
     mw("env2_pwm", "Env2→PWM"),
     // Gentle always-on vibrato by default (~5 cents at the 5 Hz LFO rate).
-    mp("lfo_pitch", "LFO→Pitch", 0.05),
-    mc("lfo_cutoff", "LFO→Cutoff"),
-    ma("lfo_amp", "LFO→Amp", 0.0),
-    mw("lfo_pwm", "LFO→PWM"),
+    mp("lfo_pitch", "LFO1→Pitch", 0.05),
+    mc("lfo_cutoff", "LFO1→Cutoff"),
+    ma("lfo_amp", "LFO1→Amp", 0.0),
+    mw("lfo_pwm", "LFO1→PWM"),
+    // LFO 2 row (E004 / 0014) — all unrouted by default.
+    mp("lfo2_pitch", "LFO2→Pitch", 0.0),
+    mc("lfo2_cutoff", "LFO2→Cutoff"),
+    ma("lfo2_amp", "LFO2→Amp", 0.0),
+    mw("lfo2_pwm", "LFO2→PWM"),
     mp("vel_pitch", "Vel→Pitch", 0.0),
     mc("vel_cutoff", "Vel→Cutoff"),
     ma("vel_amp", "Vel→Amp", 0.0),
@@ -566,13 +580,16 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
     mc("key_cutoff", "Key→Cutoff"),
     ma("key_amp", "Key→Amp", 0.0),
     mw("key_pwm", "Key→PWM"),
-    e("lfo_shape", "LFO Shape", LFO_LABELS, 0.0),
-    f("lfo_rate", "LFO Rate", 0.01, 40.0, 5.0, "Hz", true),
+    e("lfo_shape", "LFO 1 Shape", LFO_LABELS, 0.0),
+    f("lfo_rate", "LFO 1 Rate", 0.01, 40.0, 5.0, "Hz", true),
+    e("lfo2_shape", "LFO 2 Shape", LFO_LABELS, 0.0),
+    f("lfo2_rate", "LFO 2 Rate", 0.01, 40.0, 5.0, "Hz", true),
     // ── Appended after v1 (E001); in-block offsets stay stable above this line. ──
     f("hpf_cutoff", "HPF Cutoff", 20.0, 18000.0, 20.0, "Hz", true),
     i("osc1_octave", "Osc 1 Octave", -4.0, 4.0, 0.0, "oct"),
     i("osc2_octave", "Osc 2 Octave", -4.0, 4.0, 0.0, "oct"),
-    f("lfo_delay", "LFO Delay", 0.0, 4.0, 0.0, "s", false),
+    f("lfo_delay", "LFO 1 Delay", 0.0, 4.0, 0.0, "s", false),
+    f("lfo2_delay", "LFO 2 Delay", 0.0, 4.0, 0.0, "s", false),
     // ── E002 (offsets stay stable above this line) ──
     b("osc_sync", "Sync", 0.0),
     f("cross_mod", "Cross Mod", 0.0, 1.0, 0.0, "", false),
@@ -681,6 +698,10 @@ impl PatchValues {
 
     pub fn lfo_shape(&self) -> LfoShape {
         LfoShape::ALL[enum_index(self.get(PatchParam::LfoShape), LfoShape::ALL.len() - 1)]
+    }
+
+    pub fn lfo2_shape(&self) -> LfoShape {
+        LfoShape::ALL[enum_index(self.get(PatchParam::Lfo2Shape), LfoShape::ALL.len() - 1)]
     }
 
     pub fn assign_mode(&self) -> AssignMode {
@@ -866,7 +887,7 @@ mod tests {
 
     #[test]
     fn matrix_layout_is_contiguous_and_ordered() {
-        // The 20 matrix params sit at MATRIX_BASE in source-major, dest-minor
+        // The 24 matrix params sit at MATRIX_BASE in source-major, dest-minor
         // order within the per-patch block so matrix_index() addresses them.
         assert_eq!(PatchParam::MATRIX_BASE, PatchParam::Env1Pitch.index());
         assert_eq!(
@@ -881,10 +902,40 @@ mod tests {
             PatchParam::matrix_index(ModSource::Lfo, ModDest::Cutoff),
             PatchParam::LfoCutoff.index()
         );
+        // LFO 2 is the 4th source row (E004 / 0014): its block is contiguous and
+        // ordered right after the LFO 1 row.
+        assert_eq!(
+            PatchParam::matrix_index(ModSource::Lfo2, ModDest::Pitch),
+            PatchParam::Lfo2Pitch.index()
+        );
+        assert_eq!(
+            PatchParam::matrix_index(ModSource::Lfo2, ModDest::Pwm),
+            PatchParam::Lfo2Pwm.index()
+        );
+        assert!(PatchParam::is_matrix_param(PatchParam::Lfo2Amp.index()));
         assert!(PatchParam::is_matrix_param(PatchParam::Env1Pitch.index()));
         assert!(!PatchParam::is_matrix_param(PatchParam::LfoShape.index()));
         // ENV-2→Amp is the only route that defaults non-zero.
         assert_eq!(PatchValues::default().get(PatchParam::Env2Amp), 1.0);
+    }
+
+    #[test]
+    fn matrix_indexing_roundtrips_all_24_params() {
+        // 6 sources × 4 destinations, contiguous and source-major; every cell
+        // maps to a distinct in-block offset and back.
+        let mut seen = std::collections::BTreeSet::new();
+        for src in ModSource::ALL {
+            for dest in ModDest::ALL {
+                let idx = PatchParam::matrix_index(src, dest);
+                assert!(PatchParam::is_matrix_param(idx), "{src:?}->{dest:?} not flagged");
+                assert!(seen.insert(idx), "duplicate offset for {src:?}->{dest:?}");
+            }
+        }
+        assert_eq!(seen.len(), ModSource::COUNT * ModDest::COUNT);
+        assert_eq!(seen.len(), 24);
+        // Contiguous run starting at MATRIX_BASE.
+        assert_eq!(*seen.iter().next().unwrap(), PatchParam::MATRIX_BASE);
+        assert_eq!(*seen.iter().last().unwrap(), PatchParam::MATRIX_BASE + 23);
     }
 
     #[test]
