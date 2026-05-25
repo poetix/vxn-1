@@ -24,10 +24,17 @@
 //! Fader signals hold the *normalized* `[0, 1]` value; the shared store converts
 //! to/from plain units via the parameter descriptors.
 //!
-//! The 5×4 modulation matrix is surfaced economically: only the musically
+//! The 6×4 modulation matrix is surfaced economically: only the musically
 //! useful routes get dedicated faders, placed in context (filter mods in the
 //! Filter panel, vibrato/pitch-env/PWM in VCO Mod, velocity/tremolo in Amp).
-//! The remaining cells stay engine-only but host-automatable.
+//! Both LFO rows ride this layout — LFO 1's routes plus the LFO 2 row's four
+//! per-patch depths (`Lfo2*`) sit beside their LFO 1 counterparts. The remaining
+//! cells stay engine-only but host-automatable.
+//!
+//! The two LFOs are asymmetric (E005): LFO 1 is per-voice with a delay→fade
+//! onset and a free-run toggle (its own panel), while LFO 2 is one global
+//! instrument-wide oscillator (a global panel). Both expose a host-sync toggle;
+//! with sync on, the rate readout shows the musical subdivision instead of Hz.
 
 use std::ffi::c_void;
 use std::sync::Arc;
@@ -74,7 +81,8 @@ fn note_name(n: u8) -> String {
 pub type EditorHandle = WindowHandle;
 
 pub const EDITOR_WIDTH: u32 = 820;
-pub const EDITOR_HEIGHT: u32 = 470;
+/// Four panel rows now (LFO 1 / LFO 2 split out the effects onto their own row).
+pub const EDITOR_HEIGHT: u32 = 600;
 
 /// A control entry: CLAP id plus a short faceplate label (the panel header
 /// supplies the context, so per-control labels stay terse). Entries are baked
@@ -98,7 +106,8 @@ const fn g(p: GlobalParam) -> usize {
 const ROWS: &[&[(&str, &[Entry])]] = {
     use GlobalParam::{
         ChorusDepth, ChorusMix, ChorusOn, ChorusRate, DelayFeedback, DelayMix, DelayOn,
-        DelayPingPong, DelayTime, MasterTune, MasterVolume, Oversample,
+        DelayPingPong, DelayTime, Lfo2Rate, Lfo2Shape, Lfo2Sync, MasterTune, MasterVolume,
+        Oversample,
     };
     use PatchParam::*;
     &[
@@ -131,8 +140,10 @@ const ROWS: &[&[(&str, &[Entry])]] = {
                 "VCO Mod",
                 &[
                     (u(LfoPitch), "Vib"),
+                    (u(Lfo2Pitch), "Vib2"),
                     (u(Env1Pitch), "P.Env"),
                     (u(LfoPwm), "PWM"),
+                    (u(Lfo2Pwm), "PWM2"),
                 ],
             ),
         ],
@@ -146,6 +157,7 @@ const ROWS: &[&[(&str, &[Entry])]] = {
                     (u(Env1Cutoff), "Env"),
                     (u(KeyCutoff), "Key"),
                     (u(LfoCutoff), "LFO"),
+                    (u(Lfo2Cutoff), "LFO2"),
                     (u(VelCutoff), "Vel"),
                     (u(FilterVariant), "Type"),
                 ],
@@ -172,8 +184,40 @@ const ROWS: &[&[(&str, &[Entry])]] = {
             ),
         ],
         &[
-            ("LFO", &[(u(LfoShape), "Shape"), (u(LfoRate), "Rate")]),
-            ("Amp", &[(u(VelAmp), "Vel"), (u(LfoAmp), "Trem")]),
+            (
+                // LFO 1 — per-voice (E005 / 0018): shape/rate/sync plus the
+                // per-voice delay→fade onset and free-run toggle.
+                "LFO 1",
+                &[
+                    (u(LfoShape), "Shape"),
+                    (u(LfoRate), "Rate"),
+                    (u(LfoSync), "Sync"),
+                    (u(Lfo1DelayTime), "Delay"),
+                    (u(Lfo1Fade), "Fade"),
+                    (u(Lfo1FreeRun), "Free"),
+                ],
+            ),
+            (
+                // LFO 2 — one global instrument-wide oscillator (E005 / 0019);
+                // shape/rate/sync are global (its routing depths live in the
+                // VCO Mod / Filter / Amp panels as the LFO 2 matrix row).
+                "LFO 2",
+                &[
+                    (g(Lfo2Shape), "Shape"),
+                    (g(Lfo2Rate), "Rate"),
+                    (g(Lfo2Sync), "Sync"),
+                ],
+            ),
+            (
+                "Amp",
+                &[
+                    (u(VelAmp), "Vel"),
+                    (u(LfoAmp), "Trem"),
+                    (u(Lfo2Amp), "Trem2"),
+                ],
+            ),
+        ],
+        &[
             (
                 "Master",
                 &[
@@ -237,8 +281,9 @@ const DIAL: f32 = 62.0;
 
 /// UI value range for a fader. Bipolar routes (env→cutoff, env→pitch) use the
 /// full descriptor range, centred at zero; the unipolar mod amounts
-/// (key/LFO/velocity→cutoff, vibrato, LFO→PWM, velocity/LFO→amp) are shown
-/// positive-only (`0..max`) even though the underlying depth param is bipolar.
+/// (key/LFO/velocity→cutoff, LFO→PWM, velocity/LFO→amp — both LFO rows) are
+/// shown positive-only (`0..max`) even though the underlying depth param is
+/// bipolar. LFO→pitch is handled separately (see [`is_lfo_pitch`]).
 fn ui_range(idx: usize) -> (f32, f32) {
     use PatchParam::*;
     let Some(d) = desc_for_clap_id(idx) else {
@@ -247,14 +292,67 @@ fn ui_range(idx: usize) -> (f32, f32) {
     match param_ref(idx) {
         Some(ParamRef::Patch(
             _,
-            KeyCutoff | LfoCutoff | VelCutoff | LfoPitch | LfoPwm | VelAmp | LfoAmp,
+            KeyCutoff | LfoCutoff | VelCutoff | LfoPwm | VelAmp | LfoAmp | Lfo2Cutoff | Lfo2Amp
+            | Lfo2Pwm,
         )) => (0.0, d.max),
         _ => (d.min, d.max),
     }
 }
 
+/// LFO→pitch routes (`LfoPitch` / `Lfo2Pitch`) get a narrowed, curved fader for
+/// musical vibrato rather than the route's full ±48 st: it tops out at a whole
+/// semitone and bends so the half-way point sits at ~0.2 st, keeping the gentle
+/// useful range spread across most of the travel. The underlying depth param
+/// still spans ±48 st for automation/presets — this only shapes the editor fader.
+fn is_lfo_pitch(idx: usize) -> bool {
+    matches!(
+        param_ref(idx),
+        Some(ParamRef::Patch(
+            _,
+            PatchParam::LfoPitch | PatchParam::Lfo2Pitch
+        ))
+    )
+}
+
+/// Whole-semitone ceiling for the LFO→pitch faders.
+const LFO_PITCH_MAX: f32 = 1.0;
+/// Curve exponent placing the fader midpoint at ~0.2 st: `ln(0.2)/ln(0.5)`.
+const LFO_PITCH_CURVE: f32 = 2.321_928;
+
+/// Envelope time faders (attack / decay / release on both envelopes) get an
+/// exponential taper rather than the descriptor's linear 0.001..10 s, so the
+/// busy short-time region isn't crammed into the bottom of the travel. The
+/// curve `t = A·(e^(K·n) − 1)` is pinned through two anchors: the fader midpoint
+/// reads **1 s** and the top reads **10 s** (the JP-8's full range) — i.e. the
+/// lower half spans 0–1 s, the upper half 1–10 s. Sustain (a level, not a time)
+/// keeps the plain linear map.
+fn is_adsr_time(idx: usize) -> bool {
+    use PatchParam::*;
+    matches!(
+        param_ref(idx),
+        Some(ParamRef::Patch(
+            _,
+            Env1Attack | Env1Decay | Env1Release | Env2Attack | Env2Decay | Env2Release
+        ))
+    )
+}
+
+/// `K = 2·ln(9)`; with `A` below this puts the midpoint at 1 s and the top at 10 s.
+const ADSR_K: f32 = 4.394_449;
+/// `A = 1/(e^(K/2) − 1) = 1/8`.
+const ADSR_A: f32 = 0.125;
+
 /// Plain value → fader position `[0, 1]` over the UI range.
 fn fader_to_ui(idx: usize, value: f32) -> f32 {
+    if is_lfo_pitch(idx) {
+        return (value / LFO_PITCH_MAX)
+            .clamp(0.0, 1.0)
+            .powf(1.0 / LFO_PITCH_CURVE);
+    }
+    if is_adsr_time(idx) {
+        // Inverse of `A·(e^(K·n) − 1)`.
+        return ((value / ADSR_A + 1.0).ln() / ADSR_K).clamp(0.0, 1.0);
+    }
     let (lo, hi) = ui_range(idx);
     if hi > lo {
         ((value - lo) / (hi - lo)).clamp(0.0, 1.0)
@@ -265,8 +363,30 @@ fn fader_to_ui(idx: usize, value: f32) -> f32 {
 
 /// Fader position `[0, 1]` → plain value over the UI range.
 fn fader_from_ui(idx: usize, n: f32) -> f32 {
+    if is_lfo_pitch(idx) {
+        return n.clamp(0.0, 1.0).powf(LFO_PITCH_CURVE) * LFO_PITCH_MAX;
+    }
+    if is_adsr_time(idx) {
+        return ADSR_A * ((ADSR_K * n.clamp(0.0, 1.0)).exp() - 1.0);
+    }
     let (lo, hi) = ui_range(idx);
     lo + n.clamp(0.0, 1.0) * (hi - lo)
+}
+
+/// The host-sync toggle paired with an LFO rate fader, if `idx` is one. With
+/// that toggle on, the rate knob's position selects a musical subdivision
+/// (E004 / 0015), so the rate readout shows the subdivision label instead of Hz.
+/// LFO 1's rate/sync are per-patch (same layer); LFO 2's are global.
+fn sync_partner(idx: usize) -> Option<usize> {
+    match param_ref(idx) {
+        Some(ParamRef::Patch(layer, PatchParam::LfoRate)) => {
+            Some(patch_clap_id(layer, PatchParam::LfoSync))
+        }
+        Some(ParamRef::Global(GlobalParam::Lfo2Rate)) => {
+            Some(global_clap_id(GlobalParam::Lfo2Sync))
+        }
+        _ => None,
+    }
 }
 
 /// A bound control and its reactive value signal, kept so `on_idle` can sync
@@ -303,13 +423,14 @@ fn make_ctl(i: usize, shared: &SharedParams) -> Ctl {
         return Ctl::Fader(i, SyncSignal::new(0.0));
     };
     // Rotary for the waveform / LFO-shape selectors; buttons for Oversample —
-    // detected on the typed param so it holds across both layers.
+    // detected on the typed param so it holds across both layers (and the global
+    // LFO 2 shape).
     let is_rotary = matches!(
         param_ref(i),
         Some(ParamRef::Patch(
             _,
             PatchParam::Osc1Wave | PatchParam::Osc2Wave | PatchParam::LfoShape
-        ))
+        )) | Some(ParamRef::Global(GlobalParam::Lfo2Shape))
     );
     let is_buttons = matches!(
         param_ref(i),
@@ -760,10 +881,25 @@ fn control_view(cx: &mut Context, ctl: Ctl, shared: &Arc<SharedParams>, short: &
                         show.set(hover.get());
                         sh_up.set_gesture(i, false);
                     });
+                // A synced LFO rate reads as a musical subdivision; otherwise the
+                // descriptor's own display (Hz, st, …). `sync_partner` is `None`
+                // for every non-rate fader, so this collapses to the plain path.
+                let sh_pop = Arc::clone(shared);
                 value_popup(
                     cx,
                     sig.map(move |n: &f32| {
-                        desc_for_clap_id(i).unwrap().display(fader_from_ui(i, *n))
+                        let plain = fader_from_ui(i, *n);
+                        let desc = desc_for_clap_id(i).unwrap();
+                        if let Some(sid) = sync_partner(i) {
+                            if sh_pop.get(sid) >= 0.5 {
+                                let norm = desc.to_normalized(plain);
+                                return vxn_engine::sync::SUBDIVISIONS
+                                    [vxn_engine::sync::index_from_norm(norm)]
+                                .label
+                                .to_string();
+                            }
+                        }
+                        desc.display(plain)
                     }),
                     show,
                     posy,
@@ -975,6 +1111,66 @@ mod tests {
         let global: &[Entry] = &[(global_clap_id(GlobalParam::MasterVolume), "V")];
         assert!(is_layer_dependent(patch));
         assert!(!is_layer_dependent(global));
+    }
+
+    #[test]
+    fn sync_partner_pairs_rate_with_its_toggle() {
+        // LFO 1 rate ↔ sync on the same layer.
+        for layer in Layer::ALL {
+            assert_eq!(
+                sync_partner(patch_clap_id(layer, PatchParam::LfoRate)),
+                Some(patch_clap_id(layer, PatchParam::LfoSync))
+            );
+        }
+        // LFO 2 rate ↔ sync, both global.
+        assert_eq!(
+            sync_partner(global_clap_id(GlobalParam::Lfo2Rate)),
+            Some(global_clap_id(GlobalParam::Lfo2Sync))
+        );
+        // Non-rate faders have no sync partner.
+        assert_eq!(sync_partner(patch_clap_id(Layer::Upper, PatchParam::Cutoff)), None);
+        assert_eq!(sync_partner(global_clap_id(GlobalParam::MasterVolume)), None);
+    }
+
+    #[test]
+    fn lfo_pitch_fader_is_curved_and_narrowed() {
+        let id = patch_clap_id(Layer::Upper, PatchParam::LfoPitch);
+        // Whole semitone at the top, silent at the bottom.
+        assert!((fader_from_ui(id, 1.0) - 1.0).abs() < 1e-4);
+        assert!(fader_from_ui(id, 0.0).abs() < 1e-6);
+        // Midpoint lands at ~0.2 st (the subtle-vibrato sweet spot).
+        assert!((fader_from_ui(id, 0.5) - 0.2).abs() < 1e-3);
+        // Round-trips within the narrowed range.
+        for n in [0.1, 0.5, 0.9, 1.0] {
+            assert!((fader_to_ui(id, fader_from_ui(id, n)) - n).abs() < 1e-4);
+        }
+        // LFO 2's pitch route shares the curve.
+        let id2 = global_clap_id(GlobalParam::MasterTune); // sanity: not curved
+        assert!(!is_lfo_pitch(id2));
+        assert!(is_lfo_pitch(patch_clap_id(Layer::Lower, PatchParam::Lfo2Pitch)));
+    }
+
+    #[test]
+    fn adsr_time_fader_anchors_and_round_trips() {
+        for p in [
+            PatchParam::Env1Attack,
+            PatchParam::Env1Decay,
+            PatchParam::Env1Release,
+            PatchParam::Env2Attack,
+            PatchParam::Env2Decay,
+            PatchParam::Env2Release,
+        ] {
+            let id = patch_clap_id(Layer::Upper, p);
+            assert!(is_adsr_time(id));
+            assert!(fader_from_ui(id, 0.0).abs() < 1e-4); // ~0 s
+            assert!((fader_from_ui(id, 0.5) - 1.0).abs() < 1e-3); // midpoint = 1 s
+            assert!((fader_from_ui(id, 1.0) - 10.0).abs() < 1e-3); // top = 10 s
+            for n in [0.2, 0.5, 0.8, 1.0] {
+                assert!((fader_to_ui(id, fader_from_ui(id, n)) - n).abs() < 1e-4);
+            }
+        }
+        // Sustain is a level, not a time — stays linear.
+        assert!(!is_adsr_time(patch_clap_id(Layer::Upper, PatchParam::Env1Sustain)));
     }
 
     #[test]

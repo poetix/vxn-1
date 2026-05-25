@@ -1,7 +1,7 @@
 ---
 id: E004
 title: LFO expansion — second LFO & host-sync/reset
-status: open
+status: closed
 created: 2026-05-25
 ---
 
@@ -55,7 +55,7 @@ independent **envelope time-scaling by key** (§5) remains on that roadmap.
 - [x] [0014 — Second routable LFO (engine + params + 6×4 matrix)](../../tickets/closed/0014-second-lfo.md)
 - [x] [0015 — Host tempo plumbing + LFO host-sync](../../tickets/closed/0015-lfo-host-sync.md)
 - [~] [0016 — LFO reset on note start](../../tickets/closed/0016-lfo-reset.md) — **superseded by [E005](../closed/E005-per-voice-and-global-lfo.md)** (per-voice LFO 1 retrigger)
-- [ ] [0017 — Editor: LFO2, matrix row, sync/reset controls](../../tickets/open/0017-ui-lfo2.md)
+- [x] [0017 — Editor: LFO2, matrix row, sync/reset controls](../../tickets/closed/0017-ui-lfo2.md) — surfaces the **E005** control set (per-voice LFO 1 delay/fade/free-run + global LFO 2 panel)
 
 ## Dependency order
 
