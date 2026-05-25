@@ -466,11 +466,14 @@ impl Synth {
             noise_level: p.get(PatchParam::NoiseLevel),
             osc1_pw: p.get(PatchParam::Osc1PulseWidth),
             osc2_pw: p.get(PatchParam::Osc2PulseWidth),
-            osc1_semi: p.get(PatchParam::Osc1Octave) * 12.0
-                + p.get(PatchParam::Osc1Coarse)
+            // Octave and Coarse are integer-semitone params: hard-quantise them
+            // (the fader stores a continuous value) so the tuning lands exactly on
+            // a semitone. Fine stays continuous (cents).
+            osc1_semi: p.get(PatchParam::Osc1Octave).round() * 12.0
+                + p.get(PatchParam::Osc1Coarse).round()
                 + p.get(PatchParam::Osc1Fine) / 100.0,
-            osc2_semi: p.get(PatchParam::Osc2Octave) * 12.0
-                + p.get(PatchParam::Osc2Coarse)
+            osc2_semi: p.get(PatchParam::Osc2Octave).round() * 12.0
+                + p.get(PatchParam::Osc2Coarse).round()
                 + p.get(PatchParam::Osc2Fine) / 100.0,
             noise_color: p.noise_color(),
             cutoff: p.get(PatchParam::Cutoff),
@@ -638,6 +641,58 @@ mod tests {
             rms(tail) < 1e-6,
             "Env2 sustain 0 should settle to silence, got {}",
             rms(tail)
+        );
+    }
+
+    #[test]
+    fn env_block_skip_waits_for_amp_sustain() {
+        // Envelope block-skip must engage only once Env2 (the VCA) actually
+        // reaches Sustain. A held note with a long Env2 decay to a low sustain
+        // must keep getting quieter through the decay; if the skip froze the
+        // level mid-decay the amplitude would plateau early.
+        let mut s = Synth::new(48_000.0);
+        s.set_param(gp(GlobalParam::ChorusOn), 0.0);
+        s.set_param(pp(PatchParam::Env2Attack), 0.001);
+        s.set_param(pp(PatchParam::Env2Decay), 0.4); // long decay
+        s.set_param(pp(PatchParam::Env2Sustain), 0.05); // low sustain
+        s.note_on(60, 1.0);
+        let (l, _) = render(&mut s, 24_000); // 0.5 s spans the decay
+        let w = 2400;
+        let early = rms(&l[w..2 * w]);
+        let later = rms(&l[6 * w..7 * w]);
+        let settled = rms(&l[9 * w..10 * w]);
+        assert!(later < early * 0.7, "amp decay stalled: early {early} later {later}");
+        assert!(settled < later, "amp kept falling toward sustain: {later} -> {settled}");
+    }
+
+    #[test]
+    fn env_block_skip_does_not_freeze_mod_envelope() {
+        // The skip predicate requires *both* envelopes in Sustain. Here Env2
+        // (amp) snaps to full sustain immediately while Env1 — routed to pitch —
+        // has a long decay. The skip must stay disengaged while Env1 sweeps, so
+        // the pitch slides down from its raised start back to the played note as
+        // Env1 → 0. A predicate that checked only Env2 would freeze Env1 and the
+        // pitch would stall high. Frequency (zero-crossings) is an unambiguous
+        // readout of whether Env1 kept moving.
+        let mut s = pitched_synth();
+        s.set_param(pp(PatchParam::Env2Decay), 0.001);
+        s.set_param(pp(PatchParam::Env2Sustain), 1.0); // amp static almost at once
+        s.set_param(pp(PatchParam::PitchEnvSrc), 1.0); // Env1 → pitch
+        s.set_param(pp(PatchParam::PitchEnvDepth), 12.0); // +1 octave at Env1 = 1
+        s.set_param(pp(PatchParam::Env1Attack), 0.0005);
+        s.set_param(pp(PatchParam::Env1Decay), 0.4); // long
+        s.set_param(pp(PatchParam::Env1Sustain), 0.0); // → settles to the played note
+        s.note_on(57, 1.0); // A3 = 220 Hz; +1 oct = 440 Hz at the peak
+        let (l, _) = render(&mut s, 24_000); // 0.5 s spans the decay
+        let early = dominant_hz(&l[2400..7200], 48_000.0); // Env1 still high → ~ up an octave
+        let late = dominant_hz(&l[19_200..24_000], 48_000.0); // Env1 ≈ 0 → ~ played note
+        assert!(
+            early > 300.0,
+            "expected raised pitch while Env1 high, got {early} Hz"
+        );
+        assert!(
+            late < 250.0,
+            "pitch stalled high (mod envelope frozen): late {late} Hz"
         );
     }
 

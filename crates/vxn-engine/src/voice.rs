@@ -14,9 +14,9 @@
 //! (Env2) is evaluated per base frame.
 
 use vxn_dsp::{
-    AdsrCore, AdsrShape, CHANNELS_PER_LAYER, CONTROL_BLOCK, LadderCoeffs, LadderVariant, LfoCore,
-    LfoShape, NoiseColor, PolyHpf, PolyLadder, PolyNoise, PolyOscillator, Waveform, fast_exp2,
-    note_to_hz, poly_ring_mod,
+    AdsrCore, AdsrShape, AdsrStage, CHANNELS_PER_LAYER, CONTROL_BLOCK, LadderCoeffs, LadderVariant,
+    LfoCore, LfoShape, NoiseColor, PolyHpf, PolyLadder, PolyNoise, PolyOscillator, Waveform,
+    fast_exp2, note_to_hz, poly_ring_mod,
 };
 
 use crate::params::{AssignMode, EnvSel, LfoSel};
@@ -585,15 +585,43 @@ impl VoiceBank {
         let ring_on = ctx.ring_level != 0.0;
         let ring_gain = 10.0f32.powf(RING_DRIVE_DB / 20.0);
 
+        // Envelope block-skip: within a block the gate is constant and triggers
+        // fire only on frame 0, so if nothing triggers and every active voice
+        // holds *both* envelopes in Sustain (gate high), the env levels are
+        // constant for the whole block. Compute `amp` once and skip the per-frame
+        // tick and the free-check. Any trigger, or a voice mid attack/decay/
+        // release, falls back to the per-frame path. Bit-identical: a held
+        // Sustain tick is idempotent (`level = sustain`), so 0 ticks and `os·n`
+        // ticks leave the same state — and no Sustain/gate-high voice can free.
+        let env_static = trig.iter().all(|&t| !t)
+            && (0..N).all(|v| {
+                !self.active[v]
+                    || (self.gate[v]
+                        && self.env1[v].stage == AdsrStage::Sustain
+                        && self.env2[v].stage == AdsrStage::Sustain)
+            });
+        if env_static {
+            for v in 0..N {
+                amp[v] = if self.active[v] {
+                    self.env2[v].level.max(0.0)
+                } else {
+                    0.0
+                };
+            }
+        }
+
         for base_i in 0..base_frames {
             // Envelopes + amp (base rate, scalar; gated to 0 for inactive voices).
             // The VCA is hardwired to Env2 (ADR 0004 §4); Env1 still ticks so it
-            // can feed the modulation routes from its stored level.
-            for v in 0..N {
-                let t = trig[v] && base_i == 0;
-                let _e1 = self.env1[v].tick(t, self.gate[v]);
-                let e2 = self.env2[v].tick(t, self.gate[v]);
-                amp[v] = if self.active[v] { e2.max(0.0) } else { 0.0 };
+            // can feed the modulation routes from its stored level. Skipped when
+            // the block is envelope-static (see `env_static` above).
+            if !env_static {
+                for v in 0..N {
+                    let t = trig[v] && base_i == 0;
+                    let _e1 = self.env1[v].tick(t, self.gate[v]);
+                    let e2 = self.env2[v].tick(t, self.gate[v]);
+                    amp[v] = if self.active[v] { e2.max(0.0) } else { 0.0 };
+                }
             }
 
             let frame = base_i * os;
@@ -660,14 +688,18 @@ impl VoiceBank {
             // Advance the per-voice LFO 1 onset one base frame.
             self.lfo1_onset.advance(onset_dt, onset_cap);
 
-            // Free voices whose envelopes have fully released.
-            for v in 0..N {
-                if self.active[v]
-                    && !self.gate[v]
-                    && self.env1[v].is_idle()
-                    && self.env2[v].is_idle()
-                {
-                    self.active[v] = false;
+            // Free voices whose envelopes have fully released. Skipped when the
+            // block is envelope-static: every active voice is Sustain/gate-high
+            // there, so none can be idle-and-releasing.
+            if !env_static {
+                for v in 0..N {
+                    if self.active[v]
+                        && !self.gate[v]
+                        && self.env1[v].is_idle()
+                        && self.env2[v].is_idle()
+                    {
+                        self.active[v] = false;
+                    }
                 }
             }
         }
