@@ -2501,7 +2501,7 @@ dependencies = [
 
 [[package]]
 name = "vxn-clap"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clack-extensions",
  "clack-host",
@@ -2513,11 +2513,11 @@ dependencies = [
 
 [[package]]
 name = "vxn-dsp"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "vxn-engine"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "criterion",
  "vxn-dsp",
@@ -2525,7 +2525,7 @@ dependencies = [
 
 [[package]]
 name = "vxn-ui"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "raw-window-handle",
  "vizia",
@@ -3045,7 +3045,7 @@ checksum = "3ae8337f8a065cfc972643663ea4279e04e7256de865aa66fe25cec5fb912d3f"
 
 [[package]]
 name = "xtask"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "zbus"
