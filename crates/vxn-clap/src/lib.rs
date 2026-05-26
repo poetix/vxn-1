@@ -199,7 +199,13 @@ impl<'a> PluginAudioProcessor<'a, VxnShared, VxnMainThread<'a>> for VxnAudioProc
                                 synth.set_pitch_bend((raw as f32 - 8192.0) / 8192.0);
                             }
                             0xB0 if d1 == 1 => {
-                                synth.set_mod_wheel(d2 as f32 / 127.0);
+                                // Deadzone the bottom LSB: a hardware wheel
+                                // rarely rests clean at 0 and 1 LSB is already
+                                // a large step on a wide pitch route (±48 st →
+                                // 0.76 st/LSB), so jitter at rest reads as a
+                                // wandering pitch. Floor low values to 0.
+                                let wheel = if d2 <= 1 { 0.0 } else { d2 as f32 / 127.0 };
+                                synth.set_mod_wheel(wheel);
                             }
                             _ => {}
                         }

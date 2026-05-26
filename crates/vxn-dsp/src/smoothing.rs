@@ -16,6 +16,13 @@ pub fn one_pole_coeff(ms: f32, sample_rate: f32) -> f32 {
     1.0 - (-1.0 / n).exp()
 }
 
+/// Distance below which the glide snaps to its target instead of crawling down
+/// the one-pole's asymptotic tail forever. Without it the value never reaches
+/// the target exactly: a mod-wheel released to 0 leaves a residual that, scaled
+/// by a wide pitch depth, is an audible offset that takes a few hundred ms to
+/// die. 1e-6 is inaudible for the gain/CC values this smooths.
+const SNAP_EPS: f32 = 1.0e-6;
+
 /// A smoothed scalar parameter.
 #[derive(Clone)]
 pub struct Smoothed {
@@ -55,6 +62,9 @@ impl Smoothed {
     #[inline]
     pub fn tick(&mut self) -> f32 {
         self.current += self.coeff * (self.target - self.current);
+        if (self.target - self.current).abs() < SNAP_EPS {
+            self.current = self.target;
+        }
         self.current
     }
 
@@ -84,5 +94,20 @@ mod tests {
         let mut s = Smoothed::new(0.0, 100.0, 48_000.0);
         s.snap(0.5);
         assert_eq!(s.tick(), 0.5);
+    }
+
+    #[test]
+    fn settles_exactly_to_target() {
+        // Must reach the target *exactly* in bounded time, not crawl the
+        // one-pole tail forever: a residual scaled by a wide pitch depth is an
+        // audible offset that lingers after the wheel is released to 0.
+        let mut s = Smoothed::new(1.0, 20.0, 1_500.0); // control-rate mod wheel
+        s.set_target(0.0);
+        let mut ticks = 0;
+        while s.current() != 0.0 {
+            s.tick();
+            ticks += 1;
+            assert!(ticks < 10_000, "never reached exactly 0.0");
+        }
     }
 }

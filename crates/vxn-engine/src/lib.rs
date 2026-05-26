@@ -29,7 +29,9 @@ use vxn_dsp::{
 
 /// Mod-wheel (CC1) glide time (ms), applied at the control-block rate. Rounds
 /// off the 7-bit CC steps so wheel sweeps don't zipper the cutoff / osc2 pitch.
-const MOD_WHEEL_SMOOTH_MS: f32 = 20.0;
+/// On a wide pitch route 1 LSB is ~0.76 st, so the glide is set long enough to
+/// filter hardware sensor jitter at rest, not just the coarse CC quantisation.
+const MOD_WHEEL_SMOOTH_MS: f32 = 40.0;
 
 /// Snapshot of the envelope-shaping parameters. Used to skip recomputing ADSR
 /// coefficients (which cost an `exp()` per segment) unless a knob actually moved.
