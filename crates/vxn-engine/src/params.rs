@@ -50,7 +50,7 @@
 //! matching CLAP's plain-value convention. Enum/bool params store the variant
 //! index / 0.0|1.0 and are read back through typed accessors.
 
-use vxn_dsp::{AdsrShape, LadderVariant, LfoShape, Waveform};
+use vxn_dsp::{AdsrShape, LfoShape, OtaPoles, Waveform};
 
 /// Which of the two always-present patches a per-patch param belongs to.
 /// Discriminant doubles as the index into [`ParamValues::layers`].
@@ -241,7 +241,7 @@ pub enum PatchParam {
     Cutoff,
     Resonance,
     Drive,
-    FilterVariant,
+    FilterSlope,
     /// Pre-VCF high-pass cutoff (Hz). 20 ≈ fully open / "off".
     HpfCutoff,
     /// Key-track on/off: cutoff shifts exactly 1 octave per key octave relative
@@ -575,7 +575,7 @@ impl ParamDesc {
 }
 
 const WAVE_LABELS: &[&str] = &["Sine", "Triangle", "Saw", "Pulse"];
-const VARIANT_LABELS: &[&str] = &["Sharp", "Smooth"];
+const SLOPE_LABELS: &[&str] = &["12 dB", "24 dB"];
 const SHAPE_LABELS: &[&str] = &["Lin", "Exp"];
 const LFO_LABELS: &[&str] = &["Sine", "Tri", "Saw+", "Saw-", "Square", "S&H"];
 const OVERSAMPLE_LABELS: &[&str] = &["Off", "2x", "4x", "8x"];
@@ -714,7 +714,7 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
     f("cutoff", "Cutoff", 20.0, 18000.0, 8000.0, "Hz", Taper::Exp { mid: 1000.0 }),
     f("resonance", "Resonance", 0.0, 1.0, 0.2, "", Taper::Linear),
     f("drive", "Drive", 0.1, 4.0, 1.0, "", Taper::Linear),
-    e("filter_variant", "Filter Type", VARIANT_LABELS, 0.0),
+    e("filter_slope", "Filter Slope", SLOPE_LABELS, 1.0),
     f("hpf_cutoff", "HPF Cutoff", 20.0, 18000.0, 20.0, "Hz", Taper::Exp { mid: 1000.0 }),
     b("filter_key_track", "Key Track", 0.0),
     // Envelope 1
@@ -846,11 +846,11 @@ impl PatchValues {
         Waveform::ALL[enum_index(self.get(p), Waveform::ALL.len() - 1)]
     }
 
-    pub fn filter_variant(&self) -> LadderVariant {
-        if enum_index(self.get(PatchParam::FilterVariant), 1) == 0 {
-            LadderVariant::Sharp
+    pub fn filter_poles(&self) -> OtaPoles {
+        if enum_index(self.get(PatchParam::FilterSlope), 1) == 0 {
+            OtaPoles::Two
         } else {
-            LadderVariant::Smooth
+            OtaPoles::Four
         }
     }
 

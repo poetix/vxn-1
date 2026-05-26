@@ -19,6 +19,7 @@
 use crate::CHANNELS_PER_LAYER;
 use crate::ladder::LadderCoeffs;
 use crate::math::fast_sine;
+use crate::ota_ladder::{OtaLadderCoeffs, OtaPoles};
 use crate::oscillator::Waveform;
 
 const N: usize = CHANNELS_PER_LAYER;
@@ -723,6 +724,157 @@ impl PolyLadder {
             self.k[v] += self.dk[v];
             self.drive[v] += self.dd[v];
             self.scale[v] += self.ds[v];
+        }
+    }
+}
+
+// ── PolyOtaLadder ─────────────────────────────────────────────────────────────
+
+/// 16-voice OTA-C ladder lowpass (R3109/IR3109-style, Juno-flavoured). Poly
+/// sibling of [`crate::ota_ladder::OtaLadderKernel`].
+///
+/// Same per-sample coefficient ramp as [`PolyLadder`] (see its docs), but the
+/// nonlinearity is per-stage `tanh` and there is **no** `scale` term — the OTA
+/// design does not thin the bass under resonance. `poles` (12 vs 24 dB/oct
+/// output tap) is a *layer-wide* parameter, hoisted out of the lane loop; the
+/// feedback path is always the 4th stage so resonance is identical in both.
+#[derive(Clone)]
+pub struct PolyOtaLadder {
+    // Current (interpolated) coefficients, advanced each sample.
+    g: [f32; N],
+    k: [f32; N],
+    drive: [f32; N],
+    // Per-sample increments toward the target (set by `prepare_ramp`).
+    dg: [f32; N],
+    dk: [f32; N],
+    dd: [f32; N],
+    // Block target coefficients (set by `set_coeffs`).
+    tg: [f32; N],
+    tk: [f32; N],
+    td: [f32; N],
+    s0: [f32; N],
+    s1: [f32; N],
+    s2: [f32; N],
+    s3: [f32; N],
+    y4: [f32; N],
+    poles: OtaPoles,
+}
+
+impl Default for PolyOtaLadder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PolyOtaLadder {
+    pub fn new() -> Self {
+        Self {
+            g: [0.5; N],
+            k: [0.0; N],
+            drive: [1.0; N],
+            dg: [0.0; N],
+            dk: [0.0; N],
+            dd: [0.0; N],
+            tg: [0.5; N],
+            tk: [0.0; N],
+            td: [1.0; N],
+            s0: [0.0; N],
+            s1: [0.0; N],
+            s2: [0.0; N],
+            s3: [0.0; N],
+            y4: [0.0; N],
+            poles: OtaPoles::Four,
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.s0 = [0.0; N];
+        self.s1 = [0.0; N];
+        self.s2 = [0.0; N];
+        self.s3 = [0.0; N];
+        self.y4 = [0.0; N];
+    }
+
+    /// Set the output slope (layer-wide). Feedback path is unchanged.
+    #[inline]
+    pub fn set_poles(&mut self, poles: OtaPoles) {
+        self.poles = poles;
+    }
+
+    pub fn poles(&self) -> OtaPoles {
+        self.poles
+    }
+
+    /// Set this block's *target* coefficients for voice `v`.
+    #[inline]
+    pub fn set_coeffs(&mut self, v: usize, c: OtaLadderCoeffs) {
+        self.tg[v] = c.g;
+        self.tk[v] = c.k;
+        self.td[v] = c.drive;
+    }
+
+    /// Compute per-sample increments so the current coefficients reach their
+    /// targets after exactly `steps` [`process`] calls. `steps <= 1` snaps.
+    #[inline]
+    pub fn prepare_ramp(&mut self, steps: usize) {
+        if steps <= 1 {
+            self.snap_coeffs();
+            return;
+        }
+        let inv = 1.0 / steps as f32;
+        for v in 0..N {
+            self.dg[v] = (self.tg[v] - self.g[v]) * inv;
+            self.dk[v] = (self.tk[v] - self.k[v]) * inv;
+            self.dd[v] = (self.td[v] - self.drive[v]) * inv;
+        }
+    }
+
+    /// Jump current coefficients to the targets with no ramp.
+    #[inline]
+    pub fn snap_coeffs(&mut self) {
+        self.g = self.tg;
+        self.k = self.tk;
+        self.drive = self.td;
+        self.dg = [0.0; N];
+        self.dk = [0.0; N];
+        self.dd = [0.0; N];
+    }
+
+    /// One sample per voice: `out[v] = ota_ladder(x[v])`, reading the slope tap.
+    #[inline]
+    pub fn process(&mut self, x: &[f32; N], out: &mut [f32; N]) {
+        let tap = self.poles.output_tap();
+        for v in 0..N {
+            let g = self.g[v];
+            let fed = self.drive[v] * x[v] - self.k[v] * self.y4[v];
+
+            let u0 = tanh_c(fed);
+            let a0 = (u0 - self.s0[v]) * g;
+            let y0 = a0 + self.s0[v];
+            self.s0[v] = y0 + a0;
+
+            let u1 = tanh_c(y0);
+            let a1 = (u1 - self.s1[v]) * g;
+            let y1 = a1 + self.s1[v];
+            self.s1[v] = y1 + a1;
+
+            let u2 = tanh_c(y1);
+            let a2 = (u2 - self.s2[v]) * g;
+            let y2 = a2 + self.s2[v];
+            self.s2[v] = y2 + a2;
+
+            let u3 = tanh_c(y2);
+            let a3 = (u3 - self.s3[v]) * g;
+            let y3 = a3 + self.s3[v];
+            self.s3[v] = y3 + a3;
+
+            self.y4[v] = y3;
+            out[v] = [y0, y1, y2, y3][tap];
+
+            // Advance interpolated coefficients toward the block target.
+            self.g[v] += self.dg[v];
+            self.k[v] += self.dk[v];
+            self.drive[v] += self.dd[v];
         }
     }
 }

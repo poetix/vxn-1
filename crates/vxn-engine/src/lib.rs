@@ -484,7 +484,7 @@ impl Synth {
             hpf_cutoff: p.get(PatchParam::HpfCutoff),
             resonance,
             drive: p.get(PatchParam::Drive),
-            variant: p.filter_variant(),
+            poles: p.filter_poles(),
             base_semis: g.get(GlobalParam::MasterTune),
             lfo1_shape: p.lfo_shape(),
             lfo1_rate_hz,

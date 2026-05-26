@@ -208,7 +208,7 @@ const ROWS: &[&[(&str, &[Entry])]] = {
                     (u(Resonance), "Reso"),
                     (u(Drive), "Drive"),
                     (u(FilterKeyTrack), "KeyTrk"),
-                    (u(FilterVariant), "Type"),
+                    (u(FilterSlope), "Slope"),
                 ],
             ),
             (
@@ -1323,12 +1323,12 @@ fn fader_body(
 /// typed param so it holds across both layers. The mod-route source selectors are
 /// deliberately *not* here — they stay vertical beside their faders.
 fn in_bottom_strip(idx: usize) -> bool {
-    use PatchParam::{Env1Shape, Env2Shape, FilterKeyTrack, FilterVariant, Lfo1FreeRun, LfoSync};
+    use PatchParam::{Env1Shape, Env2Shape, FilterKeyTrack, FilterSlope, Lfo1FreeRun, LfoSync};
     matches!(
         param_ref(idx),
         Some(ParamRef::Patch(
             _,
-            LfoSync | Lfo1FreeRun | Env1Shape | Env2Shape | FilterVariant | FilterKeyTrack
+            LfoSync | Lfo1FreeRun | Env1Shape | Env2Shape | FilterSlope | FilterKeyTrack
         )) | Some(ParamRef::Global(
             GlobalParam::Lfo2Sync
                 | GlobalParam::DelaySync
@@ -1339,13 +1339,13 @@ fn in_bottom_strip(idx: usize) -> bool {
 }
 
 /// One bottom-strip control laid out **horizontally**: a plain bool is a single
-/// labelled box; a small enum (Lin/Exp, Sharp/Smooth, the oversample modes) is a
+/// labelled box; a small enum (Lin/Exp, 12/24 dB, the oversample modes) is a
 /// row of exclusive labelled boxes. The vertical [`enum_list_body`] equivalent for
 /// the strip.
 fn strip_cell(cx: &mut Context, ctl: Ctl, short: &'static str, shared: &Arc<SharedParams>) {
     match ctl {
         Ctl::Switch(i, sig) => match desc_for_clap_id(i).unwrap().kind {
-            // Two-state enum (Lin/Exp, Sharp/Smooth): both option boxes in a row.
+            // Two-state enum (Lin/Exp, 12/24 dB): both option boxes in a row.
             ParamKind::Enum { variants } => {
                 let sh = Arc::clone(shared);
                 HStack::new(cx, move |cx| {
@@ -1567,7 +1567,7 @@ fn control_view(cx: &mut Context, ctl: Ctl, shared: &Arc<SharedParams>, short: &
             }
             Ctl::Switch(i, sig) => {
                 match desc_for_clap_id(i).unwrap().kind {
-                    // A named two-state enum (Sharp/Smooth, Linear/Exponential):
+                    // A named two-state enum (12/24 dB, Linear/Exponential):
                     // an exclusive two-row list so the state name stays visible.
                     ParamKind::Enum { variants } => {
                         let sh = Arc::clone(shared);

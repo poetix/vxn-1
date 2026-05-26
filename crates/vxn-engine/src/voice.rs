@@ -14,8 +14,8 @@
 //! (Env2) is evaluated per base frame.
 
 use vxn_dsp::{
-    AdsrCore, AdsrShape, AdsrStage, CHANNELS_PER_LAYER, CONTROL_BLOCK, LadderCoeffs, LadderVariant,
-    LfoCore, LfoShape, PolyHpf, PolyLadder, PolyOscillator, Waveform,
+    AdsrCore, AdsrShape, AdsrStage, CHANNELS_PER_LAYER, CONTROL_BLOCK, LfoCore, LfoShape,
+    OtaLadderCoeffs, OtaPoles, PolyHpf, PolyOscillator, PolyOtaLadder, Waveform,
     fast_exp2, note_to_hz, poly_ring_mod,
 };
 
@@ -113,7 +113,8 @@ pub struct BlockCtx {
     pub hpf_cutoff: f32,
     pub resonance: f32,
     pub drive: f32,
-    pub variant: LadderVariant,
+    /// OTA filter output slope (12 vs 24 dB/oct).
+    pub poles: OtaPoles,
     pub base_semis: f32,
     /// LFO 1 is per-voice (E005 / 0018): the bank ticks its own phases, so the
     /// block carries LFO 1's shape, resolved rate (Hz, post host-sync) and the
@@ -177,7 +178,7 @@ pub struct VoiceBank {
     osc1: PolyOscillator,
     osc2: PolyOscillator,
     hpf: PolyHpf,
-    ladder: PolyLadder,
+    ladder: PolyOtaLadder,
     env1: [AdsrCore; N],
     env2: [AdsrCore; N],
 
@@ -231,7 +232,7 @@ impl VoiceBank {
             osc1: PolyOscillator::new(),
             osc2: PolyOscillator::new(),
             hpf: PolyHpf::new(),
-            ladder: PolyLadder::new(),
+            ladder: PolyOtaLadder::new(),
             env1: std::array::from_fn(|_| AdsrCore::new(sample_rate)),
             env2: std::array::from_fn(|_| AdsrCore::new(sample_rate)),
             note: [0; N],
@@ -482,15 +483,11 @@ impl VoiceBank {
             let cutoff_hz = ctx.cutoff * fast_exp2(m.cutoff_mod / 12.0);
             self.ladder.set_coeffs(
                 v,
-                LadderCoeffs::new(
-                    cutoff_hz,
-                    ctx.os_sample_rate,
-                    ctx.resonance,
-                    ctx.drive,
-                    ctx.variant,
-                ),
+                OtaLadderCoeffs::new(cutoff_hz, ctx.os_sample_rate, ctx.resonance, ctx.drive),
             );
         }
+        // Output slope is layer-wide, not per voice.
+        self.ladder.set_poles(ctx.poles);
 
         // Pre-VCF high-pass. Cutoff is global (not a mod destination), so the
         // coefficient is computed once and broadcast. At the default low cutoff
@@ -1174,7 +1171,7 @@ mod mod_tests {
             hpf_cutoff: 20.0,
             resonance: 0.0,
             drive: 1.0,
-            variant: LadderVariant::Sharp,
+            poles: OtaPoles::Four,
             base_semis: 0.0,
             lfo1_shape: LfoShape::Sine,
             lfo1_rate_hz: 1.0,
