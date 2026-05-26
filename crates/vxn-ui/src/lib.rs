@@ -387,6 +387,10 @@ label { font-size: 10; color: #d6d6d6; }
 .tg-lbl { font-size: 7; color: #9a9a9a; }
 .tg-row:checked .tg-lbl { color: #ececec; }
 .value-pop { background-color: #0e0e0e; border-width: 1px; border-color: #d9701b; corner-radius: 3px; padding-left: 4px; padding-right: 4px; font-size: 9; color: #f6f6f6; }
+.reset-btn { height: 14px; background-color: #333333; border-width: 1px; border-color: #555555; corner-radius: 2px; }
+.reset-btn:hover { background-color: #3a3a3a; border-color: #c4c4c4; }
+.reset-btn .tg-lbl { color: #b0b0b0; }
+.reset-btn:hover .tg-lbl { color: #ececec; }
 .fader .track { background-color: #555555; width: 6px; corner-radius: 2px; }
 .fader .range { background-color: #3a86cc; corner-radius: 2px; }
 .fader .thumb { background-color: #e8e8e8; border-width: 1px; border-color: #141414; corner-radius: 1px; width: 20px; height: 8px; }
@@ -836,12 +840,12 @@ fn keys_panel(
                         split.set(DEFAULT_SPLIT_POINT as f32);
                         sh_dbl.set_split_point(DEFAULT_SPLIT_POINT);
                     })
-                    .on_over(move |cx| {
+                    .on_hover(move |cx| {
                         posx.set(cursor_left(cx));
                         hover.set(true);
                         show.set(true);
                     })
-                    .on_over_out(move |_cx| {
+                    .on_hover_out(move |_cx| {
                         hover.set(false);
                         show.set(drag.get());
                     })
@@ -870,6 +874,27 @@ fn keys_panel(
             .width(Stretch(1.0))
             .height(Auto)
             .display(split_vis);
+
+            // Reset the patch(es) currently being edited to plain defaults. In
+            // Whole the two layers share one patch, so reset both; in Dual/Split
+            // reset only the layer the edit toggle points at. Globals, key mode and
+            // split point are setup state, left untouched. The `on_idle` poll
+            // re-syncs every control signal from the store afterwards.
+            let sh_reset = Arc::clone(shared);
+            Button::new(cx, |cx| Label::new(cx, up("Reset")).class("tg-lbl"))
+                .class("reset-btn")
+                .width(Stretch(1.0))
+                .cursor(CursorIcon::Hand)
+                .on_press(move |_cx| {
+                    if key_mode.get() == 0 {
+                        sh_reset.reset_patch_to_defaults(Layer::Upper);
+                        sh_reset.reset_patch_to_defaults(Layer::Lower);
+                    } else {
+                        let layer =
+                            if edit_layer.get() == 0 { Layer::Upper } else { Layer::Lower };
+                        sh_reset.reset_patch_to_defaults(layer);
+                    }
+                });
         })
         .height(Pixels(COL_H))
         .vertical_gap(Pixels(8.0))
@@ -1214,12 +1239,12 @@ fn fader_body(
             sh_dbl.set(i, d);
             sh_dbl.set_gesture(i, false);
         })
-        .on_over(move |cx| {
+        .on_hover(move |cx| {
             posy.set(cursor_top(cx));
             hover.set(true);
             show.set(true);
         })
-        .on_over_out(move |_cx| {
+        .on_hover_out(move |_cx| {
             hover.set(false);
             show.set(drag.get());
         })
@@ -1296,7 +1321,7 @@ fn strip_cell(cx: &mut Context, ctl: Ctl, short: &'static str, shared: &Arc<Shar
                 HStack::new(cx, move |cx| {
                     for (n, label) in variants.iter().enumerate() {
                         let sh = Arc::clone(&sh);
-                        toggle_row(cx, *label, sig.map(move |b: &bool| *b as usize == n), move |_cx| {
+                        toggle_row(cx, label, sig.map(move |b: &bool| *b as usize == n), move |_cx| {
                             let on = n == 1;
                             sig.set(on);
                             sh.set(i, if on { 1.0 } else { 0.0 });
@@ -1325,7 +1350,7 @@ fn strip_cell(cx: &mut Context, ctl: Ctl, short: &'static str, shared: &Arc<Shar
             HStack::new(cx, move |cx| {
                 for (n, label) in variants.iter().enumerate() {
                     let sh = Arc::clone(&sh);
-                    toggle_row(cx, *label, sig.map(move |s: &Option<usize>| *s == Some(n)), move |_cx| {
+                    toggle_row(cx, label, sig.map(move |s: &Option<usize>| *s == Some(n)), move |_cx| {
                         sig.set(Some(n));
                         sh.set(i, n as f32);
                     });
@@ -1478,12 +1503,12 @@ fn control_view(cx: &mut Context, ctl: Ctl, shared: &Arc<SharedParams>, short: &
                             sig.set(if cnt > 1 { idx / (cnt - 1) as f32 } else { 0.0 });
                             sh_set.set(i, idx);
                         })
-                        .on_over(move |cx| {
+                        .on_hover(move |cx| {
                             posy.set(cursor_top(cx));
                             hover.set(true);
                             show.set(true);
                         })
-                        .on_over_out(move |_cx| {
+                        .on_hover_out(move |_cx| {
                             hover.set(false);
                             show.set(drag.get());
                         })
@@ -1767,7 +1792,7 @@ mod tests {
             let mut entry_ids: Vec<usize> = entries.iter().map(|(id, _)| *id).collect();
             let mut route_ids: Vec<usize> = routes
                 .iter()
-                .flat_map(|(_, src, depth)| src.into_iter().copied().chain([*depth]))
+                .flat_map(|(_, src, depth)| src.iter().copied().chain([*depth]))
                 .collect();
             entry_ids.sort_unstable();
             route_ids.sort_unstable();

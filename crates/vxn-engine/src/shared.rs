@@ -140,6 +140,21 @@ impl SharedParams {
         }
     }
 
+    /// Reset every per-patch param of `layer` to its descriptor default. Each
+    /// write is bracketed by a gesture (like the UI's double-click reset) so the
+    /// CLAP layer echoes the jump to the host as a recorded edit. Globals and the
+    /// other layer are left untouched; key mode and split point are setup state,
+    /// not part of a patch, so they are also left alone.
+    pub fn reset_patch_to_defaults(&self, layer: Layer) {
+        for p in 0..crate::params::PATCH_COUNT {
+            let id = patch_clap_id(layer, PatchParam::from_index(p).unwrap());
+            let default = desc_for_clap_id(id).map_or(0.0, |d| d.default);
+            self.set_gesture(id, true);
+            self.set(id, default);
+            self.set_gesture(id, false);
+        }
+    }
+
     #[inline]
     pub fn split_point(&self) -> u8 {
         self.split_point.load(Ordering::Relaxed)
