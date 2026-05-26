@@ -578,7 +578,7 @@ const WAVE_LABELS: &[&str] = &["Sine", "Triangle", "Saw", "Pulse"];
 const VARIANT_LABELS: &[&str] = &["Sharp", "Smooth"];
 const SHAPE_LABELS: &[&str] = &["Lin", "Exp"];
 const LFO_LABELS: &[&str] = &["Sine", "Tri", "Saw+", "Saw-", "Square", "S&H"];
-const OVERSAMPLE_LABELS: &[&str] = &["Off", "2x", "4x"];
+const OVERSAMPLE_LABELS: &[&str] = &["Off", "2x", "4x", "8x"];
 const ASSIGN_LABELS: &[&str] = &["Poly", "Unison", "Solo", "Twin"];
 const LFO_SEL_LABELS: &[&str] = &["Off", "LFO 1", "LFO 2"];
 const ENV_SEL_LABELS: &[&str] = &["Off", "Env 1", "Env 2"];
@@ -941,12 +941,13 @@ impl GlobalValues {
         self.get(g) >= 0.5
     }
 
-    /// Oversampling factor for the synthesis path: 1 (Off), 2 or 4.
+    /// Oversampling factor for the synthesis path: 1 (Off), 2, 4 or 8.
     pub fn oversample_factor(&self) -> usize {
-        match enum_index(self.get(GlobalParam::Oversample), 2) {
+        match enum_index(self.get(GlobalParam::Oversample), 3) {
             0 => 1,
             1 => 2,
-            _ => 4,
+            2 => 4,
+            _ => 8,
         }
     }
 

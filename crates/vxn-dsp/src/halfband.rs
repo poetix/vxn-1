@@ -1,4 +1,4 @@
-//! Halfband FIR decimator and a 2×/4× oversampling helper.
+//! Halfband FIR decimator and a 2×/4×/8× oversampling helper.
 //!
 //! `HalfbandFir` is copied from `patches-dsp::halfband`: a 33-tap symmetric
 //! linear-phase halfband filter (8 non-zero off-centre taps + centre), every
@@ -95,12 +95,16 @@ impl Default for HalfbandFir {
     }
 }
 
-/// 2× / 4× oversampling decimator. Holds two cascaded halfband stages: 4×
-/// decimation runs stage A (4→2) then stage B (2→1); 2× uses stage A only.
+/// 2× / 4× / 8× oversampling decimator. Holds three cascaded halfband stages,
+/// each a 2:1 step run at successively lower rates: 8× runs stage A (8→4),
+/// stage B (4→2), stage C (2→1); 4× uses A (4→2) then B (2→1); 2× uses A only.
+/// A given stage always operates at the same rate regardless of factor, so its
+/// filter state stays coherent.
 #[derive(Clone)]
 pub struct Oversampler {
     stage_a: HalfbandFir,
     stage_b: HalfbandFir,
+    stage_c: HalfbandFir,
 }
 
 impl Default for Oversampler {
@@ -114,16 +118,18 @@ impl Oversampler {
         Self {
             stage_a: HalfbandFir::default(),
             stage_b: HalfbandFir::default(),
+            stage_c: HalfbandFir::default(),
         }
     }
 
     pub fn reset(&mut self) {
         self.stage_a.reset();
         self.stage_b.reset();
+        self.stage_c.reset();
     }
 
     /// Decimate `input` (length `output.len() * factor`) into `output`.
-    /// `factor` must be 1, 2 or 4. For 1× this is a straight copy.
+    /// `factor` must be 1, 2, 4 or 8. For 1× this is a straight copy.
     pub fn decimate(&mut self, input: &[f32], output: &mut [f32], factor: usize) {
         match factor {
             2 => {
@@ -137,6 +143,21 @@ impl Oversampler {
                     let a = self.stage_a.process(input[base], input[base + 1]);
                     let b = self.stage_a.process(input[base + 2], input[base + 3]);
                     *out = self.stage_b.process(a, b);
+                }
+            }
+            8 => {
+                for (i, out) in output.iter_mut().enumerate() {
+                    let base = 8 * i;
+                    // 8 → 4 (stage A)
+                    let a0 = self.stage_a.process(input[base], input[base + 1]);
+                    let a1 = self.stage_a.process(input[base + 2], input[base + 3]);
+                    let a2 = self.stage_a.process(input[base + 4], input[base + 5]);
+                    let a3 = self.stage_a.process(input[base + 6], input[base + 7]);
+                    // 4 → 2 (stage B)
+                    let b0 = self.stage_b.process(a0, a1);
+                    let b1 = self.stage_b.process(a2, a3);
+                    // 2 → 1 (stage C)
+                    *out = self.stage_c.process(b0, b1);
                 }
             }
             _ => {
@@ -189,6 +210,34 @@ mod tests {
         }
         let tail = output[output.len() - 4..].iter().sum::<f32>() / 4.0;
         assert!((tail - 1.0).abs() < 0.02, "4x DC gain {tail}");
+    }
+
+    #[test]
+    fn dc_passes_through_8x() {
+        let mut os = Oversampler::new();
+        let input = [1.0f32; 256];
+        let mut output = [0.0f32; 32];
+        for _ in 0..6 {
+            os.decimate(&input, &mut output, 8);
+        }
+        let tail = output[output.len() - 4..].iter().sum::<f32>() / 4.0;
+        assert!((tail - 1.0).abs() < 0.02, "8x DC gain {tail}");
+    }
+
+    #[test]
+    fn nyquist_rejected_8x() {
+        // Alternating ±1 at the 8× rate is the oversampled Nyquist; the cascade
+        // should crush it back to the base rate.
+        let mut os = Oversampler::new();
+        let input: [f32; 256] = std::array::from_fn(|i| if i % 2 == 0 { 1.0 } else { -1.0 });
+        let mut output = [0.0f32; 32];
+        for _ in 0..6 {
+            os.decimate(&input, &mut output, 8);
+        }
+        let peak = output[output.len() - 8..]
+            .iter()
+            .fold(0.0f32, |m, &x| m.max(x.abs()));
+        assert!(peak < 0.05, "8x Nyquist leakage {peak}");
     }
 
     #[test]

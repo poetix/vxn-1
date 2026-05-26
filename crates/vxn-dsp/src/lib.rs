@@ -43,7 +43,7 @@ pub const MAX_VOICES: usize = 2 * CHANNELS_PER_LAYER;
 
 /// Maximum oversampling factor for the synthesis path. Bounds the size of the
 /// oversampled scratch buffer (`CONTROL_BLOCK * MAX_OVERSAMPLE`).
-pub const MAX_OVERSAMPLE: usize = 4;
+pub const MAX_OVERSAMPLE: usize = 8;
 
 /// Engine control-block size in samples. Modulation and coefficients are
 /// recomputed once per block; the per-sample inner loop runs this many times.

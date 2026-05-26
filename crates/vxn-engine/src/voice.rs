@@ -96,7 +96,7 @@ impl Lfo1Onset {
 pub struct BlockCtx {
     /// Oversampled sample rate (`base_rate * oversample`).
     pub os_sample_rate: f32,
-    /// Oversampling factor (1, 2 or 4).
+    /// Oversampling factor (1, 2, 4 or 8).
     pub os: usize,
     pub osc1_wave: Waveform,
     pub osc2_wave: Waveform,
@@ -356,6 +356,7 @@ impl VoiceBank {
     /// Trigger a specific channel: the lowest level of the assign seam. Poly hits
     /// one channel, Unison hits all; both route through here so per-channel state
     /// (gate, detune, phase reset) is set in exactly one place.
+    #[allow(clippy::too_many_arguments)] // one coupled per-trigger param set, single caller
     fn trigger(
         &mut self,
         v: usize,
@@ -530,8 +531,8 @@ impl VoiceBank {
         let env_static =
             envelopes_static(&trig, &self.active, &self.gate, &self.env1, &self.env2);
         if env_static {
-            for v in 0..N {
-                amp[v] = if self.active[v] {
+            for (v, amp_v) in amp.iter_mut().enumerate() {
+                *amp_v = if self.active[v] {
                     self.env2[v].level.max(0.0)
                 } else {
                     0.0
