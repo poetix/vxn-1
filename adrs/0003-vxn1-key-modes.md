@@ -225,3 +225,68 @@ FX bus.
 - Roland Jupiter-8 Owner's Manual: per-section LFO (p.19), Key Modes /
   split-point behaviour (p.11), Assign Modes (p.12), Performance Controls
   (p.14).
+
+## Amendment — 2026-05-26 (Solo/Twin assign modes; global-vs-per-layer scope)
+
+Two clarifications from the E006 voice work. §3–§9 stand; §4's assign-mode set
+is formalised and the global/per-layer split is made explicit.
+
+### §4 — the assign-mode set, formalised
+
+The assign mode is a per-layer enum with **four** values (§4 originally wrote
+the set loosely as "poly / unison / mono"):
+
+- **Poly** — first-free / nearest-free / oldest-steal across the layer's 8
+  channels. One channel per note.
+- **Unison** — one note stacked across all 8 channels with a per-channel detune
+  spread and half-cycle start-phase decorrelation; level-compensated `1/√8`.
+- **Solo** — monophonic: exactly one channel sounds per layer, last-note
+  priority. A new note takes over the sounding channel, so portamento is legato.
+- **Twin** — each note assigned to **two** channels with a pitch spread
+  (±`UnisonDetune`) and a quarter-cycle phase decorrelation; level-compensated
+  `1/√2`. A fat two-voice-per-note stack.
+
+**Naming.** The two-channels-per-note mode is **Twin**, deliberately *not*
+"Dual", to avoid colliding with the keyboard-level **`KeyMode::Dual`** (§3 —
+note routed to *both layers*). The two axes are orthogonal and compose.
+
+**Polyphony is not a separate setting — it falls out of the static 8-channel
+pool (§2).** Twin consumes two channels per note; effective note-polyphony
+against the engine's 16 channels total:
+
+| Key mode        | Channels per note           | Poly / Unison / Solo | Twin          |
+| --------------- | --------------------------- | -------------------- | ------------- |
+| Whole           | 1 (round-robin both layers) | up to 16 notes       | 8 notes       |
+| Split           | 1 (one layer, 8 ch)         | up to 8 notes/layer  | 4 notes/layer |
+| Dual (layered)  | 2 (one per layer)           | up to 8 notes        | 4 notes       |
+
+Oldest-`alloc_tick` stealing (§2/§4) absorbs overflow; these counts are
+descriptive, not enforced caps.
+
+**Structure.** The allocation *policy* (which channel(s) a note takes, plus the
+per-channel detune/phase to stamp) is a **pure function over per-layer
+bookkeeping** — channel `active` / `note` / glide source / `alloc_tick` — with no
+oscillator, filter or sample-rate dependency, so it is unit-tested in isolation.
+The MIDI processor applies the plan via the DSP trigger (§4's "stream transform
+before allocation" seam is unchanged). Solo/Twin add allocation policies, not
+engine surgery.
+
+### Global vs per-layer — explicit scope (confirms §6/§9)
+
+Because Solo/Twin (like all voice settings) are per-layer, the boundary is worth
+stating outright:
+
+- **Per-layer** — the `PatchParam` block, instantiated Upper + Lower: oscillators,
+  mixer levels + noise type, filter, envelopes, **LFO 1** (per-voice:
+  delay/fade/free-run), the fixed modulation routes, PWM, and the **voice/assign
+  controls** — `AssignMode` (incl. Solo/Twin), `UnisonDetune`, portamento. In
+  Split each layer runs its own assign mode independently.
+- **Truly global** — the `GlobalParam` block, one instance: **master tune**,
+  **master volume**, the **FX bus** (chorus, delay — §7), **oversample quality**,
+  and **LFO 2** (shape / rate / sync — the single instrument-wide LFO; either LFO
+  still reaches any channel via the per-channel `{Off/LFO1/LFO2}` selectors,
+  ADR 0004 §4). Performance-control **values** (pitch bend, mod wheel) are global
+  but their **response is per-layer** (§9).
+
+So "global" is **not** just LFO 2 + FX: it also covers master tune/volume and
+oversample. Everything else — all voice settings included — is per-layer.
