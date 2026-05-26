@@ -671,10 +671,6 @@ pub fn open_editor(
     shared: Arc<SharedParams>,
     scale_override: Option<f64>,
 ) -> EditorHandle {
-    // Temporary HiDPI probe: keep the raw NSView address (as `usize`, so the
-    // idle closure stays `Send`) to re-query the live backing scale.
-    #[cfg(target_os = "macos")]
-    let parent_addr = parent as usize;
     let parent = ParentWindow(parent);
 
     // Per-open idle tick counter (interior-mutable so the `Fn` idle closure can
@@ -691,10 +687,6 @@ pub fn open_editor(
                 // Force the one-time surface rebuild at the correct physical size.
                 cx.emit(WindowEvent::SetUserScale(1.0));
             }
-            #[cfg(target_os = "macos")]
-            if n == 60 {
-                scale_probe::log(cx, parent_addr);
-            }
         })
         .inner_size((EDITOR_WIDTH, EDITOR_HEIGHT))
         .title("VXN1");
@@ -704,49 +696,6 @@ pub fn open_editor(
     }
 
     app.open_parented(&parent)
-}
-
-/// Temporary HiDPI double-size diagnostic: logs the scale factor vizia resolved
-/// for rendering/layout against the live NSView backing scale. Appends to the
-/// same file as `vxn-clap`'s `dbg_log`. Remove with that logger once verified.
-#[cfg(target_os = "macos")]
-mod scale_probe {
-    use vizia::prelude::*;
-
-    fn dbg_log(msg: &str) {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("/tmp/vxn-gui.log")
-        {
-            let _ = writeln!(f, "{msg}");
-        }
-    }
-
-    fn live_backing_scale(nsview_addr: usize) -> f64 {
-        use objc::runtime::Object;
-        use objc::{msg_send, sel, sel_impl};
-        if nsview_addr == 0 {
-            return -1.0;
-        }
-        unsafe {
-            let view = nsview_addr as *mut Object;
-            let window: *mut Object = msg_send![view, window];
-            if !window.is_null() {
-                return msg_send![window, backingScaleFactor];
-            }
-            0.0
-        }
-    }
-
-    pub fn log(cx: &mut Context, nsview_addr: usize) {
-        dbg_log(&format!(
-            "scale_probe: vizia_scale_factor={} live_backing={}",
-            cx.scale_factor(),
-            live_backing_scale(nsview_addr),
-        ));
-    }
 }
 
 fn build_editor(cx: &mut Context, shared: Arc<SharedParams>) {

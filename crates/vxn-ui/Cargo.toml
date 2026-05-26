@@ -14,8 +14,3 @@ vxn-engine.workspace = true
 # `raw-window-handle_05` gui feature). See vxn1-ui-deps notes.
 vizia = { git = "https://github.com/vizia/vizia", rev = "1b1d1b6b30cf383bdb06e87611088026945f10c2", default-features = false, features = ["baseview"] }
 raw-window-handle = "0.5"
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# Temporary: re-query the live NSView backing scale from the running editor to
-# compare against vizia's resolved `scale_factor` (HiDPI double-size probe).
-objc = "0.2"

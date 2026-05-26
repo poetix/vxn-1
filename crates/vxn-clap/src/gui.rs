@@ -8,25 +8,10 @@ use clack_extensions::gui::*;
 use clack_plugin::prelude::*;
 use std::sync::Arc;
 
-/// Temporary HiDPI diagnostic logger. A plugin has no terminal/stdout, so we
-/// append to a fixed file the host can't clobber. Remove once the double-size
-/// scaling bug is understood.
-#[cfg(target_os = "macos")]
-fn dbg_log(msg: &str) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/vxn-gui.log")
-    {
-        let _ = writeln!(f, "{msg}");
-    }
-}
-
-/// Backing scale factor of the host's parent NSView at attach time, via its
-/// window (falling back to the main screen when the view isn't in a window
-/// yet). This is the number vizia's self-correcting `Resized` path keys off —
-/// if it's already 2.0 here, no `viewDidChangeBackingProperties` rebuild fires.
+/// Backing scale factor of the host's parent NSView, via its window (falling
+/// back to the main screen when the view isn't in a window yet). Used to pin the
+/// editor's HiDPI scale at attach time, since vizia's `SystemScaleFactor`
+/// placeholder isn't reliably corrected after attach — see [`vxn_ui::open_editor`].
 #[cfg(target_os = "macos")]
 fn parent_backing_scale(nsview: *mut std::ffi::c_void) -> f64 {
     use objc::runtime::Object;
@@ -78,8 +63,6 @@ impl PluginGuiImpl for VxnMainThread<'_> {
     }
 
     fn set_scale(&mut self, _scale: f64) -> Result<(), PluginError> {
-        #[cfg(target_os = "macos")]
-        dbg_log(&format!("set_scale: host requested scale = {_scale}"));
         Ok(())
     }
 
@@ -130,17 +113,7 @@ impl PluginGuiImpl for VxnMainThread<'_> {
         // on displays where the backing scale never changes after attach, so the
         // editor would otherwise render oversized — see `vxn_ui::open_editor`.
         #[cfg(target_os = "macos")]
-        let scale_override = {
-            let s = parent_backing_scale(parent);
-            dbg_log(&format!(
-                "set_parent: nsview={:p} backing_scale={} editor_logical={}x{}",
-                parent,
-                s,
-                vxn_ui::EDITOR_WIDTH,
-                vxn_ui::EDITOR_HEIGHT,
-            ));
-            (s > 0.0).then_some(s)
-        };
+        let scale_override = Some(parent_backing_scale(parent)).filter(|s| *s > 0.0);
         #[cfg(not(target_os = "macos"))]
         let scale_override = None;
 
