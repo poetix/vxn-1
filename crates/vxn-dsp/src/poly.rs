@@ -17,7 +17,6 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::CHANNELS_PER_LAYER;
-use crate::ladder::LadderCoeffs;
 use crate::math::fast_sine;
 use crate::ota_ladder::{OtaLadderCoeffs, OtaPoles};
 use crate::oscillator::Waveform;
@@ -574,168 +573,20 @@ pub fn poly_ring_mod(o1: &[f32; N], o2: &[f32; N], gain: f32, out: &mut [f32; N]
     }
 }
 
-// ── PolyLadder ──────────────────────────────────────────────────────────────
-
-/// 16-voice ZDF ladder lowpass. Per-voice coefficients (cutoff is modulated
-/// per voice); shared topology.
-///
-/// Coefficients are *interpolated per sample* across each control block. The
-/// engine samples the modulators (DAW automation, LFO, envelope, key-follow)
-/// once per block and calls [`set_coeffs`](Self::set_coeffs) with the block's
-/// target, then [`prepare_ramp`](Self::prepare_ramp); [`process`](Self::process)
-/// then linearly ramps `(g, k, drive, scale)` from the previous block's values
-/// toward the target. Block-stepped cutoff therefore becomes a smooth
-/// piecewise-linear coefficient trajectory, continuous across block boundaries
-/// — this kills the staircase that block-rate filter automation / LFO
-/// modulation would otherwise produce. (Adapted back from `patches-dsp`, which
-/// VXN1 had originally stripped for the frozen-per-block kernel.)
-#[derive(Clone)]
-pub struct PolyLadder {
-    // Current (interpolated) coefficients, advanced each sample.
-    g: [f32; N],
-    k: [f32; N],
-    drive: [f32; N],
-    scale: [f32; N],
-    // Per-sample increments toward the target (set by `prepare_ramp`).
-    dg: [f32; N],
-    dk: [f32; N],
-    dd: [f32; N],
-    ds: [f32; N],
-    // Block target coefficients (set by `set_coeffs`).
-    tg: [f32; N],
-    tk: [f32; N],
-    td: [f32; N],
-    ts: [f32; N],
-    s0: [f32; N],
-    s1: [f32; N],
-    s2: [f32; N],
-    s3: [f32; N],
-    y4: [f32; N],
-}
-
-impl Default for PolyLadder {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl PolyLadder {
-    pub fn new() -> Self {
-        Self {
-            g: [0.5; N],
-            k: [0.0; N],
-            drive: [1.0; N],
-            scale: [1.0; N],
-            dg: [0.0; N],
-            dk: [0.0; N],
-            dd: [0.0; N],
-            ds: [0.0; N],
-            tg: [0.5; N],
-            tk: [0.0; N],
-            td: [1.0; N],
-            ts: [1.0; N],
-            s0: [0.0; N],
-            s1: [0.0; N],
-            s2: [0.0; N],
-            s3: [0.0; N],
-            y4: [0.0; N],
-        }
-    }
-
-    pub fn reset(&mut self) {
-        self.s0 = [0.0; N];
-        self.s1 = [0.0; N];
-        self.s2 = [0.0; N];
-        self.s3 = [0.0; N];
-        self.y4 = [0.0; N];
-    }
-
-    /// Set this block's *target* coefficients for voice `v`. The current
-    /// coefficients ramp toward this over the block once [`prepare_ramp`] runs.
-    #[inline]
-    pub fn set_coeffs(&mut self, v: usize, c: LadderCoeffs) {
-        self.tg[v] = c.g;
-        self.tk[v] = c.k;
-        self.td[v] = c.drive;
-        self.ts[v] = c.scale;
-    }
-
-    /// Compute per-sample increments so the current coefficients reach their
-    /// targets after exactly `steps` [`process`] calls (one control block).
-    /// `steps <= 1` snaps immediately (no ramp).
-    #[inline]
-    pub fn prepare_ramp(&mut self, steps: usize) {
-        if steps <= 1 {
-            self.snap_coeffs();
-            return;
-        }
-        let inv = 1.0 / steps as f32;
-        for v in 0..N {
-            self.dg[v] = (self.tg[v] - self.g[v]) * inv;
-            self.dk[v] = (self.tk[v] - self.k[v]) * inv;
-            self.dd[v] = (self.td[v] - self.drive[v]) * inv;
-            self.ds[v] = (self.ts[v] - self.scale[v]) * inv;
-        }
-    }
-
-    /// Jump the current coefficients to the targets with no ramp (reset / first
-    /// block / direct use).
-    #[inline]
-    pub fn snap_coeffs(&mut self) {
-        self.g = self.tg;
-        self.k = self.tk;
-        self.drive = self.td;
-        self.scale = self.ts;
-        self.dg = [0.0; N];
-        self.dk = [0.0; N];
-        self.dd = [0.0; N];
-        self.ds = [0.0; N];
-    }
-
-    /// One sample per voice: `out[v] = ladder(x[v])`. Advances the interpolated
-    /// coefficients one step toward the block target.
-    #[inline]
-    pub fn process(&mut self, x: &[f32; N], out: &mut [f32; N]) {
-        for v in 0..N {
-            let g = self.g[v];
-            let u = tanh_c(self.drive[v] * x[v] * self.scale[v] - self.k[v] * self.y4[v]);
-
-            let v0 = (u - self.s0[v]) * g;
-            let y0 = v0 + self.s0[v];
-            self.s0[v] = y0 + v0;
-
-            let v1 = (y0 - self.s1[v]) * g;
-            let y1 = v1 + self.s1[v];
-            self.s1[v] = y1 + v1;
-
-            let v2 = (y1 - self.s2[v]) * g;
-            let y2 = v2 + self.s2[v];
-            self.s2[v] = y2 + v2;
-
-            let v3 = (y2 - self.s3[v]) * g;
-            let y3 = v3 + self.s3[v];
-            self.s3[v] = y3 + v3;
-
-            self.y4[v] = y3;
-            out[v] = y3;
-
-            // Advance interpolated coefficients toward the block target.
-            self.g[v] += self.dg[v];
-            self.k[v] += self.dk[v];
-            self.drive[v] += self.dd[v];
-            self.scale[v] += self.ds[v];
-        }
-    }
-}
-
 // ── PolyOtaLadder ─────────────────────────────────────────────────────────────
 
 /// 16-voice OTA-C ladder lowpass (R3109/IR3109-style, Juno-flavoured). Poly
 /// sibling of [`crate::ota_ladder::OtaLadderKernel`].
 ///
-/// Same per-sample coefficient ramp as [`PolyLadder`] (see its docs), but the
-/// nonlinearity is per-stage `tanh` and there is **no** `scale` term — the OTA
-/// design does not thin the bass under resonance. `poles` (12 vs 24 dB/oct
+/// Coefficients are *interpolated per sample* across each control block: the
+/// engine samples the modulators once per block, calls [`set_coeffs`](Self::set_coeffs)
+/// with the block target then [`prepare_ramp`](Self::prepare_ramp), and
+/// [`process`](Self::process) linearly ramps `(g, k, drive)` from the previous
+/// block's values toward it — turning block-stepped cutoff into a smooth
+/// piecewise-linear trajectory (no zipper/staircase).
+///
+/// The nonlinearity is per-stage `tanh` and there is **no** `scale` term — the
+/// OTA design does not thin the bass under resonance. `poles` (12 vs 24 dB/oct
 /// output tap) is a *layer-wide* parameter, hoisted out of the lane loop; the
 /// feedback path is always the 4th stage so resonance is identical in both.
 #[derive(Clone)]
@@ -882,7 +733,6 @@ impl PolyOtaLadder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ladder::LadderVariant;
     use crate::oscillator::Oscillator;
 
     #[test]
@@ -1009,12 +859,9 @@ mod tests {
     #[test]
     fn poly_ladder_stable_and_lowpass() {
         let sr = 48_000.0;
-        let mut lad = PolyLadder::new();
+        let mut lad = PolyOtaLadder::new();
         for v in 0..N {
-            lad.set_coeffs(
-                v,
-                LadderCoeffs::new(1000.0, sr, 0.5, 1.0, LadderVariant::Sharp),
-            );
+            lad.set_coeffs(v, OtaLadderCoeffs::new(1000.0, sr, 0.5, 1.0));
         }
         lad.snap_coeffs();
         // Feed Nyquist-ish into all lanes; should be attenuated and finite.
@@ -1035,17 +882,14 @@ mod tests {
         // prepare_ramp must land the current coefficients exactly on target
         // after `steps` process calls, ramping linearly (no jump on sample 0).
         let sr = 48_000.0;
-        let mut lad = PolyLadder::new();
+        let mut lad = PolyOtaLadder::new();
         // Start settled at a low cutoff, then target a high one.
         for v in 0..N {
-            lad.set_coeffs(
-                v,
-                LadderCoeffs::new(200.0, sr, 0.0, 1.0, LadderVariant::Sharp),
-            );
+            lad.set_coeffs(v, OtaLadderCoeffs::new(200.0, sr, 0.0, 1.0));
         }
         lad.snap_coeffs();
         let g_start = lad.g[0];
-        let target = LadderCoeffs::new(8000.0, sr, 0.0, 1.0, LadderVariant::Sharp);
+        let target = OtaLadderCoeffs::new(8000.0, sr, 0.0, 1.0);
         for v in 0..N {
             lad.set_coeffs(v, target);
         }

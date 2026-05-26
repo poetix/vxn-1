@@ -14,7 +14,7 @@
 //! - **Snap** (everything else: enums, bools, ADSR times, pitch, LFO/effect
 //!   rates, and crucially cutoff/resonance/drive): discrete, cached, or — for
 //!   the filter — smoothed downstream by per-sample *coefficient* interpolation
-//!   in [`vxn_dsp::PolyLadder`], which handles automation, LFO and envelope
+//!   in [`vxn_dsp::PolyOtaLadder`], which handles automation, LFO and envelope
 //!   modulation uniformly. Smoothing the cutoff *value* here too would be
 //!   redundant, so these jump.
 //!

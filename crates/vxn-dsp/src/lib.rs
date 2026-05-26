@@ -24,7 +24,6 @@ pub mod chorus;
 pub mod delay;
 pub mod halfband;
 pub mod hpf;
-pub mod ladder;
 pub mod lfo;
 pub mod math;
 pub mod oscillator;
@@ -57,13 +56,12 @@ pub use chorus::StereoChorus;
 pub use delay::{DelayLine, StereoDelay};
 pub use halfband::{HalfbandFir, Oversampler};
 pub use hpf::{HpfKernel, PolyHpf};
-pub use ladder::{LadderCoeffs, LadderKernel, LadderVariant};
 pub use lfo::{LfoCore, LfoShape};
 pub use math::{fast_exp2, fast_sine, fast_tanh, lookup_sine, xorshift64};
 pub use oscillator::{Oscillator, Waveform};
 pub use ota_ladder::{OtaLadderCoeffs, OtaLadderKernel, OtaPoles};
 pub use phase::{MonoPhaseAccumulator, polyblep};
-pub use poly::{PolyLadder, PolyOscillator, PolyOtaLadder, poly_ring_mod};
+pub use poly::{PolyOscillator, PolyOtaLadder, poly_ring_mod};
 pub use smoothing::{Smoothed, ms_to_samples, one_pole_coeff};
 
 /// Flush x86/ARM denormals-to-zero on the current thread, without restoring the

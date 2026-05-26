@@ -8,7 +8,7 @@
 //!
 //! Coefficients are frozen per control block (set once via `set_cutoff`); the
 //! HPF cutoff is not a modulation destination, so no per-sample ramp is needed
-//! (unlike [`crate::PolyLadder`], whose cutoff is modulated).
+//! (unlike [`crate::PolyOtaLadder`], whose cutoff is modulated).
 
 use crate::CHANNELS_PER_LAYER;
 use std::f32::consts::PI;
@@ -66,7 +66,7 @@ impl Default for HpfKernel {
     }
 }
 
-/// 16-voice structure-of-arrays one-pole high-pass, mirroring [`crate::PolyLadder`]'s
+/// 16-voice structure-of-arrays one-pole high-pass, mirroring [`crate::PolyOtaLadder`]'s
 /// shape (`set_cutoff(v, …)` / `process(&in, &mut out)`). Per-voice coefficients
 /// (the cutoff is global today, but the SoA form keeps it in the same lane loop
 /// as the ladder).
