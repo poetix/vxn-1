@@ -11,12 +11,11 @@ filter, and a vintage-flavoured chorus — packaged as a single `.clap` bundle.
 - **16-voice polyphony** with per-voice envelopes and a global LFO.
 - **Dual oscillators** with hard-sync and phase/cross-modulation, plus optional
   anti-aliasing oversampling up to 8×.
-- **OTA-C ladder VCF** (R3109/IR3109-style, Juno-flavoured) with a switchable
+- **OTA-C ladder VCF** (R3109/IR3109-style) with a switchable
   12 / 24 dB/oct slope, plus a separate high-pass filter.
 - **Pitch envelope** alongside the amplitude and filter envelopes.
-- **Vintage bucket-brigade (BBD) chorus** — Juno-60-style "bright" voicing with
-  bucket saturation, anti-image/reconstruction filter banks, and the
-  inverted-LFO mono-compatible stereo trick.
+- **Vintage bucket-brigade (BBD) chorus** — "Bright" voicing with
+  bucket saturation, anti-image/reconstruction filter banks, and inverted-LFO mono-compatible stereo.
 - **Vizia** GUI embedded via CLAP's `gui` extension.
 
 ## Architecture
@@ -36,9 +35,6 @@ kept bit-faithful to their [`patches`](https://github.com/Vulpus-Labs) origins).
 The engine drives fixed 32-sample control blocks (`CONTROL_BLOCK`), recomputing
 modulation and filter coefficients once per block while the inner per-sample
 loop stays branch-light.
-
-clack was chosen over nih-plug specifically for its fully-permissive license
-(MIT OR Apache-2.0); nih-plug's VST3 export pulls in GPLv3.
 
 ## Building
 
