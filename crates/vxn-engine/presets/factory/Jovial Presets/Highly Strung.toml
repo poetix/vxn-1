@@ -1,0 +1,24 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Highly Strung"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "strings", "unison"]
+comment = "Bright unison strings (orig. 'Hi Strings') — eight detuned saws, slow bow-swell, high register. Divergence: ensemble width comes from unison detune (no onboard chorus — that's a Juno trait)."
+
+[patch]
+osc2_octave = 0
+osc2_fine = 9.0
+osc2_level = 0.8
+cutoff = 3600.0
+resonance = 0.15
+env2_attack = 0.5
+env2_decay = 2.0
+env2_sustain = 0.85
+env2_release = 1.1
+assign_mode = "Unison"
+unison_detune = 16.0
+pitch_lfo_depth = 0.2
+lfo_rate = 4.5

@@ -1,0 +1,26 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Clean Sweep"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "sync", "pad"]
+comment = "Heavy sync-sweep pad (orig. 'Sync Sweep') — Env 1 drags osc 2's pitch under hard sync for a slow, glassy formant motion. Divergence: raise the global Oversample for the cleanest sync (a Patch can't carry it)."
+
+[patch]
+osc1_wave = "Pulse"
+osc1_pw = 0.35
+osc2_octave = 0
+osc2_level = 0.6
+cross_mod_type = "Sync"
+osc2_pitch_env_src = "Env 1"
+osc2_pitch_env_depth = 30.0
+env1_attack = 0.6
+env1_decay = 2.5
+cutoff = 5000.0
+resonance = 0.2
+env2_attack = 0.5
+env2_decay = 1.5
+env2_sustain = 0.7
+env2_release = 1.4

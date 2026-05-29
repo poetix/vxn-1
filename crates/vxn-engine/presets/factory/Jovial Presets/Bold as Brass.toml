@@ -1,0 +1,23 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Bold as Brass"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "brass"]
+comment = "Low brass — the tubas and trombones of the JP-8 (orig. 'Lo Brass'). A saw pair an octave down, 24 dB ladder swept by Env 1 for the attack swell. Divergence: no VCO drift — thickness from osc detune alone."
+
+[patch]
+osc1_octave = -1
+osc2_fine = -4.0
+osc2_level = 0.8
+cutoff = 420.0
+resonance = 0.25
+drive = 1.5
+env1_decay = 0.4
+env1_sustain = 0.25
+cutoff_env_depth = 54.0
+env2_attack = 0.02
+env2_sustain = 0.7
+env2_release = 0.25

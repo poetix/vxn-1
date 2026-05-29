@@ -1,0 +1,24 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Mellow Drama"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "strings", "unison"]
+comment = "Soft, dark string pad (orig. 'Mellow Strings') — lower cutoff, lazier swell, gentle vibrato. Divergence: width from unison detune, not chorus."
+
+[patch]
+osc2_octave = 0
+osc2_fine = 8.0
+osc2_level = 0.8
+cutoff = 2200.0
+resonance = 0.12
+env2_attack = 0.8
+env2_decay = 2.2
+env2_sustain = 0.85
+env2_release = 1.3
+assign_mode = "Unison"
+unison_detune = 14.0
+pitch_lfo_depth = 0.15
+lfo_rate = 4.0

@@ -1,0 +1,23 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Top Brass"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "brass"]
+comment = "Bright brass section — trumpets up top (orig. 'Hi Brass'). Same ladder-swell recipe as the low brass, tuned up with a faster Env-1 bite and a higher cutoff. Divergence: no VCO drift."
+
+[patch]
+osc2_octave = 0
+osc2_fine = -4.0
+osc2_level = 0.8
+cutoff = 1100.0
+resonance = 0.2
+drive = 1.4
+env1_decay = 0.25
+env1_sustain = 0.2
+cutoff_env_depth = 42.0
+env2_attack = 0.01
+env2_sustain = 0.75
+env2_release = 0.22

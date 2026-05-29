@@ -39,6 +39,7 @@
 //! with sync on, the rate readout shows the musical subdivision instead of Hz.
 
 use std::ffi::c_void;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use vizia::ParentWindow;
@@ -46,9 +47,10 @@ use vizia::context::TreeProps;
 use vizia::prelude::*;
 use vizia::vg;
 use vxn_engine::{
-    AssignMode, CrossModType, DEFAULT_SPLIT_POINT, GlobalParam, KeyMode, Layer, ParamKind,
-    ParamRef, PatchParam, SharedParams, TOTAL_PARAMS, desc_for_clap_id, global_clap_id, param_ref,
-    patch_clap_id,
+    AssignMode, CrossModType, DEFAULT_SPLIT_POINT, FactoryPreset, GlobalParam, KeyMode, Layer,
+    Meta, ParamKind, ParamRef, Patch, PatchParam, Performance, Preset, SharedParams, TOTAL_PARAMS,
+    UserPreset, desc_for_clap_id, factory, global_clap_id, list_user_presets, load_preset_file,
+    param_ref, patch_clap_id, save_patch, save_performance,
 };
 
 /// Resolve a faceplate [`Entry`]'s baked (Upper) CLAP id to the layer currently
@@ -92,8 +94,9 @@ pub type EditorHandle = WindowHandle;
 pub const EDITOR_WIDTH: u32 = 1024;
 /// Four panel rows: (1) LFOs + oscillators + mixer, (2) envelopes + filter +
 /// filter mod, (3) the per-osc mod routes + performance wheels, (4) voice +
-/// master + keys + the two effects.
-pub const EDITOR_HEIGHT: u32 = 734;
+/// master + keys + the two effects — plus the banner and the preset bar above
+/// them (0027).
+pub const EDITOR_HEIGHT: u32 = 772;
 
 /// A control entry: CLAP id plus a short faceplate label (the panel header
 /// supplies the context, so per-control labels stay terse). Entries are baked
@@ -417,6 +420,23 @@ label { font-size: 10; color: #d6d6d6; }
 .wave-txt { font-size: 8; color: #888888; }
 .wave-txt.active { color: #a7cfe2; }
 .dimmed { opacity: 0.35; }
+/* Preset bar (0027): a slim strip under the banner. */
+.preset-bar { background-color: #1c1c1c; border-width: 1px; border-color: #0e0e0e; corner-radius: 4px; padding-left: 8px; padding-right: 8px; }
+.preset-name { font-size: 11; color: #a7cfe2; }
+.preset-status { font-size: 9; color: #9a9a9a; }
+.pbar-btn { height: 18px; background-color: #333333; border-width: 1px; border-color: #555555; corner-radius: 2px; padding-left: 6px; padding-right: 6px; }
+.pbar-btn:hover { background-color: #3a3a3a; border-color: #c4c4c4; }
+.pbar-btn .tg-lbl { color: #cfcfcf; font-size: 10; }
+.pbar-btn:hover .tg-lbl { color: #ececec; }
+.preset-field { background-color: #0e0e0e; border-width: 1px; border-color: #555555; corner-radius: 2px; color: #f0f0f0; font-size: 10; padding-left: 4px; padding-right: 4px; height: 18px; }
+.preset-field:focus-visible { border-color: #d9701b; }
+/* Browse popup: a floating, scrollable, grouped list. */
+.preset-pop { background-color: #161616; border-width: 1px; border-color: #d9701b; corner-radius: 3px; padding: 4px; }
+.preset-cat { font-size: 9; color: #d9701b; letter-spacing: 1px; }
+.preset-row { height: 18px; background-color: transparent; border-width: 0px; padding-left: 4px; padding-right: 4px; corner-radius: 2px; }
+.preset-row:hover { background-color: #2e2e2e; }
+.preset-row .tg-lbl { color: #d6d6d6; font-size: 10; }
+.preset-row:hover .tg-lbl { color: #ffffff; }
 "#;
 
 /// Fader travel, sized to match a 3-row selector list (3 × the 24px `.tg-row` +
@@ -826,6 +846,10 @@ fn build_editor(cx: &mut Context, shared: Arc<SharedParams>) {
                 .width(Stretch(1.0))
                 .height(Pixels(26.0))
                 .alignment(Alignment::Center);
+            // Preset browser bar (0027): current name + prev/next, a grouped
+            // Factory/User browse popup, the patch load-target selector, and
+            // Save-As. Sits between the banner and the panel rows.
+            preset_bar(cx, &shared, edit_layer);
             for row in ROWS.iter() {
                 HStack::new(cx, |cx| {
                     for (title, entries) in *row {
@@ -862,6 +886,359 @@ fn build_editor(cx: &mut Context, shared: Arc<SharedParams>) {
         .vertical_gap(Pixels(8.0))
         .padding(Pixels(10.0));
     });
+}
+
+/// Browser group label for on-disk user presets (the read-only factory presets
+/// group by their own `meta.category`).
+const USER_CATEGORY: &str = "User";
+
+/// Where a browser entry's preset is read from.
+#[derive(Clone)]
+enum EntrySource {
+    /// Index into the embedded factory bank (`vxn_engine::factory()`).
+    Factory(usize),
+    /// Path to a `.toml` in the user preset directory.
+    User(PathBuf),
+}
+
+/// One row in the browser's combined Factory+User list. The same flat list is
+/// what the prev/next steppers walk (ADR 0005 §6 / 0027), so its ordering is the
+/// stepping order: factory presets grouped by category (then name), then users.
+#[derive(Clone)]
+struct BrowserEntry {
+    name: String,
+    /// `meta.category` for factory presets, or [`USER_CATEGORY`] for user ones.
+    category: String,
+    source: EntrySource,
+}
+
+/// Build the combined browser list: factory presets sorted by `(category, name)`
+/// so they group cleanly, then user presets (already name-sorted by 0026). The
+/// `EntrySource::Factory(i)` index points back into `bank` regardless of sort.
+fn build_entries(bank: &[FactoryPreset], users: &[UserPreset]) -> Vec<BrowserEntry> {
+    let mut indexed: Vec<(usize, &FactoryPreset)> = bank.iter().enumerate().collect();
+    indexed.sort_by(|a, b| {
+        a.1.category
+            .to_lowercase()
+            .cmp(&b.1.category.to_lowercase())
+            .then_with(|| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()))
+    });
+    let mut out: Vec<BrowserEntry> = indexed
+        .into_iter()
+        .map(|(i, f)| BrowserEntry {
+            name: f.name.clone(),
+            category: f.category.clone(),
+            source: EntrySource::Factory(i),
+        })
+        .collect();
+    out.extend(users.iter().map(|u| BrowserEntry {
+        name: u.name.clone(),
+        category: USER_CATEGORY.to_string(),
+        source: EntrySource::User(u.path.clone()),
+    }));
+    out
+}
+
+/// Resolve the patch load-target selector (`0` Upper, `1` Lower, anything else =
+/// the current edit layer) to a concrete [`Layer`] (0027 acceptance: default is
+/// the current edit layer). Irrelevant for a Performance load (it replaces both).
+fn resolve_target(sel: usize, edit_layer: usize) -> Layer {
+    match sel {
+        0 => Layer::Upper,
+        1 => Layer::Lower,
+        _ => Layer::ALL[edit_layer.min(1)],
+    }
+}
+
+/// Default Save-As kind from the key mode: **Whole** is a single timbre, saved as
+/// a **Patch** (the edited layer); **Dual/Split** carry two layers + global +
+/// split, saved as a **Performance** (ADR 0005 §6 terminology). Documented as the
+/// 0027 "infer from key mode" decision — a Patch/Perf toggle still lets the user
+/// override (e.g. to capture global FX with a Whole sound, which a Patch omits).
+/// Returns `true` for Performance.
+fn default_save_kind_perf(key_mode: KeyMode) -> bool {
+    key_mode != KeyMode::Whole
+}
+
+/// Next index when stepping the combined list by `delta` (wraps). `None` only for
+/// an empty list; with no current selection a forward step starts at the first
+/// entry and a backward step at the last.
+fn step_index(delta: isize, current: Option<usize>, len: usize) -> Option<usize> {
+    if len == 0 {
+        return None;
+    }
+    Some(match current {
+        Some(i) => (i as isize + delta).rem_euclid(len as isize) as usize,
+        None if delta >= 0 => 0,
+        None => len - 1,
+    })
+}
+
+/// Load one browser entry into the shared store (the bulk write of ADR 0005 §6).
+/// A **Patch** lands in `target` (other layer/global/key mode untouched); a
+/// **Performance** replaces everything. Sets the current-name display and a
+/// status line; load warnings (unknown key / bad enum from 0026) are surfaced
+/// non-fatally rather than swallowed. Factory presets are pre-validated so they
+/// never warn; only user files can.
+fn load_into(
+    entry: &BrowserEntry,
+    bank: &[FactoryPreset],
+    shared: &SharedParams,
+    target: Layer,
+    name: SyncSignal<String>,
+    status: SyncSignal<String>,
+) {
+    let loaded: Result<(Preset, Vec<String>), String> = match &entry.source {
+        EntrySource::Factory(i) => bank
+            .get(*i)
+            .map(|f| (f.preset.clone(), Vec::new()))
+            .ok_or_else(|| "factory preset missing".to_string()),
+        EntrySource::User(path) => load_preset_file(path).map_err(|e| e.to_string()),
+    };
+    match loaded {
+        Ok((preset, warnings)) => {
+            match &preset {
+                Preset::Patch(p) => shared.load_patch(&p.values, target),
+                Preset::Performance(p) => shared.load_performance(&p.state),
+            }
+            name.set(entry.name.clone());
+            status.set(match warnings.first() {
+                None => format!("Loaded {}", entry.name),
+                Some(w) => format!("Loaded {} — {w}", entry.name),
+            });
+        }
+        Err(e) => status.set(format!("Load failed: {e}")),
+    }
+}
+
+/// Snapshot the live store and write it to the user directory (0026). A
+/// Performance captures the whole instrument; a Patch captures just `save_layer`.
+/// Returns the written path or a message for the status line.
+fn save_current(
+    name_text: &str,
+    perf: bool,
+    save_layer: Layer,
+    shared: &SharedParams,
+) -> Result<PathBuf, String> {
+    let trimmed = name_text.trim();
+    if trimmed.is_empty() {
+        return Err("name the preset first".to_string());
+    }
+    let meta = Meta {
+        name: trimmed.to_string(),
+        ..Meta::default()
+    };
+    if perf {
+        save_performance(&Performance {
+            meta,
+            state: shared.to_state(),
+        })
+        .map_err(|e| e.to_string())
+    } else {
+        let values = shared.to_state().params.layer(save_layer).clone();
+        save_patch(&Patch { meta, values }).map_err(|e| e.to_string())
+    }
+}
+
+/// The preset browser bar (0027): the current preset name with prev/next
+/// steppers over the combined Factory+User list, a grouped browse popup, the
+/// patch load-target selector, and Save-As. Builds against the editor idiom —
+/// `SyncSignal` state, `on_press_down` (vizia drops Press on tiny cursor drift,
+/// [[vxn1-vizia-no-click-slop]]), and the existing `PollAutomation` idle resync
+/// (a one-shot bulk load repaints every control on the next idle tick; not a
+/// continuous relayout, so it doesn't stomp input — cf.
+/// [[vxn1-vizia-automation-relayout-input-stomp]]).
+fn preset_bar(cx: &mut Context, shared: &Arc<SharedParams>, edit_layer: SyncSignal<usize>) {
+    let shared = Arc::clone(shared);
+    let bank = Arc::new(factory());
+    let users = list_user_presets().unwrap_or_default();
+    let entries: SyncSignal<Arc<Vec<BrowserEntry>>> =
+        SyncSignal::new(Arc::new(build_entries(&bank, &users)));
+
+    // Current preset name (em dash until something loads), a transient status
+    // line, the Save-As text, and the browser cursor into `entries`.
+    let name = SyncSignal::new(String::from("\u{2014}"));
+    let status = SyncSignal::new(String::new());
+    let save_name = SyncSignal::new(String::new());
+    let current: SyncSignal<Option<usize>> = SyncSignal::new(None);
+    // Patch load target (0 Upper, 1 Lower, 2 = current edit layer, the default).
+    let target = SyncSignal::new(2usize);
+    // Save kind: false = Patch (edited layer), true = Performance. Defaulted from
+    // the key mode; the Patch/Perf toggle overrides it.
+    let kind_perf = SyncSignal::new(default_save_kind_perf(shared.key_mode()));
+    let browse_open = SyncSignal::new(false);
+
+    HStack::new(cx, move |cx| {
+        // ── Prev / current name / next ──
+        let (b_prev, sh_prev) = (Arc::clone(&bank), Arc::clone(&shared));
+        Button::new(cx, |cx| Label::new(cx, "<").class("tg-lbl"))
+            .class("pbar-btn")
+            .cursor(CursorIcon::Hand)
+            .on_press_down(move |_cx| {
+                let es = entries.get();
+                if let Some(ni) = step_index(-1, current.get(), es.len()) {
+                    let layer = resolve_target(target.get(), edit_layer.get());
+                    load_into(&es[ni], &b_prev, &sh_prev, layer, name, status);
+                    current.set(Some(ni));
+                }
+            });
+        Label::new(cx, name)
+            .class("preset-name")
+            .width(Pixels(150.0))
+            .height(Stretch(1.0))
+            .alignment(Alignment::Left);
+        let (b_next, sh_next) = (Arc::clone(&bank), Arc::clone(&shared));
+        Button::new(cx, |cx| Label::new(cx, ">").class("tg-lbl"))
+            .class("pbar-btn")
+            .cursor(CursorIcon::Hand)
+            .on_press_down(move |_cx| {
+                let es = entries.get();
+                if let Some(ni) = step_index(1, current.get(), es.len()) {
+                    let layer = resolve_target(target.get(), edit_layer.get());
+                    load_into(&es[ni], &b_next, &sh_next, layer, name, status);
+                    current.set(Some(ni));
+                }
+            });
+
+        // ── Browse (grouped popup) ──
+        let (b_pop, sh_pop) = (Arc::clone(&bank), Arc::clone(&shared));
+        VStack::new(cx, move |cx| {
+            Button::new(cx, |cx| Label::new(cx, "Browse").class("tg-lbl"))
+                .class("pbar-btn")
+                .cursor(CursorIcon::Hand)
+                .on_press_down(move |_cx| browse_open.set(!browse_open.get()));
+            // Floating list, built only while open and rebuilt when the entry
+            // list changes (a Save adds a user preset). Absolutely positioned so
+            // it overlays the panels below without reserving layout space.
+            Binding::new(cx, browse_open, move |cx| {
+                if !browse_open.get() {
+                    return;
+                }
+                let (b_pop, sh_pop) = (Arc::clone(&b_pop), Arc::clone(&sh_pop));
+                Binding::new(cx, entries, move |cx| {
+                    let es = entries.get();
+                    let (b_pop, sh_pop) = (Arc::clone(&b_pop), Arc::clone(&sh_pop));
+                    VStack::new(cx, move |cx| {
+                        ScrollView::new(cx, move |cx| {
+                            if es.is_empty() {
+                                Label::new(cx, "No presets").class("preset-cat");
+                            }
+                            let mut last_cat: Option<String> = None;
+                            for (i, e) in es.iter().enumerate() {
+                                if last_cat.as_deref() != Some(e.category.as_str()) {
+                                    Label::new(cx, e.category.clone())
+                                        .class("preset-cat")
+                                        .height(Pixels(16.0));
+                                    last_cat = Some(e.category.clone());
+                                }
+                                let (b, sh, entry, label) = (
+                                    Arc::clone(&b_pop),
+                                    Arc::clone(&sh_pop),
+                                    e.clone(),
+                                    e.name.clone(),
+                                );
+                                Button::new(cx, move |cx| {
+                                    Label::new(cx, label).class("tg-lbl").hoverable(false)
+                                })
+                                .class("preset-row")
+                                .width(Stretch(1.0))
+                                .cursor(CursorIcon::Hand)
+                                .on_press_down(move |_cx| {
+                                    let layer = resolve_target(target.get(), edit_layer.get());
+                                    load_into(&entry, &b, &sh, layer, name, status);
+                                    current.set(Some(i));
+                                    browse_open.set(false);
+                                });
+                            }
+                        })
+                        .height(Pixels(300.0));
+                    })
+                    .class("preset-pop")
+                    .position_type(PositionType::Absolute)
+                    .top(Pixels(22.0))
+                    .left(Pixels(0.0))
+                    .width(Pixels(240.0))
+                    .height(Auto)
+                    .z_index(200);
+                });
+            });
+        })
+        .width(Auto)
+        .height(Stretch(1.0))
+        .alignment(Alignment::Center);
+
+        // ── Patch load target ──
+        HStack::new(cx, move |cx| {
+            Label::new(cx, "TGT").class("tg-lbl");
+            for (n, lbl) in ["U", "L", "Edit"].into_iter().enumerate() {
+                toggle_row(
+                    cx,
+                    lbl,
+                    target.map(move |t: &usize| *t == n),
+                    move |_cx| target.set(n),
+                );
+            }
+        })
+        .width(Auto)
+        .height(Stretch(1.0))
+        .horizontal_gap(Pixels(4.0))
+        .alignment(Alignment::Center);
+
+        // ── Save-As: name field, Patch/Perf kind, Save ──
+        let sh_save = Arc::clone(&shared);
+        let bank_save = Arc::clone(&bank);
+        HStack::new(cx, move |cx| {
+            Label::new(cx, "SAVE").class("tg-lbl");
+            Textbox::new(cx, save_name)
+                .class("preset-field")
+                .width(Pixels(120.0))
+                .on_edit(move |_cx, text| save_name.set(text));
+            toggle_row(cx, "Patch", kind_perf.map(|p: &bool| !*p), move |_cx| {
+                kind_perf.set(false)
+            });
+            toggle_row(cx, "Perf", kind_perf.map(|p: &bool| *p), move |_cx| {
+                kind_perf.set(true)
+            });
+            Button::new(cx, |cx| Label::new(cx, "Save").class("tg-lbl"))
+                .class("pbar-btn")
+                .cursor(CursorIcon::Hand)
+                .on_press_down(move |_cx| {
+                    let trimmed = save_name.get().trim().to_string();
+                    let save_layer = resolve_target(2, edit_layer.get());
+                    match save_current(&trimmed, kind_perf.get(), save_layer, &sh_save) {
+                        Ok(path) => {
+                            // Re-enumerate users so the new file shows in the
+                            // browser, and point the cursor at it.
+                            let users = list_user_presets().unwrap_or_default();
+                            let rebuilt = Arc::new(build_entries(&bank_save, &users));
+                            let idx = rebuilt.iter().position(|e| {
+                                matches!(&e.source, EntrySource::User(p) if *p == path)
+                            });
+                            entries.set(rebuilt);
+                            current.set(idx);
+                            name.set(trimmed.clone());
+                            status.set(format!("Saved {trimmed}"));
+                        }
+                        Err(e) => status.set(format!("Save failed: {e}")),
+                    }
+                });
+        })
+        .width(Auto)
+        .height(Stretch(1.0))
+        .horizontal_gap(Pixels(4.0))
+        .alignment(Alignment::Center);
+
+        // Status / warning line fills the remaining width on the right.
+        Label::new(cx, status)
+            .class("preset-status")
+            .width(Stretch(1.0))
+            .height(Stretch(1.0))
+            .alignment(Alignment::Right);
+    })
+    .class("preset-bar")
+    .height(Pixels(30.0))
+    .horizontal_gap(Pixels(6.0))
+    .alignment(Alignment::Left);
 }
 
 /// The "Keys" panel: key-mode selector, Upper/Lower edit-target toggle (hidden
@@ -2541,5 +2918,105 @@ mod tests {
         assert_eq!(note_name(69), "A4"); // A440
         assert_eq!(note_name(0), "C-1");
         assert_eq!(note_name(127), "G9");
+    }
+
+    // ── Preset browser helpers (0027) ─────────────────────────────────────────
+
+    use vxn_engine::{Meta, Patch, PatchValues, Preset};
+
+    fn fp(category: &str, name: &str) -> FactoryPreset {
+        FactoryPreset {
+            path: format!("{category}/{name}.toml"),
+            category: category.to_string(),
+            name: name.to_string(),
+            preset: Preset::Patch(Patch {
+                meta: Meta {
+                    name: name.to_string(),
+                    ..Default::default()
+                },
+                values: PatchValues::default(),
+            }),
+        }
+    }
+
+    fn up_entry(name: &str) -> UserPreset {
+        UserPreset {
+            path: PathBuf::from(format!("/tmp/{name}.toml")),
+            name: name.to_string(),
+            kind: "patch",
+        }
+    }
+
+    #[test]
+    fn resolve_target_maps_selector_and_edit_layer() {
+        assert_eq!(resolve_target(0, 0), Layer::Upper);
+        assert_eq!(resolve_target(1, 0), Layer::Lower);
+        // 2 (and anything else) follows the current edit layer.
+        assert_eq!(resolve_target(2, 0), Layer::Upper);
+        assert_eq!(resolve_target(2, 1), Layer::Lower);
+        assert_eq!(resolve_target(99, 1), Layer::Lower);
+    }
+
+    #[test]
+    fn save_kind_default_follows_key_mode() {
+        // Whole = single timbre → Patch; multi-layer modes → Performance.
+        assert!(!default_save_kind_perf(KeyMode::Whole));
+        assert!(default_save_kind_perf(KeyMode::Dual));
+        assert!(default_save_kind_perf(KeyMode::Split));
+    }
+
+    #[test]
+    fn step_index_wraps_and_seeds() {
+        assert_eq!(step_index(1, None, 0), None); // empty list
+        assert_eq!(step_index(1, None, 3), Some(0)); // forward from nothing → first
+        assert_eq!(step_index(-1, None, 3), Some(2)); // back from nothing → last
+        assert_eq!(step_index(1, Some(2), 3), Some(0)); // wrap forward
+        assert_eq!(step_index(-1, Some(0), 3), Some(2)); // wrap back
+        assert_eq!(step_index(1, Some(0), 3), Some(1));
+    }
+
+    #[test]
+    fn build_entries_groups_factory_by_category_then_appends_users() {
+        // Out-of-order, mixed-category bank: build_entries must sort by
+        // (category, name) while preserving each preset's bank index, then append
+        // users under the User group in their given order.
+        let bank = vec![
+            fp("Pad", "Glass"),       // idx 0
+            fp("Bass", "Mini"),       // idx 1
+            fp("Bass", "FM Growl"),   // idx 2
+        ];
+        let users = vec![up_entry("My Patch"), up_entry("Another")];
+        let entries = build_entries(&bank, &users);
+
+        let shape: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|e| (e.category.as_str(), e.name.as_str()))
+            .collect();
+        assert_eq!(
+            shape,
+            vec![
+                ("Bass", "FM Growl"),
+                ("Bass", "Mini"),
+                ("Pad", "Glass"),
+                (USER_CATEGORY, "My Patch"),
+                (USER_CATEGORY, "Another"),
+            ]
+        );
+        // Factory indices point back into the unsorted bank.
+        assert!(matches!(entries[0].source, EntrySource::Factory(2)));
+        assert!(matches!(entries[1].source, EntrySource::Factory(1)));
+        assert!(matches!(entries[2].source, EntrySource::Factory(0)));
+        // Users carry their on-disk path.
+        assert!(
+            matches!(&entries[3].source, EntrySource::User(p) if p.ends_with("My Patch.toml"))
+        );
+    }
+
+    #[test]
+    fn build_entries_handles_empty_bank_and_users() {
+        assert!(build_entries(&[], &[]).is_empty());
+        let only_users = build_entries(&[], &[up_entry("Solo")]);
+        assert_eq!(only_users.len(), 1);
+        assert_eq!(only_users[0].category, USER_CATEGORY);
     }
 }

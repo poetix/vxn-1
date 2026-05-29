@@ -1,0 +1,25 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Bach to Basics"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "keys", "pluck"]
+comment = "Harpsichord pluck (orig. 'Harpsichord') — bright narrow-pulse pair, fast decay, no sustain, slight detune for the dual-string jangle. Divergence: no physical jack/quill model; a pure subtractive pluck."
+
+[patch]
+osc1_wave = "Pulse"
+osc1_pw = 0.2
+osc2_wave = "Pulse"
+osc2_octave = 0
+osc2_pw = 0.25
+osc2_fine = 4.0
+cutoff = 3000.0
+resonance = 0.2
+env1_decay = 0.15
+cutoff_env_depth = 36.0
+env2_attack = 0.002
+env2_decay = 0.6
+env2_sustain = 0.0
+env2_release = 0.2

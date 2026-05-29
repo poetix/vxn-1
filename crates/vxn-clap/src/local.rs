@@ -33,6 +33,12 @@ pub struct LocalParams {
     gesture: [bool; TOTAL_PARAMS],
     /// Params changed by the UI since the last [`emit`](Self::emit).
     ui_changed: [bool; TOTAL_PARAMS],
+    /// Params changed by **host automation** since the last
+    /// [`publish`](Self::publish). Only these are written back to the shared
+    /// store, so a concurrent UI bulk write (a preset load) landing between this
+    /// block's [`fetch_ui_changes`](Self::fetch_ui_changes) and `publish` is
+    /// never clobbered by re-publishing the stale mirror.
+    host_changed: [bool; TOTAL_PARAMS],
 }
 
 impl LocalParams {
@@ -41,6 +47,7 @@ impl LocalParams {
             values: std::array::from_fn(|i| shared.get(i)),
             gesture: [false; TOTAL_PARAMS],
             ui_changed: [false; TOTAL_PARAMS],
+            host_changed: [false; TOTAL_PARAMS],
         }
     }
 
@@ -69,6 +76,7 @@ impl LocalParams {
                 if i < TOTAL_PARAMS {
                     let v = e.value() as f32;
                     self.values[i] = v;
+                    self.host_changed[i] = true;
                     return Some((i, v));
                 }
             }
@@ -83,11 +91,18 @@ impl LocalParams {
         }
     }
 
-    /// Publish the working values to `shared` so the host and UI observe
-    /// host-side automation changes.
-    pub fn publish(&self, shared: &SharedParams) {
-        for (i, &v) in self.values.iter().enumerate() {
-            shared.set(i, v);
+    /// Publish **host-automation** changes to `shared` so the host and UI observe
+    /// host-side movement. Only params flagged by [`apply_input`](Self::apply_input)
+    /// this block are written (then cleared) — re-publishing the whole mirror
+    /// would race a concurrent UI bulk write (a preset load) and silently revert
+    /// it. UI-originated writes already live in `shared`; the audio thread only
+    /// reads them (via `fetch_ui_changes`), never writes them back.
+    pub fn publish(&mut self, shared: &SharedParams) {
+        for i in 0..TOTAL_PARAMS {
+            if self.host_changed[i] {
+                shared.set(i, self.values[i]);
+                self.host_changed[i] = false;
+            }
         }
     }
 
@@ -126,5 +141,61 @@ impl LocalParams {
                 let _ = out.try_push(ParamGestureEndEvent::new(end_time, id));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use vxn_engine::{Layer, PatchParam, ParamValues, patch_clap_id};
+
+    /// A UI bulk write (preset load) that lands in the window between this block's
+    /// `fetch_ui_changes` and `publish` must survive: `publish` only writes host
+    /// automation, so it can't revert the UI's value. The next `fetch_ui_changes`
+    /// then folds it into the mirror. (Regression: a blanket re-publish silently
+    /// dropped the load, leaving the old patch in place — 0027.)
+    #[test]
+    fn publish_does_not_clobber_concurrent_ui_writes() {
+        let shared = SharedParams::new();
+        let mut local = LocalParams::new(&shared);
+        let cutoff = patch_clap_id(Layer::Upper, PatchParam::Cutoff);
+
+        // No host automation this block; the UI writes a new value to the shared
+        // store after the mirror was built (the preset-load race window).
+        let before = shared.get(cutoff);
+        let loaded = before + 1234.0;
+        shared.set(cutoff, loaded);
+
+        // publish must leave the UI's value untouched (nothing host-changed).
+        local.publish(&shared);
+        assert_eq!(shared.get(cutoff), loaded, "publish reverted a UI write");
+
+        // The next fetch folds the UI value into the mirror / engine.
+        assert!(local.fetch_ui_changes(&shared));
+        let mut params = ParamValues::default();
+        local.write_to(&mut params);
+        assert_eq!(params.get_by_clap_id(cutoff), loaded);
+    }
+
+    /// host automation still reaches the shared store via publish, so the UI/host
+    /// observe it. (`apply_input` flags the param; we exercise the publish side
+    /// by flagging through the same field a host event would set.)
+    #[test]
+    fn publish_writes_host_changes_once_then_clears() {
+        let shared = SharedParams::new();
+        let mut local = LocalParams::new(&shared);
+        let cutoff = patch_clap_id(Layer::Upper, PatchParam::Cutoff);
+
+        // Simulate a host-automation fold: mirror updated + flagged.
+        local.values[cutoff] = 777.0;
+        local.host_changed[cutoff] = true;
+        local.publish(&shared);
+        assert_eq!(shared.get(cutoff), 777.0);
+
+        // A second publish with no new host change is a no-op (flag cleared), so a
+        // later UI write to the same param is not overwritten.
+        shared.set(cutoff, 888.0);
+        local.publish(&shared);
+        assert_eq!(shared.get(cutoff), 888.0);
     }
 }

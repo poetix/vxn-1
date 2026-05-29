@@ -1,0 +1,54 @@
+schema = 1
+kind = "performance"
+
+[meta]
+name = "Great Divide"
+author = "Vulpus Labs"
+category = "Jovial Performances"
+tags = ["jp8", "split", "bass", "lead"]
+comment = "Keyboard split at C3 (MIDI 48): Solo sync lead up top (Upper), Solo bass below (Lower). Global ping-pong delay plus a raised Oversample for clean sync. Divergence: chorus off for authenticity."
+
+[performance]
+key_mode = "Split"
+split_point = 48
+
+[performance.global]
+chorus_on = false
+delay_on = true
+delay_time = 0.3
+delay_mix = 0.18
+oversample = "4x"
+
+[performance.upper]
+osc2_coarse = 7
+osc2_octave = 0
+cross_mod_type = "Sync"
+osc2_pitch_env_src = "Env 1"
+osc2_pitch_env_depth = 12.0
+cutoff = 6000.0
+resonance = 0.3
+drive = 1.5
+env2_attack = 0.01
+env2_decay = 0.3
+env2_release = 0.25
+assign_mode = "Solo"
+legato = true
+portamento_time = 0.03
+pitch_wheel_depth = 7.0
+
+[performance.lower]
+osc1_octave = -1
+osc2_fine = 0.0
+cutoff = 420.0
+resonance = 0.3
+filter_key_track = true
+env1_decay = 0.25
+env1_sustain = 0.1
+cutoff_env_depth = 44.0
+env2_attack = 0.002
+env2_decay = 0.4
+env2_sustain = 0.3
+env2_release = 0.12
+assign_mode = "Solo"
+legato = true
+portamento_time = 0.03

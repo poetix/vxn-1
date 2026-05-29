@@ -1,0 +1,26 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Brass Tacks"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "brass", "pwm"]
+comment = "Classic poly synth-brass stab (orig. 'Synth Brass') — a pulse/saw blend with slow PWM shimmer and an Env-1 filter bite. Divergence: PWM rides per-voice LFO 1, not the JP-8's per-section LFO."
+
+[patch]
+osc1_wave = "Pulse"
+osc1_pw = 0.45
+osc2_octave = 0
+osc2_fine = -3.0
+cutoff = 1400.0
+resonance = 0.18
+cutoff_env_depth = 36.0
+env1_decay = 0.3
+env1_sustain = 0.3
+env2_attack = 0.015
+env2_sustain = 0.7
+env2_release = 0.2
+pwm_lfo_src = "LFO 1"
+pwm_lfo_depth = 0.08
+lfo_rate = 0.8

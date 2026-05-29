@@ -1,0 +1,27 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Sync or Swim"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "sync", "lead"]
+comment = "Surging 'negative envelope' sync lead (orig. 'Neg Sync') — sharp attack, the sync sweep diving downward via an inverted (negative) pitch-env depth. Divergence: negative depth replaces the JP-8 env-polarity switch; raise Oversample for clean sync."
+
+[patch]
+osc2_coarse = 5
+osc2_octave = 0
+cross_mod_type = "Sync"
+osc2_pitch_env_src = "Env 1"
+osc2_pitch_env_depth = -24.0
+env1_attack = 0.001
+env1_decay = 0.25
+cutoff = 5500.0
+resonance = 0.25
+drive = 1.5
+env2_attack = 0.002
+env2_decay = 0.4
+env2_sustain = 0.7
+env2_release = 0.2
+assign_mode = "Solo"
+legato = true

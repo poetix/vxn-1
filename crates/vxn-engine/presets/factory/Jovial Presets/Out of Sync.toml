@@ -1,0 +1,28 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Out of Sync"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "sync", "lead", "twin"]
+comment = "Bright metallic sync lead for power solos (orig. 'Sync Lead'). Twin assign fattens each note across two detuned channels; Env 1 drives the sync sweep. Divergence: raise Oversample to tame sync alias."
+
+[patch]
+osc2_coarse = 7
+osc2_octave = 0
+cross_mod_type = "Sync"
+osc2_pitch_env_src = "Env 1"
+osc2_pitch_env_depth = 12.0
+cutoff = 6500.0
+resonance = 0.3
+drive = 1.6
+env1_attack = 0.01
+env1_decay = 0.7
+env1_sustain = 0.3
+env2_attack = 0.01
+env2_decay = 0.3
+env2_release = 0.2
+assign_mode = "Twin"
+unison_detune = 8.0
+pitch_wheel_depth = 7.0

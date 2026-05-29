@@ -1,0 +1,46 @@
+schema = 1
+kind = "performance"
+
+[meta]
+name = "Isao Tinkle"
+author = "Vulpus Labs"
+category = "Jovial Performances"
+tags = ["jp8", "bell", "fm", "dual"]
+comment = "FM chime (orig. 'Tomita Chime') as a two-layer Dual: Upper = static FM bell (sine carrier + sine modulator at +7 st, modulator out of mix) for the metallic ring; Lower = a plain sine with an inverted Env-1 pitch ping (the chime 'ting'). The JP-8 did this in one panel with an inverted env on VCO frequency; VXN-1 splits the body and the transient across two layers so the FM ratio stays put. Chorus off; raise Oversample for cleanest FM."
+
+[performance]
+key_mode = "Dual"
+split_point = 60
+
+[performance.global]
+chorus_on = false
+
+[performance.upper]
+osc1_wave = "Sine"
+osc2_wave = "Sine"
+osc2_coarse = 7
+osc2_octave = 0
+osc2_fine = 0.0
+osc2_level = 0.0
+cross_mod_type = "FM"
+cross_mod_amount = 1.3
+cutoff = 9000.0
+resonance = 0.1
+env2_attack = 0.001
+env2_decay = 2.5
+env2_sustain = 0.0
+env2_release = 0.8
+
+[performance.lower]
+osc1_wave = "Sine"
+osc2_level = 0.0
+cutoff = 12000.0
+resonance = 0.0
+pitch_env_src = "Env 1"
+pitch_env_depth = -7.0
+env1_attack = 0.001
+env1_decay = 0.15
+env2_attack = 0.001
+env2_decay = 0.5
+env2_sustain = 0.0
+env2_release = 0.3

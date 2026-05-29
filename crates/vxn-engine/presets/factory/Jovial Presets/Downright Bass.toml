@@ -1,0 +1,25 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Downright Bass"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "bass", "mono"]
+comment = "Plucky upright/acoustic-style bass (orig. 'Upright Bass') — saw + triangle, fast Env-1 filter pluck to no sustain, key-track for an even response. Divergence: no body-resonance model; the pluck is filter-env only."
+
+[patch]
+osc2_wave = "Triangle"
+osc1_octave = -1
+osc2_fine = 0.0
+cutoff = 380.0
+resonance = 0.3
+filter_key_track = true
+env1_decay = 0.18
+cutoff_env_depth = 48.0
+env2_decay = 0.4
+env2_sustain = 0.2
+env2_release = 0.12
+assign_mode = "Solo"
+legato = true
+portamento_time = 0.02

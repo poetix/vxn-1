@@ -1,0 +1,23 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Solar Sails"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "pad", "noise"]
+comment = "Airy, evolving wind pad (orig. 'Solar Winds') — pink noise over a soft saw, a slow per-voice LFO drifting the cutoff. Divergence: drift uses LFO 1 (per-voice), since LFO 2's rate isn't settable from a Patch."
+
+[patch]
+osc1_level = 0.5
+noise_level = 0.3
+noise_color = "Pink"
+cutoff = 1800.0
+resonance = 0.4
+lfo_shape = "Tri"
+lfo_rate = 0.3
+cutoff_lfo1_depth = 40.0
+env2_attack = 1.5
+env2_decay = 2.5
+env2_sustain = 0.7
+env2_release = 2.0

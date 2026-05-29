@@ -1,0 +1,23 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Phat Fifths"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "bass", "fifths", "twin"]
+comment = "Power-fifth bass (orig. 'Fat Fifths') — osc 2 a fifth (+7 st) above, Twin assign for the 'fat' stack. Divergence: Twin (two voices/note) is a VXN-1 extra, approximating the analog girth."
+
+[patch]
+osc1_octave = -1
+osc2_coarse = 7
+osc2_fine = 0.0
+cutoff = 900.0
+env1_decay = 0.3
+env1_sustain = 0.1
+cutoff_env_depth = 40.0
+env2_decay = 0.5
+env2_sustain = 0.6
+env2_release = 0.15
+assign_mode = "Twin"
+unison_detune = 10.0

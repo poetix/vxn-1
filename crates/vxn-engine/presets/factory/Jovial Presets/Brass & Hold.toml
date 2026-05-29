@@ -1,0 +1,24 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Brass & Hold"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "brass", "sample-hold"]
+comment = "Sample-and-hold brass (orig. 'S-H Brass') — the JP-8 'Camera Eye' trick: an S&H LFO steps the cutoff for a bubbling, random texture over a brass tone. Divergence: S&H on per-voice LFO 1; no per-section routing."
+
+[patch]
+osc2_octave = 0
+osc2_fine = -4.0
+cutoff = 900.0
+resonance = 0.3
+cutoff_env_depth = 30.0
+env1_decay = 0.3
+env1_sustain = 0.3
+env2_attack = 0.02
+env2_sustain = 0.7
+env2_release = 0.25
+lfo_shape = "S&H"
+lfo_rate = 8.0
+cutoff_lfo1_depth = 36.0

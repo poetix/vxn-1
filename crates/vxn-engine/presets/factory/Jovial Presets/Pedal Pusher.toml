@@ -1,0 +1,19 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Pedal Pusher"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "bass", "organ"]
+comment = "Sustained organ bass pedal (orig. 'Organ Bass Pedals') — sine plus a sub triangle, instant attack, full sustain, quick release. Divergence: none — a simple, solid sub for left-hand pedal parts."
+
+[patch]
+osc1_wave = "Sine"
+osc2_wave = "Triangle"
+osc1_octave = -1
+osc2_fine = 0.0
+cutoff = 600.0
+env2_sustain = 1.0
+env2_release = 0.15
+assign_mode = "Solo"

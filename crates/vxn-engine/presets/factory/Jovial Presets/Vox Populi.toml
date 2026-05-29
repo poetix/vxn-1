@@ -1,0 +1,25 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Vox Populi"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "choir", "pad"]
+comment = "Synthetic choir 'aah' (orig. 'Choir Voices') — twin pulse oscillators through a bandpass for a vowel-like formant, slow swell and a breath of vibrato. Divergence: VXN-1 has no true formant filter; bandpass approximates the vowel."
+
+[patch]
+osc1_wave = "Pulse"
+osc1_pw = 0.3
+osc2_wave = "Pulse"
+osc2_octave = 0
+osc2_pw = 0.4
+osc2_fine = 6.0
+filter_mode = "BP"
+cutoff = 1200.0
+resonance = 0.3
+env2_attack = 0.45
+env2_decay = 1.5
+env2_sustain = 0.85
+env2_release = 1.0
+pitch_lfo_depth = 0.25

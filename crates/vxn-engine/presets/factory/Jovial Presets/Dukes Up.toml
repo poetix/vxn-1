@@ -1,0 +1,25 @@
+schema = 1
+kind = "patch"
+
+[meta]
+name = "Dukes Up"
+author = "Vulpus Labs"
+category = "Jovial Presets"
+tags = ["jp8", "lead", "mono"]
+comment = "Fat mono solo lead (orig. 'Duke Lead') — saw plus a detuned pulse, legato glide, wide pitch-bend for dives. Divergence: none major — mono Solo with portamento."
+
+[patch]
+osc2_wave = "Pulse"
+osc2_octave = 0
+osc2_fine = -5.0
+osc2_pw = 0.4
+cutoff = 4000.0
+resonance = 0.3
+drive = 1.3
+env2_attack = 0.01
+env2_decay = 0.4
+env2_release = 0.25
+assign_mode = "Solo"
+legato = true
+portamento_time = 0.06
+pitch_wheel_depth = 12.0
