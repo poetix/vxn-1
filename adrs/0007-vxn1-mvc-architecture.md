@@ -278,19 +278,48 @@ This ADR captures the destination architecture. Migration is
 ### 8. Reuse intent for VXN-2
 
 VXN-2 will define its own `Synth`, its own `PatchParam` / `GlobalParam`
-enums, its own param table — and reuse:
+enums, its own param table. The reusable surface is **architectural**,
+not visual.
 
-- `vxn-app` unchanged: the controller, event enums, trait surface.
-- `vxn-ui-web` mostly unchanged: the HTML/JS faceplate is data-driven
-  from the controller's view events, so a different param table renders
-  through the same bridge. Panel layout (which controls in which row) is
-  the part that diverges; isolate it behind a "facelist" data structure
-  the front-end consumes.
+**Carries over unchanged:**
 
-The honest scope of "shared" is the architecture and the surface, not
-the look. VXN-2's faceplate will be its own design; what carries over is
-that designing it is a matter of editing one HTML/CSS/data file, not
-re-plumbing the host integration.
+- `vxn-app` — the controller, event enums, trait surface. The Model /
+  Controller / View separation, the channel discipline, the audio-
+  thread invariant.
+- The CLAP shell integration in `vxn-clap` — host event extraction,
+  state save/restore, GUI extension wiring against `EditorBackend`.
+- The WebView **embedding plumbing** in `vxn-ui-web` — wry-based child
+  WKWebView setup, parent-window scale handling, the IPC bridge
+  transport (JS ↔ Rust message protocol), the floating popup for text
+  input.
+- The preset format + corpus IO in `vxn-engine::preset_io` (ADR 0005),
+  including the controller's mediation of mutations.
+
+**Does not carry over:** the faceplate itself. VXN-2 will likely want
+control idioms VXN-1 has no place for — oscilloscopes, spectrum
+displays, X/Y pads, modulation matrix grids, custom envelope editors,
+waveform-shape editors driven by the engine's actual sample buffer.
+These are not parameter widgets; they need engine data the present
+`ParamModel` / `ParamChanged` surface does not carry. New ViewEvent
+variants (waveform tap, scope buffer, meter readings) will be
+defined as needed; they extend the protocol, they do not slot into the
+existing one.
+
+**The honest scope of "shared":**
+
+- The architecture (Model / Controller / View, audio thread integrity,
+  event channels, IO mediation).
+- The transport (wry child WebView, IPC bridge, floating popup, host
+  integration).
+- The format (preset TOML + corpus rules).
+
+**Not shared:** the faceplate's structure, its layout, its visual
+language, or any assumption that "if you have a parameter you get a
+fader for it". VXN-2's editor is a new HTML/CSS/JS application built
+on the same scaffolding. What changes is the build cost relative to
+greenfield — re-deriving the host integration, the parameter
+plumbing, the preset IO and the embedding glue is the slow part, and
+those parts are done.
 
 ## Consequences
 
