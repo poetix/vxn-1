@@ -259,9 +259,14 @@ impl<'a> PluginTimerImpl for VxnMainThread<'a> {
         self.drain_view_events();
         // Then catch any audio-thread automation the controller never saw.
         // The two pushes can echo the same param twice in a tick (controller
-        // emit + diff push); the WebView's `update` is idempotent, so the
-        // overlap is just a wasted evaluate_script — no visible effect.
+        // emit + diff push); the WebView dedupes ParamChanged by id inside
+        // `flush_view_events`, so the overlap costs nothing on the wire.
         self.push_param_diffs();
+        // 0046: one `evaluate_script` per tick. Both pushes above only
+        // buffered into the EditorHandle; this is the single bridge call.
+        if let Some(handle) = self.gui.as_ref() {
+            handle.flush_view_events();
+        }
     }
 }
 

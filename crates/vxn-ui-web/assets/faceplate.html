@@ -223,6 +223,28 @@ html, body {
   z-index: 1000;
 }
 
+/* Status pill (0046) — lower-right corner notifier. Driven by the
+   controller's `Status { line }` ViewEvent (clamp warnings on preset load,
+   ad-hoc messages). Fades after ~2.4s; pure CSS animation so the JS side
+   just sets the line + toggles the `visible` class. */
+.status-pill {
+  position: fixed;
+  right: 10px;
+  bottom: 10px;
+  background: #0e0e0e;
+  border: 1px solid var(--glyph-active);
+  border-radius: 3px;
+  padding: 3px 8px;
+  font-size: 10px;
+  color: #f6f6f6;
+  white-space: nowrap;
+  z-index: 1000;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 240ms ease-out;
+}
+.status-pill.visible { opacity: 1; }
+
 /* Fader — vertical track + thumb. Pointer ops issue Begin/EndGesture
    brackets so the host's automation lane records as one event, not a
    pixel storm. */
@@ -781,8 +803,11 @@ html, body {
 // ─── Bridge bootstrap ──────────────────────────────────────────────────────
 //
 // `window.vxn.send({op,...})` posts a UiEvent at the controller through wry's
-// IPC handler; `window.vxn.onViewEvent(ev)` is the entry point Rust calls
-// via `webview.evaluate_script` for each ViewEvent the controller emits.
+// IPC handler; `window.__vxn.applyViewEvents(arr)` is the batched entry
+// point Rust calls via `webview.evaluate_script` once per controller tick
+// (0046). `window.vxn.onViewEvent(ev)` is a single-event convenience that
+// routes to the same dispatcher — kept for ad-hoc calls and for in-page
+// tests.
 //
 // `window.vxn.params` is the param descriptor table — Rust splices its JSON
 // in via the `__PARAMS_JSON__` placeholder below at editor-open time. Keys
@@ -791,7 +816,7 @@ html, body {
 // Buffer ViewEvents that arrive before `init()` runs. The clack shell's
 // CLAP timer (vxn-clap `on_timer`) starts pushing `param_changed` events
 // as soon as `set_parent` registers it — that's often before the inline
-// `init()` call below has populated the CONTROLS map and rebound this
+// `init()` call below has populated the CONTROLS map and rebound the
 // dispatcher. Without a buffer the first broadcast (which is the only
 // one for params that aren't being automated) is dropped on the floor
 // and `lastDisplay` on every fader stays empty until the user wiggles
@@ -813,6 +838,13 @@ window.vxn = {
   // Upper-side CLAP id into its Lower-side twin: Lower id = Upper id +
   // patchCount, for any id under 2 × patchCount.
   patchCount: __PATCH_COUNT__,
+};
+// Batched bridge entry point. `init()` replaces this with the real dispatcher
+// once CONTROLS is built; until then, every event in the batch is buffered.
+window.__vxn = {
+  applyViewEvents: function (arr) {
+    for (const ev of arr) _earlyViewEvents.push(ev);
+  },
 };
 
 // ─── Floating value popup (single shared instance) ─────────────────────────
@@ -836,6 +868,26 @@ const valuePop = (() => {
     },
     update(text) { el.textContent = text; },
     hide() { el.style.display = 'none'; },
+  };
+})();
+
+// ─── Status pill (0046) ────────────────────────────────────────────────────
+//
+// One shared <div> in the lower-right corner. `Status { line }` ViewEvents
+// flash it for ~2.4s then fade (CSS transition). Re-fired messages reset
+// the timer so a rapid burst stays readable.
+const statusPill = (() => {
+  const el = document.createElement('div');
+  el.className = 'status-pill';
+  document.body.appendChild(el);
+  let timer = null;
+  return {
+    flash(text) {
+      el.textContent = text;
+      el.classList.add('visible');
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => el.classList.remove('visible'), 2400);
+    },
   };
 })();
 
@@ -1844,10 +1896,13 @@ function init() {
   collectDimRuleSpecs();
   rebindAllForLayer(CURRENT_LAYER);
 
-  // Dispatch incoming ViewEvents from Rust. ParamChanged routes by id;
-  // EditLayerChanged triggers a full layered-cell rebind (0045);
-  // anything else logged for now (0042+ wires status, key-mode, preset
-  // events into their respective UI areas).
+  // Dispatch one ViewEvent from Rust. ParamChanged routes by id (with the
+  // partner-rate / free-run / filter-mode / generic-dim side effects pulled
+  // in from 0042–0044). EditLayerChanged triggers a full layered-cell
+  // rebind (0045). Status flashes the lower-right pill (0046). KeyModeChanged
+  // / PresetLoaded / PresetCorpusChanged are still pre-wiring — log when
+  // verbose tracing is on so the contract is visible without spamming the
+  // console during automation.
   const dispatch = function (ev) {
     if (ev.kind === 'param_changed') {
       // Cache last-seen value so the sync-flip / free-run-flip / layer-
@@ -1888,12 +1943,24 @@ function init() {
       rebindAllForLayer(layer);
       return;
     }
+    if (ev.kind === 'status') {
+      statusPill.flash(ev.line);
+      return;
+    }
+    // key_mode_changed / preset_loaded / preset_corpus_changed land here.
+    // E011 / 0049+ wire the Keys + preset browser areas; for now they are
+    // intentional no-ops so the bridge stays quiet under normal play.
     // Uncomment for verbose tracing during development:
     // console.log('vxn:view', ev);
+  };
+  // Batched bridge entry — Rust calls this once per controller tick.
+  const applyViewEvents = function (arr) {
+    for (const ev of arr) dispatch(ev);
   };
   // Replay any events buffered between bootstrap and init.
   for (const ev of _earlyViewEvents) dispatch(ev);
   _earlyViewEvents.length = 0;
+  window.__vxn.applyViewEvents = applyViewEvents;
   window.vxn.onViewEvent = dispatch;
 
   // Tell the controller we're ready — it re-broadcasts every param + key

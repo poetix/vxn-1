@@ -16,6 +16,8 @@
 //! 0047 flips it from vizia to this crate. Until then, the trait surface is
 //! the contract a future shell programs against.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 
 use raw_window_handle::{
@@ -34,21 +36,46 @@ use wry::dpi::{LogicalPosition, LogicalSize};
 pub const EDITOR_WIDTH: u32 = 1024;
 pub const EDITOR_HEIGHT: u32 = 772;
 
+/// Max bytes per `evaluate_script` payload. The JSON-array literal interpolated
+/// into the JS source is bounded here; under heavy automation (preset load
+/// touches every param) the batch is split across multiple calls so wry never
+/// sees a giant string. 100 KB is the ticket's "sane" cap.
+const MAX_BATCH_BYTES: usize = 100_000;
+
 /// Live editor. Dropping it tears down the WebView; on macOS wry removes the
 /// subview from the parent NSView as part of that.
 pub struct EditorHandle {
     webview: WebView,
+    /// Per-tick batch buffer. The clack shell's `on_timer` calls
+    /// [`Self::push_view_event`] once per event the controller produced this
+    /// tick, then [`Self::flush_view_events`] once at the end — one
+    /// `evaluate_script` per tick, not per event.
+    buf: RefCell<Vec<ViewEvent>>,
 }
 
 impl EditorHandle {
-    /// Push one [`ViewEvent`] into the page. For 0039 the page just logs
-    /// these; 0041+ will translate into DOM updates.
+    /// Buffer one [`ViewEvent`] for the current tick. Flushed by
+    /// [`Self::flush_view_events`]; nothing crosses into JS until then.
     pub fn push_view_event(&self, event: ViewEvent) {
-        let payload = view_event_to_json(&event);
-        let js = format!(
-            "if(window.vxn&&window.vxn.onViewEvent){{window.vxn.onViewEvent({payload})}}"
-        );
-        let _ = self.webview.evaluate_script(&js);
+        self.buf.borrow_mut().push(event);
+    }
+
+    /// Drain the batch into one `__vxn.applyViewEvents` call (or several, if
+    /// the JSON exceeds [`MAX_BATCH_BYTES`]). `ParamChanged` events dedupe by
+    /// id within the batch — only the latest value per param survives, which
+    /// caps the bridge at one update per param per tick regardless of how
+    /// many automation writes the audio thread did between ticks.
+    pub fn flush_view_events(&self) {
+        let events = std::mem::take(&mut *self.buf.borrow_mut());
+        if events.is_empty() {
+            return;
+        }
+        for chunk_json in batch_chunks(&events, MAX_BATCH_BYTES) {
+            let js = format!(
+                "if(window.__vxn&&window.__vxn.applyViewEvents){{window.__vxn.applyViewEvents({chunk_json})}}"
+            );
+            let _ = self.webview.evaluate_script(&js);
+        }
     }
 
     /// Marker for shape parity with vizia's `WindowHandle::close` — the
@@ -83,6 +110,10 @@ impl EditorBackend for WebEditor {
     fn push_view_event(handle: &Self::Handle, event: ViewEvent) {
         handle.push_view_event(event);
     }
+
+    fn flush_view_events(handle: &Self::Handle) {
+        handle.flush_view_events();
+    }
 }
 
 /// Build the WebView under `parent`, wire the IPC handler to `ctrl`, and load
@@ -104,7 +135,7 @@ pub fn open_editor(parent: *mut c_void, ctrl: ControllerHandle) -> EditorHandle 
         })
         .build()
         .expect("wry WebView build failed");
-    EditorHandle { webview }
+    EditorHandle { webview, buf: RefCell::new(Vec::new()) }
 }
 
 /// Splice the runtime param-descriptor JSON into the faceplate template. The
@@ -296,7 +327,59 @@ fn parse_key_mode(v: &serde_json::Value) -> Option<KeyMode> {
     Some(KeyMode::from_u8(v.as_u64()? as u8))
 }
 
-// ── ViewEvent → JSON ────────────────────────────────────────────────────────
+// ── ViewEvent → JSON batches ────────────────────────────────────────────────
+
+/// Dedupe `ParamChanged` events by id (latest value wins, preserves the
+/// position of the last occurrence relative to non-`ParamChanged` events).
+/// Other variants pass through unchanged. Bounded at `events.len()`; the
+/// hashmap is reused across calls is not worth it here — buffers are short.
+fn dedup_param_changes(events: &[ViewEvent]) -> Vec<&ViewEvent> {
+    let mut latest_for_id: HashMap<usize, usize> = HashMap::new();
+    for (i, ev) in events.iter().enumerate() {
+        if let ViewEvent::ParamChanged { id, .. } = ev {
+            latest_for_id.insert(id.raw(), i);
+        }
+    }
+    events
+        .iter()
+        .enumerate()
+        .filter(|(i, ev)| match ev {
+            ViewEvent::ParamChanged { id, .. } => latest_for_id.get(&id.raw()) == Some(i),
+            _ => true,
+        })
+        .map(|(_, ev)| ev)
+        .collect()
+}
+
+/// Build one or more JSON-array literals from a tick batch. Each chunk is a
+/// `[...]` string ≤ `max_bytes` (a single event larger than `max_bytes`
+/// still ships on its own — splitting inside a JSON object would corrupt
+/// the page).
+fn batch_chunks(events: &[ViewEvent], max_bytes: usize) -> Vec<String> {
+    let deduped = dedup_param_changes(events);
+    let mut chunks: Vec<String> = Vec::new();
+    let mut current = String::from("[");
+    let mut first_in_chunk = true;
+    for ev in deduped {
+        let s = view_event_to_json(ev);
+        let projected = current.len() + s.len() + if first_in_chunk { 1 } else { 2 };
+        if !first_in_chunk && projected > max_bytes {
+            current.push(']');
+            chunks.push(std::mem::replace(&mut current, String::from("[")));
+            first_in_chunk = true;
+        }
+        if !first_in_chunk {
+            current.push(',');
+        }
+        current.push_str(&s);
+        first_in_chunk = false;
+    }
+    current.push(']');
+    if current != "[]" {
+        chunks.push(current);
+    }
+    chunks
+}
 
 /// Serialize a [`ViewEvent`] to a JSON value the page can read. Mirror of
 /// [`parse_ui_event`]'s opcode shape: `{ "kind": "...", ...fields }`.
@@ -397,6 +480,88 @@ mod tests {
         assert!(parse_ui_event("not json").is_none());
         assert!(parse_ui_event(r#"{"op":"unknown"}"#).is_none());
         assert!(parse_ui_event(r#"{"op":"set_param_norm","id":42}"#).is_none());
+    }
+
+    fn param_changed(id: usize, plain: f32) -> ViewEvent {
+        ViewEvent::ParamChanged {
+            id: ParamId::new(id),
+            plain,
+            norm: plain,
+            display: format!("{plain}"),
+        }
+    }
+
+    #[test]
+    fn dedup_keeps_latest_param_per_id() {
+        // Three writes to id 1 in a tick → only the last one ships.
+        let events = vec![
+            param_changed(1, 0.1),
+            param_changed(2, 0.2),
+            param_changed(1, 0.3),
+            param_changed(1, 0.4),
+            ViewEvent::Status { line: "ok".into() },
+            param_changed(2, 0.5),
+        ];
+        let kept: Vec<f32> = dedup_param_changes(&events)
+            .into_iter()
+            .filter_map(|ev| match ev {
+                ViewEvent::ParamChanged { plain, .. } => Some(*plain),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kept, vec![0.4, 0.5]);
+        // Non-ParamChanged variants survive untouched.
+        let kinds: Vec<_> = dedup_param_changes(&events)
+            .into_iter()
+            .map(|ev| matches!(ev, ViewEvent::Status { .. }))
+            .collect();
+        assert!(kinds.iter().any(|x| *x), "Status must be kept");
+    }
+
+    #[test]
+    fn batch_chunks_single_under_cap() {
+        let events = vec![param_changed(1, 0.5), param_changed(2, 0.5)];
+        let chunks = batch_chunks(&events, 10_000);
+        assert_eq!(chunks.len(), 1, "should fit in one chunk");
+        let v: serde_json::Value = serde_json::from_str(&chunks[0]).unwrap();
+        let arr = v.as_array().expect("array");
+        assert_eq!(arr.len(), 2);
+        assert_eq!(arr[0]["kind"], "param_changed");
+    }
+
+    #[test]
+    fn batch_chunks_splits_above_cap() {
+        // 200 distinct ids — each event JSON is ~80 bytes, so a tight cap
+        // forces multiple chunks. Every chunk must parse as a JSON array,
+        // and concatenating their contents must equal the deduped input.
+        let events: Vec<ViewEvent> = (0..200).map(|i| param_changed(i, i as f32 * 0.01)).collect();
+        let chunks = batch_chunks(&events, 1_000);
+        assert!(chunks.len() > 1, "tight cap should split: got {}", chunks.len());
+        let mut total = 0;
+        for c in &chunks {
+            let v: serde_json::Value = serde_json::from_str(c).unwrap();
+            let arr = v.as_array().expect("array");
+            total += arr.len();
+            assert!(c.len() <= 1_000 + 200, "chunk size respects cap (slack: {})", c.len());
+        }
+        assert_eq!(total, 200, "all events present across chunks");
+    }
+
+    #[test]
+    fn batch_chunks_empty_yields_nothing() {
+        assert!(batch_chunks(&[], 10_000).is_empty());
+    }
+
+    #[test]
+    fn batch_chunks_dedup_applies_before_chunking() {
+        // Two writes to the same id collapse before chunking.
+        let events = vec![param_changed(1, 0.1), param_changed(1, 0.9)];
+        let chunks = batch_chunks(&events, 10_000);
+        assert_eq!(chunks.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&chunks[0]).unwrap();
+        let arr = v.as_array().expect("array");
+        assert_eq!(arr.len(), 1);
+        assert!((arr[0]["plain"].as_f64().unwrap() - 0.9).abs() < 1e-6);
     }
 
     #[test]
@@ -584,6 +749,28 @@ mod tests {
         assert!(PLACEHOLDER_HTML.contains("window.vxn"));
         assert!(PLACEHOLDER_HTML.contains("window.ipc.postMessage"));
         assert!(PLACEHOLDER_HTML.contains("onViewEvent"));
+    }
+
+    #[test]
+    fn faceplate_batched_bridge_wired() {
+        // 0046: Rust calls `window.__vxn.applyViewEvents(arr)` once per
+        // controller tick. Bootstrap installs a buffering stub; init() swaps
+        // in the real dispatcher.
+        assert!(PLACEHOLDER_HTML.contains("window.__vxn"));
+        assert!(PLACEHOLDER_HTML.contains("applyViewEvents"));
+        // Bootstrap stub still funnels into `_earlyViewEvents` so events
+        // that race the inline init() are not lost.
+        assert!(PLACEHOLDER_HTML.contains("_earlyViewEvents"));
+    }
+
+    #[test]
+    fn faceplate_status_pill_wired() {
+        // 0046: Status ViewEvent flashes a pill in the lower-right corner.
+        assert!(PLACEHOLDER_HTML.contains(".status-pill"));
+        assert!(PLACEHOLDER_HTML.contains(".status-pill.visible"));
+        assert!(PLACEHOLDER_HTML.contains("statusPill"));
+        assert!(PLACEHOLDER_HTML.contains("statusPill.flash"));
+        assert!(PLACEHOLDER_HTML.contains("ev.kind === 'status'"));
     }
 
     // ── Row 1 + Row 2 control mount points (0041, 0041a, 0042, 0043) ────

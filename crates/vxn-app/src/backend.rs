@@ -22,6 +22,14 @@ pub trait EditorBackend: 'static {
 
     /// Forward a `ViewEvent` into the backend's render context. Called from
     /// the controller's thread; the backend is responsible for marshalling
-    /// onto its own UI thread if needed.
+    /// onto its own UI thread if needed. Backends that batch (the WebView
+    /// IPC bridge, where each `evaluate_script` is a non-trivial JS context
+    /// crossing) should buffer here and flush via [`Self::flush_view_events`]
+    /// at the end of the host's tick.
     fn push_view_event(handle: &Self::Handle, event: ViewEvent);
+
+    /// Flush any events buffered by [`Self::push_view_event`]. Called once
+    /// per host tick after every push. Default is a no-op — backends that
+    /// dispatch synchronously (Vizia's on_idle) ignore it.
+    fn flush_view_events(_handle: &Self::Handle) {}
 }
