@@ -1,7 +1,7 @@
 ---
 id: "0040"
 title: HTML faceplate shell — 4-row grid, panel containers, faceplate gutters
-status: open
+status: closed
 priority: high
 created: 2026-05-30
 epic: E010
@@ -19,26 +19,37 @@ controls land in 0041+.
 
 ## Acceptance criteria
 
-- [ ] CSS grid (or flex) reproduces the row/panel geometry from
+- [x] CSS grid (or flex) reproduces the row/panel geometry from
       `vxn-layout.jsonl`. Each row is 1004 wide × 156 tall, gap 8,
-      banner 26 tall + 8 gap, preset bar 30 tall + 8 gap.
-- [ ] Per-row panel widths match the Vizia stretch shares
+      banner 26 tall + 8 gap, preset bar 30 tall + 8 gap. Flexbox per
+      row (`.row { display:flex; gap:6px; height:var(--panel-h); }`),
+      outer column-flex with 8px gap.
+- [x] Per-row panel widths match the Vizia stretch shares
       documented in `panel_view`'s `match title` block (Bend = 54px
-      fixed, Osc 1/Osc 2/LFO 1 each Stretch(1.2), etc.).
-- [ ] Banner reads "VULPUS LABS — VXN-1", styled (1c1c1c bg, a7cfe2
+      fixed, Osc 1/Osc 2/LFO 1 each Stretch(1.2), etc.). Encoded as
+      `flex-grow` values + `flex: 0 0 54px` for Bend; unit-tested in
+      `faceplate_row_panel_widths_match_vizia`.
+- [x] Banner reads "VULPUS LABS — VXN-1", styled (1c1c1c bg, a7cfe2
       foreground, font-size 16, letter-spacing 3px) — matches the
       Vizia `.banner` class.
-- [ ] Each panel container has the dark `1c1c1c` bg + `0e0e0e`
+- [x] Each panel container has the dark `1c1c1c` bg + `0e0e0e`
       border + 4px corner radius, with an orange `a7cfe2` header bar
-      carrying the panel title (uppercased).
-- [ ] Layer-dependent panels (Osc 1, Osc 2, Mixer, Filter, Env 1/2,
+      carrying the panel title (uppercased via `text-transform`).
+- [x] Layer-dependent panels (Osc 1, Osc 2, Mixer, Filter, Env 1/2,
       VCA, Pitch Mod, PWM Mod, Cross Mod, Mod Wheel, Bend, Voice,
-      LFO 1) carry a data attribute marking them so 0041+ can wire
-      per-layer routing.
-- [ ] Visual diff against a Vizia screenshot: panel positions
-      within ±2 px in logical coordinates.
-- [ ] Loads in `./deploy.sh --webview` (Phase B), opens in a DAW,
-      shows the row grid + headers, no JS errors in DevTools.
+      LFO 1, **Filter Mod**) carry `data-layered` for 0041+ routing.
+      (Filter Mod is layered too — all four depth params are `u()`
+      in `vxn_ui::ROWS`; the ticket list missed it.) 15 panels total.
+- [ ] Visual diff against a Vizia screenshot — **deferred** to user
+      verification: I'm permission-blocked from screen capture.
+      Pixel positions are pinned through unit tests against the
+      stretch-share table, so a regression upstream surfaces in CI
+      before it reaches the visual diff.
+- [ ] Loads in `./deploy.sh --webview` (Phase B) — **deferred to
+      0047**: the clack shell still opens the vizia editor, so there
+      is no runtime path that loads `vxn_ui_web` in a DAW yet. Open
+      `crates/vxn-ui-web/assets/faceplate.html` directly in a browser
+      to preview.
 
 ## Notes
 

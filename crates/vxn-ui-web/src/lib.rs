@@ -257,37 +257,13 @@ fn preset_source_json(src: Option<&PresetSource>) -> serde_json::Value {
     }
 }
 
-// ── Placeholder page ────────────────────────────────────────────────────────
+// ── Faceplate page ──────────────────────────────────────────────────────────
 
-const PLACEHOLDER_HTML: &str = r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<title>VXN1</title>
-<style>
-  html, body { margin: 0; height: 100%; background: #1a1a1a; color: #ddd;
-    font-family: -apple-system, system-ui, sans-serif; }
-  #root { display: flex; align-items: center; justify-content: center;
-    height: 100%; font-size: 28px; letter-spacing: 0.15em; }
-</style>
-</head>
-<body>
-<div id="root">VULPUS LABS - VXN-1</div>
-<script>
-  // Bridge object: pages call window.vxn.send({op:'...',...}) to post a
-  // UiEvent at the controller; Rust pushes ViewEvents back by calling
-  // window.vxn.onViewEvent(ev).
-  window.vxn = {
-    send: function (msg) {
-      try { window.ipc.postMessage(JSON.stringify(msg)); }
-      catch (e) { console.warn('vxn.send failed', e); }
-    },
-    onViewEvent: function (ev) { console.log('vxn:view', ev); },
-  };
-</script>
-</body>
-</html>
-"#;
+/// Static HTML/CSS faceplate scaffold (0040). Four-row panel grid with empty
+/// bodies; 0041+ populates each panel with controls. Inline `<style>` block
+/// keeps the page openable in a browser for visual previewing without the
+/// wry runtime.
+const PLACEHOLDER_HTML: &str = include_str!("../assets/faceplate.html");
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -372,5 +348,153 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["kind"], "preset_corpus_changed");
         assert_eq!(v["follow"], "/tmp/x.preset");
+    }
+
+    // ── Faceplate structural checks (0040) ─────────────────────────────────
+    //
+    // Substring-only — pulling an HTML parser in just to assert presence
+    // would be overkill. The asserts here catch silent regressions (a row
+    // dropped, a panel renamed, a data attr lost) without pinning markup.
+
+    fn count(needle: &str) -> usize {
+        PLACEHOLDER_HTML.matches(needle).count()
+    }
+
+    #[test]
+    fn faceplate_has_banner_and_preset_bar_slot() {
+        assert!(PLACEHOLDER_HTML.contains(r#"class="banner""#));
+        assert!(PLACEHOLDER_HTML.contains("VULPUS LABS"));
+        assert!(PLACEHOLDER_HTML.contains("VXN-1"));
+        assert!(PLACEHOLDER_HTML.contains(r#"class="preset-bar-slot""#));
+    }
+
+    #[test]
+    fn faceplate_has_four_rows() {
+        for r in 1..=4 {
+            assert!(
+                PLACEHOLDER_HTML.contains(&format!(r#"data-row="{r}""#)),
+                "missing data-row=\"{r}\"",
+            );
+        }
+        // Five panels per row × 4 rows = 20 panels total. Catches an
+        // accidental row collapse or duplicate emit.
+        assert_eq!(count(r#"class="panel""#), 20, "panel count drift");
+    }
+
+    #[test]
+    fn faceplate_panel_names_match_rows() {
+        // Same titles as `vxn_ui::ROWS`; reordering or rename would have to
+        // happen here in lockstep.
+        let expected: &[&[&str]] = &[
+            &["LFO 1", "LFO 2", "Osc 1", "Osc 2", "Mixer"],
+            &["Env 1", "Env 2", "VCA", "Filter", "Filter Mod"],
+            &["Pitch Mod", "PWM Mod", "Cross Mod", "Mod Wheel", "Bend"],
+            &["Keys", "Voice", "Chorus", "Delay", "Master"],
+        ];
+        for row in expected {
+            for name in *row {
+                assert!(
+                    PLACEHOLDER_HTML.contains(&format!(r#"data-name="{name}""#)),
+                    "missing panel {name}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn faceplate_layered_panels_match_vxn_ui() {
+        // Layered = panel has at least one per-patch (Upper/Lower) entry in
+        // `vxn_ui::ROWS`. Mirror that list here so we notice if a panel's
+        // entry mix changes upstream.
+        let layered = [
+            "LFO 1", "Osc 1", "Osc 2", "Mixer", "Env 1", "Env 2", "VCA",
+            "Filter", "Filter Mod", "Pitch Mod", "PWM Mod", "Cross Mod",
+            "Mod Wheel", "Bend", "Voice",
+        ];
+        for name in layered {
+            let marker = format!(r#"data-name="{name}" data-layered"#);
+            assert!(
+                PLACEHOLDER_HTML.contains(&marker),
+                "panel {name} missing data-layered",
+            );
+        }
+        // Count attribute occurrences only — `data-layered>` skips the CSS
+        // `[data-layered]` selector hit.
+        assert_eq!(
+            count("data-layered>"),
+            layered.len(),
+            "extra/missing data-layered panel",
+        );
+    }
+
+    #[test]
+    fn faceplate_reserves_chorus_delay_header_toggle() {
+        // Header switch lives on Chorus + Delay only (`vxn_ui::panel_view`,
+        // `header_switch` matcher). Reserve the slot now; widget arrives in
+        // 0045.
+        for name in ["Chorus", "Delay"] {
+            assert!(
+                PLACEHOLDER_HTML
+                    .contains(&format!(r#"data-name="{name}" data-header-toggle"#)),
+                "{name} missing data-header-toggle",
+            );
+        }
+        // `data-header-toggle>` matches the panel-div attribute only;
+        // CSS `[data-header-toggle]` selectors don't have the closing `>`.
+        assert_eq!(
+            count("data-header-toggle>"),
+            2,
+            "header-toggle expected on Chorus + Delay only",
+        );
+    }
+
+    #[test]
+    fn faceplate_css_vars_match_vxn_ui_constants() {
+        // Pixel literals live in CSS vars (ticket: "a future resize policy
+        // should be one variable change"). Sanity check the load-bearing
+        // ones against `vxn_ui` constants.
+        assert!(PLACEHOLDER_HTML.contains("--panel-h: 156px"));
+        assert!(PLACEHOLDER_HTML.contains("--col-h: 120px"));
+        assert!(PLACEHOLDER_HTML.contains("--fader-h: 74px"));
+        assert!(PLACEHOLDER_HTML.contains("--dial: 62px"));
+        assert!(PLACEHOLDER_HTML.contains("--banner-h: 26px"));
+        assert!(PLACEHOLDER_HTML.contains("--preset-bar-h: 30px"));
+        assert!(PLACEHOLDER_HTML.contains("--pad-outer: 10px"));
+    }
+
+    #[test]
+    fn faceplate_row_panel_widths_match_vizia() {
+        // Stretch shares from `vxn_ui::panel_view`'s `match title` block. If
+        // upstream tweaks a share, this fails — keeping the HTML pinned to
+        // the vizia layout the user already approved.
+        for (sel, share) in [
+            ("LFO 1", "1.2"),
+            ("LFO 2", "0.7"),
+            ("Osc 1", "1.2"),
+            ("Osc 2", "1.2"),
+            ("Mixer", "1.1"),
+            ("Env 1", "0.8"),
+            ("Env 2", "0.8"),
+            ("VCA", "0.75"),
+            ("Filter", "1.15"),
+            ("Filter Mod", "1.0"),
+        ] {
+            assert!(
+                PLACEHOLDER_HTML
+                    .contains(&format!(r#".panel[data-name="{sel}"]"#))
+                    && PLACEHOLDER_HTML.contains(&format!("flex-grow: {share}")),
+                "share for {sel} ≠ {share}",
+            );
+        }
+        // Bend is the only fixed-width panel.
+        assert!(PLACEHOLDER_HTML.contains("flex: 0 0 54px"));
+    }
+
+    #[test]
+    fn faceplate_bridge_object_intact() {
+        // Bridge from 0039 still present — 0040 only adds layout.
+        assert!(PLACEHOLDER_HTML.contains("window.vxn"));
+        assert!(PLACEHOLDER_HTML.contains("window.ipc.postMessage"));
+        assert!(PLACEHOLDER_HTML.contains("onViewEvent"));
     }
 }

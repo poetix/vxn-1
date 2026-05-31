@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>VXN1</title>
+<style>
+/* Faceplate scaffold (0040). Mirrors the vizia editor's geometry from
+   `target/vxn-layout.jsonl`: 1024×772 logical, 10px outer padding, 8px
+   vertical gap between banner / preset-bar / 4×156 rows, 6px horizontal
+   gap between panels in a row. CSS vars are named after the vxn-ui Rust
+   constants so the mapping stays obvious; pixel literals stay out of
+   selectors so a future resize policy is one variable change. */
+:root {
+  /* Palette (matches vxn-ui's STYLE block). */
+  --face-bg: #2b2b2b;
+  --panel-bg: #1c1c1c;
+  --panel-border: #0e0e0e;
+  --panel-corner: 4px;
+  --header-bg: #a7cfe2;
+  --header-fg: #141414;
+  --banner-fg: #a7cfe2;
+  --text: #d6d6d6;
+
+  /* Geometry (matches vxn-ui's PANEL_H / FADER_H / COL_H / DIAL plus
+     row + chrome heights derived from `target/vxn-layout.jsonl`). */
+  --editor-w: 1024px;
+  --pad-outer: 10px;
+  --banner-h: 26px;
+  --preset-bar-h: 30px;
+  --panel-h: 156px;          /* PANEL_H */
+  --col-h: 120px;            /* COL_H — per-control column inside a panel */
+  --fader-h: 74px;           /* FADER_H — fader travel */
+  --dial: 62px;              /* DIAL — selector-knob box */
+  --panel-pad: 5px;
+  --panel-vgap: 4px;
+  --row-vgap: 8px;
+  --row-hgap: 6px;
+  --header-h: 16px;
+  --header-toggle-slot: 16px; /* reserves the Chorus/Delay header switch (0045) */
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--face-bg);
+  color: var(--text);
+  font-family: "IBM Plex Sans Condensed", -apple-system, system-ui, sans-serif;
+  /* Disable text selection across the faceplate — knobs / faders behave more
+     like physical controls than text. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.faceplate {
+  width: var(--editor-w);
+  box-sizing: border-box;
+  padding: var(--pad-outer);
+  display: flex;
+  flex-direction: column;
+  gap: var(--row-vgap);
+}
+
+.banner {
+  height: var(--banner-h);
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--panel-corner);
+  color: var(--banner-fg);
+  font-size: 16px;
+  letter-spacing: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Vizia uses an em-dash via the .banner class on a Label; keep parity. */
+}
+
+/* Empty slot. The vizia editor's preset bar overlays this during the
+   E010 → E011 transition (0049 replaces it with the HTML preset bar). */
+.preset-bar-slot {
+  height: var(--preset-bar-h);
+  background: transparent;
+}
+
+.row {
+  display: flex;
+  gap: var(--row-hgap);
+  height: var(--panel-h);
+}
+
+.panel {
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--panel-corner);
+  padding: var(--panel-pad);
+  display: flex;
+  flex-direction: column;
+  gap: var(--panel-vgap);
+  min-width: 0; /* let flex shrink override intrinsic content width */
+  flex: 1 1 0;  /* default: equal share */
+  box-sizing: border-box;
+}
+
+/* Layered panels switch their per-patch controls between Upper / Lower at
+   the edit-layer toggle (0041+ wires it). Marked here so the JS panel
+   modules can find them by attribute. */
+.panel[data-layered] {}
+
+/* Per-row stretch shares — pulled from `panel_view`'s `match title` block
+   in `crates/vxn-ui/src/lib.rs:2791`. flex-basis is 0 so `flex-grow`
+   gives a pure ratio. Bend is the only fixed-width panel. */
+.row-1 .panel[data-name="LFO 1"]  { flex-grow: 1.2; }
+.row-1 .panel[data-name="LFO 2"]  { flex-grow: 0.7; }
+.row-1 .panel[data-name="Osc 1"]  { flex-grow: 1.2; }
+.row-1 .panel[data-name="Osc 2"]  { flex-grow: 1.2; }
+.row-1 .panel[data-name="Mixer"]  { flex-grow: 1.1; }
+
+.row-2 .panel[data-name="Env 1"]      { flex-grow: 0.8; }
+.row-2 .panel[data-name="Env 2"]      { flex-grow: 0.8; }
+.row-2 .panel[data-name="VCA"]        { flex-grow: 0.75; }
+.row-2 .panel[data-name="Filter"]     { flex-grow: 1.15; }
+.row-2 .panel[data-name="Filter Mod"] { flex-grow: 1.0; }
+
+/* Row 3: four equal stretchers + a fixed-width Bend. */
+.row-3 .panel[data-name="Bend"] {
+  flex: 0 0 54px;
+}
+
+/* Row 4 is all-equal (Keys, Voice, Chorus, Delay, Master). Default share. */
+
+.panel-header {
+  height: var(--header-h);
+  background: var(--header-bg);
+  color: var(--header-fg);
+  border-radius: 2px;
+  font-size: 10px;
+  letter-spacing: 1px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-transform: uppercase;
+  /* `text-transform` mirrors vxn-ui's `up()` helper — source strings stay
+     mixed-case for matching / readability. */
+}
+
+/* Chorus / Delay lift their On bool into the header (0045 wires the
+   widget). Reserve the slot now so the grid doesn't shift later. */
+.panel[data-header-toggle] .panel-header {
+  justify-content: flex-start;
+  padding-left: 3px;
+  gap: 4px;
+}
+.panel[data-header-toggle] .panel-header-toggle-slot {
+  width: var(--header-toggle-slot);
+  height: var(--header-toggle-slot);
+  flex: 0 0 var(--header-toggle-slot);
+}
+.panel[data-header-toggle] .panel-header-title {
+  flex: 1 1 auto;
+  text-align: center;
+  /* Pull title back to optical center despite the leading toggle slot. */
+  margin-right: var(--header-toggle-slot);
+}
+
+.panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  /* 0041+ populates with per-control columns (faders, dials, switches). */
+}
+</style>
+</head>
+<body>
+<div class="faceplate" id="faceplate">
+
+  <div class="banner">VULPUS LABS &mdash; VXN-1</div>
+
+  <div class="preset-bar-slot" id="preset-bar-slot" aria-hidden="true"></div>
+
+  <!-- Row 1 — LFOs, oscillators, mixer. -->
+  <div class="row row-1" data-row="1">
+    <div class="panel" data-name="LFO 1" data-layered>
+      <div class="panel-header">LFO 1</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="LFO 2">
+      <div class="panel-header">LFO 2</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="Osc 1" data-layered>
+      <div class="panel-header">OSC 1</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="Osc 2" data-layered>
+      <div class="panel-header">OSC 2</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="Mixer" data-layered>
+      <div class="panel-header">MIXER</div>
+      <div class="panel-body"></div>
+    </div>
+  </div>
+
+  <!-- Row 2 — envelopes, filter, filter mod. -->
+  <div class="row row-2" data-row="2">
+    <div class="panel" data-name="Env 1" data-layered>
+      <div class="panel-header">ENV 1</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="Env 2" data-layered>
+      <div class="panel-header">ENV 2</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="VCA" data-layered>
+      <div class="panel-header">VCA</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="Filter" data-layered>
+      <div class="panel-header">FILTER</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="Filter Mod" data-layered>
+      <div class="panel-header">FILTER MOD</div>
+      <div class="panel-body"></div>
+    </div>
+  </div>
+
+  <!-- Row 3 — per-osc mod routes + performance wheels (Bend is fixed-width). -->
+  <div class="row row-3" data-row="3">
+    <div class="panel" data-name="Pitch Mod" data-layered>
+      <div class="panel-header">PITCH MOD</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="PWM Mod" data-layered>
+      <div class="panel-header">PWM MOD</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="Cross Mod" data-layered>
+      <div class="panel-header">CROSS MOD</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="Mod Wheel" data-layered>
+      <div class="panel-header">MOD WHEEL</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="Bend" data-layered>
+      <div class="panel-header">BEND</div>
+      <div class="panel-body"></div>
+    </div>
+  </div>
+
+  <!-- Row 4 — keys, voice, the two effects, master. Equal-width. -->
+  <div class="row row-4" data-row="4">
+    <div class="panel" data-name="Keys">
+      <div class="panel-header">KEYS</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="Voice" data-layered>
+      <div class="panel-header">VOICE</div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="Chorus" data-header-toggle>
+      <div class="panel-header">
+        <div class="panel-header-toggle-slot" aria-hidden="true"></div>
+        <div class="panel-header-title">CHORUS</div>
+      </div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="Delay" data-header-toggle>
+      <div class="panel-header">
+        <div class="panel-header-toggle-slot" aria-hidden="true"></div>
+        <div class="panel-header-title">DELAY</div>
+      </div>
+      <div class="panel-body"></div>
+    </div>
+    <div class="panel" data-name="Master">
+      <div class="panel-header">MASTER</div>
+      <div class="panel-body"></div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+  // Bridge object: pages call window.vxn.send({op:'...',...}) to post a
+  // UiEvent at the controller; Rust pushes ViewEvents back by calling
+  // window.vxn.onViewEvent(ev). For 0040 the page is structure-only — 0041+
+  // attaches per-panel handlers.
+  window.vxn = {
+    send: function (msg) {
+      try { window.ipc.postMessage(JSON.stringify(msg)); }
+      catch (e) { console.warn('vxn.send failed', e); }
+    },
+    onViewEvent: function (ev) { console.log('vxn:view', ev); },
+  };
+</script>
+</body>
+</html>
