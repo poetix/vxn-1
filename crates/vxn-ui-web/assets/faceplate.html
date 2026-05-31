@@ -162,6 +162,9 @@ html, body {
   width: var(--header-toggle-slot);
   height: var(--header-toggle-slot);
   flex: 0 0 var(--header-toggle-slot);
+  display: flex;
+  align-items: center;
+  justify-content: center;
 }
 .panel[data-header-toggle] .panel-header-title {
   flex: 1 1 auto;
@@ -407,13 +410,15 @@ html, body {
   height: auto;
 }
 
-/* Header-switch slot (Chorus / Delay, 0045) — a small toggle box mounted
-   inside `.panel-header-toggle-slot`. Matches `.ctl-tg-box`'s palette but
-   sits on the orange header bar, so the inactive fill borrows the header
-   tint slightly to read as part of the header chrome. */
+/* Header-switch box (Chorus / Delay, 0045) — a small toggle child of
+   `.panel-header-toggle-slot`. Sized to sit *inside* the 16 px header
+   bar, not fill it, so the box reads as a control on the header rather
+   than the header's whole left edge. Palette matches `.ctl-tg-box` but
+   the inactive border picks up a header-tinted shade so it reads as
+   part of the header chrome. */
 .panel-header-switch {
-  width: 11px;
-  height: 11px;
+  width: 10px;
+  height: 10px;
   background: #4a4a4a;
   border: 1px solid #2c4a59;
   border-radius: 2px;
@@ -1347,21 +1352,24 @@ function makeDropdown(el, id, desc) {
 
 // ─── Header switch (Chorus / Delay, 0045) ──────────────────────────────────
 //
-// A single toggle box mounted into a panel header's `.panel-header-toggle-slot`.
-// Same wire shape as a plain bool `Switch` — gesture-bracketed `set_param`
-// on click; update() flips the `.active` class on echo.
+// A small toggle box centred inside a panel header's
+// `.panel-header-toggle-slot`. Same wire shape as a plain bool `Switch` —
+// gesture-bracketed `set_param` on click; update() flips the `.active`
+// class on echo. The box is a child of the slot rather than the slot
+// itself so the 16 px slot keeps its layout reservation while the visible
+// box stays small enough to sit inside the header bar.
 function makeHeaderSwitch(el, id, _desc) {
-  el.classList.add('panel-header-switch');
-  el.innerHTML = '';
+  el.innerHTML = '<div class="panel-header-switch"></div>';
+  const box = el.querySelector('.panel-header-switch');
   el.addEventListener('pointerdown', (ev) => {
     ev.preventDefault();
-    const on = el.classList.contains('active') ? 0 : 1;
+    const on = box.classList.contains('active') ? 0 : 1;
     window.vxn.send({ op: 'begin_gesture', id });
     window.vxn.send({ op: 'set_param', id, plain: on });
     window.vxn.send({ op: 'end_gesture', id });
   });
   return {
-    update(plain) { el.classList.toggle('active', plain >= 0.5); },
+    update(plain) { box.classList.toggle('active', plain >= 0.5); },
   };
 }
 
