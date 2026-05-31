@@ -879,6 +879,9 @@ mod tests {
             ("pitch_env_depth",      "pitch_env_src"),
             ("pwm_lfo_depth",        "pwm_lfo_src"),
             ("pwm_env_depth",        "pwm_env_src"),
+            // VCA's Amp LFO Depth follows the same rule (Off / LFO 1 /
+            // LFO 2 source → fader dims on Off).
+            ("amp_lfo_depth",        "amp_lfo_src"),
         ] {
             assert!(
                 PLACEHOLDER_HTML.contains(&format!(
