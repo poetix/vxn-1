@@ -719,6 +719,30 @@ mod tests {
     }
 
     #[test]
+    fn filter_mode_notch_dims_slope_strip() {
+        // 0043: Filter Mode = Notch dims the Slope strip cell (DSP no-op,
+        // see vxn-dsp/src/ota_ladder.rs). Test guards the wiring rather
+        // than the runtime toggle:
+        //   - CSS targets both `.ctl.dimmed` and `.ctl-strip.dimmed` (slope
+        //     lives in the strip).
+        //   - JS resolves `filter_mode` + `filter_slope` and looks up the
+        //     Notch variant by label (so a `FILTER_MODE_LABELS` reorder
+        //     doesn't desync).
+        //   - The dispatch branch keys on `FILTER_MODE_ID`.
+        // Asserting on PLACEHOLDER_HTML keeps the test substring-based —
+        // the existing Free-run dim has the same shape.
+        assert!(
+            PLACEHOLDER_HTML.contains(".ctl-strip.dimmed"),
+            "missing strip dim selector (slope dim relies on it)",
+        );
+        assert!(PLACEHOLDER_HTML.contains("locateSlopeDimCells"));
+        assert!(PLACEHOLDER_HTML.contains("FILTER_MODE_ID = paramIdByName('filter_mode')"));
+        assert!(PLACEHOLDER_HTML.contains("variants.indexOf('Notch')"));
+        assert!(PLACEHOLDER_HTML.contains("data-param=\"filter_slope\""));
+        assert!(PLACEHOLDER_HTML.contains("ev.id === FILTER_MODE_ID"));
+    }
+
+    #[test]
     fn faceplate_has_subdivisions_json_placeholder() {
         // SUBDIVISIONS table is spliced as a JSON array of labels; the LFO
         // rate fader's displayOverride indexes it when sync is on (0042).

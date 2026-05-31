@@ -367,10 +367,13 @@ html, body {
 .ctl-dropdown select:focus { outline: 1px solid var(--ctl-value); }
 
 /* Dimmed — applied to control cells whose param is gated by a sibling
-   (LFO 1's Delay/Fade dim while Free is on; mirrors vizia's `.dimmed`
-   class). Visual-only: pointer events still pass through so DAW
-   automation echoes still move the thumb. */
-.ctl.dimmed { opacity: 0.4; }
+   (LFO 1's Delay/Fade dim while Free is on; Filter Slope dims when the
+   mode is Notch, where the DSP's `FilterMode::mix` ignores slope, see
+   vxn-dsp/src/ota_ladder.rs). Visual-only: pointer events still pass
+   through so DAW automation echoes still move the thumb. Same selector
+   covers both panel-body (`.ctl`) and panel-strip (`.ctl-strip`)
+   mounts. */
+.ctl.dimmed, .ctl-strip.dimmed { opacity: 0.4; }
 </style>
 </head>
 <body>
@@ -699,6 +702,16 @@ const RATE_OF_SYNC = new Map();  // syncId -> rateId
 // machine"). Looked up once in `init()`.
 let FREE_RUN_ID = null;
 const FREE_DIMMED_CELLS = [];  // [{ id, el }]
+
+// `filter_mode` ↔ Slope dim (0043). The DSP's `FilterMode::mix` ignores
+// `FilterSlope` when the mode is Notch (the 2-pole notch is structurally
+// the cleanest null the ladder can form — see vxn-dsp/src/ota_ladder.rs),
+// so the strip switch dims in that mode to signal it's a no-op. The Notch
+// variant index is resolved at init from the descriptor's `variants`
+// array so a label reorder in `FILTER_MODE_LABELS` doesn't desync.
+let FILTER_MODE_ID = null;
+let FILTER_NOTCH_INDEX = -1;
+const SLOPE_DIMMED_CELLS = [];  // [el]
 
 // One detent = one variant step. The drag sensitivity: pixels of vertical
 // pointer travel per detent. ~30 feels close to hardware knobs.
@@ -1148,6 +1161,19 @@ function locateFreeRunCells() {
   }
 }
 
+// Resolve the Filter Mode param + the Notch variant's plain index, plus
+// the Slope cell that dims with it (0043). `variants` ships in the
+// descriptor JSON, so a `FILTER_MODE_LABELS` reorder doesn't break this.
+function locateSlopeDimCells() {
+  FILTER_MODE_ID = paramIdByName('filter_mode');
+  if (FILTER_MODE_ID != null) {
+    const variants = window.vxn.params[FILTER_MODE_ID].variants || [];
+    FILTER_NOTCH_INDEX = variants.indexOf('Notch');
+  }
+  const slope = document.querySelector('[data-param="filter_slope"]');
+  if (slope) SLOPE_DIMMED_CELLS.push(slope);
+}
+
 // Pair LFO rate faders with their sync-toggle partners (E004 / 0015).
 // Mirrors `vxn_ui_vizia::sync_partner`. Currently only the LFO rates use
 // this; the Delay panel will join when 0045 wires `delay_time/delay_sync`.
@@ -1181,6 +1207,7 @@ function rateDisplayOverride(id) {
 function init() {
   locateSyncPartners();
   locateFreeRunCells();
+  locateSlopeDimCells();
 
   // Walk every mount point and instantiate the right primitive. Selector
   // covers both `.ctl` (vertical column inside `.panel-body`) and
@@ -1247,6 +1274,11 @@ function init() {
       if (ev.id === FREE_RUN_ID) {
         const on = ev.plain >= 0.5;
         for (const c of FREE_DIMMED_CELLS) c.el.classList.toggle('dimmed', on);
+      }
+      // Filter Mode = Notch → slope is a no-op (DSP), so dim the strip.
+      if (ev.id === FILTER_MODE_ID && FILTER_NOTCH_INDEX >= 0) {
+        const dim = Math.round(ev.plain) === FILTER_NOTCH_INDEX;
+        for (const el of SLOPE_DIMMED_CELLS) el.classList.toggle('dimmed', dim);
       }
       return;
     }
