@@ -55,6 +55,10 @@ pub struct Controller<M: ParamModel> {
     model: Arc<M>,
     presets: Box<dyn PresetStore>,
     corpus: CorpusHandle,
+    /// Last successfully loaded preset's source. Anchors the prev/next
+    /// walker (0049): `UiEvent::StepPreset` resolves this against the
+    /// combined ordered list and advances by `delta`.
+    current_source: Option<PresetSource>,
     ui_tx: SyncSender<UiEvent>,
     ui_rx: Receiver<UiEvent>,
     host_tx: SyncSender<HostEvent>,
@@ -86,6 +90,7 @@ impl<M: ParamModel> Controller<M> {
             model,
             presets,
             corpus: corpus.clone(),
+            current_source: None,
             ui_tx,
             ui_rx,
             host_tx,
@@ -162,6 +167,9 @@ impl<M: ParamModel> Controller<M> {
             }
             UiEvent::LoadPreset { source } => {
                 self.load_preset(source);
+            }
+            UiEvent::StepPreset { delta } => {
+                self.step_preset(delta);
             }
             UiEvent::SavePreset { name, folder } => {
                 self.save_preset(name, folder);
@@ -245,6 +253,16 @@ impl<M: ParamModel> Controller<M> {
                 // widget (HTML faceplate) can rebind per-patch panels.
                 self.send(ViewEvent::EditLayerChanged { layer });
             }
+            UiEvent::RequestTextInput { id, title, initial } => {
+                // Pure relay — controller doesn't peek at the value.
+                // Backend (vxn-ui-web on macOS) intercepts the matching
+                // ViewEvent in push_view_event and opens an NSWindow.
+                self.send(ViewEvent::OpenTextInput { id, title, initial });
+            }
+            UiEvent::TextInputResult { id, value } => {
+                // Forward to the page so its pending JS callback fires.
+                self.send(ViewEvent::TextInputResult { id, value });
+            }
             UiEvent::EditorReady => {
                 // Editor has just finished its inline init and is now
                 // listening on `onViewEvent`. Push the full param table +
@@ -254,6 +272,13 @@ impl<M: ParamModel> Controller<M> {
                 // into a known-ready listener.
                 self.broadcast_all_params();
                 self.send(ViewEvent::KeyModeChanged { mode: self.model.key_mode() });
+                // 0050 race fix: the webview backend's first corpus push
+                // can land before the page's bootstrap script has
+                // installed `__vxn.applyPresetCorpus`. The webview's
+                // flush_view_events keys its retry off
+                // PresetCorpusChanged, so emit a benign one here to
+                // force a corpus re-push after the page reports ready.
+                self.send(ViewEvent::PresetCorpusChanged { follow: None });
             }
         }
     }
@@ -301,6 +326,7 @@ impl<M: ParamModel> Controller<M> {
                     self.send_status(format!("preset apply failed: {e}"));
                     return;
                 }
+                self.current_source = Some(source.clone());
                 self.send(ViewEvent::PresetLoaded {
                     meta: load.meta,
                     source: Some(source),
@@ -311,6 +337,59 @@ impl<M: ParamModel> Controller<M> {
             }
             Err(e) => self.send_status(format!("preset load failed: {e}")),
         }
+    }
+
+    /// Walk the combined Factory + User preset list by `delta` and load the
+    /// resulting entry (0049 prev/next). Order: factory entries first
+    /// (alpha-by-name), then user entries (alpha-by-name across folders);
+    /// wraps at either end. With no prior preset, `delta >= 0` seeds at
+    /// the first entry, `delta < 0` at the last — matches the vizia
+    /// editor's `step_index` semantics so the walker behaves the same
+    /// across backends.
+    fn step_preset(&mut self, delta: i32) {
+        let list = self.combined_preset_list();
+        if list.is_empty() {
+            return;
+        }
+        let cur_idx = self
+            .current_source
+            .as_ref()
+            .and_then(|c| list.iter().position(|s| s == c));
+        let len = list.len() as i32;
+        let next = match cur_idx {
+            Some(i) => (i as i32 + delta).rem_euclid(len) as usize,
+            None if delta >= 0 => 0,
+            None => (len - 1) as usize,
+        };
+        let source = list[next].clone();
+        self.load_preset(source);
+    }
+
+    /// Combined factory + user preset list in walker order (0049).
+    /// Factory entries first (alpha-by-name); then user entries across all
+    /// folders (alpha-by-name). Built from the same corpus the browser
+    /// reads so prev/next and the browser stay coherent.
+    fn combined_preset_list(&self) -> Vec<PresetSource> {
+        let corpus = match self.corpus.lock() {
+            Ok(c) => c,
+            Err(_) => return Vec::new(),
+        };
+        let mut factory: Vec<(usize, &PresetMeta)> = corpus.factory.iter().enumerate().collect();
+        factory.sort_by(|a, b| a.1.name.to_lowercase().cmp(&b.1.name.to_lowercase()));
+        let mut user: Vec<&crate::preset::UserPresetEntry> = corpus
+            .user
+            .iter()
+            .flat_map(|f| f.presets.iter())
+            .collect();
+        user.sort_by(|a, b| a.meta.name.to_lowercase().cmp(&b.meta.name.to_lowercase()));
+        let mut out: Vec<PresetSource> = Vec::with_capacity(factory.len() + user.len());
+        for (i, _) in factory {
+            out.push(PresetSource::Factory { index: i });
+        }
+        for p in user {
+            out.push(PresetSource::User { path: p.path.clone() });
+        }
+        out
     }
 
     fn save_preset(&mut self, name: String, folder: Option<String>) {

@@ -167,8 +167,6 @@ pub struct VxnMainThread<'a> {
     view_rx: Arc<Mutex<Receiver<ViewEvent>>>,
     /// Shared snapshot of the preset corpus the controller publishes for the
     /// editor's browser. Refreshed by the controller after every disk op.
-    /// Webview backend reads this once the browser HTML lands (0050).
-    #[cfg_attr(feature = "webview", allow(dead_code))]
     corpus: CorpusHandle,
     /// Cheap-clone tick closure handed to the editor so its idle hook can
     /// pump the controller without knowing about its concrete type. The

@@ -10,7 +10,7 @@ use crate::domain::{KeyMode, Layer, PresetMeta};
 use crate::model::ParamId;
 
 /// Where a preset is read from.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PresetSource {
     /// Index into the embedded factory bank (`vxn_engine::factory()`).
     Factory { index: usize },
@@ -30,6 +30,12 @@ pub enum UiEvent {
     /// Globals and the other layer are left untouched.
     ResetLayer { layer: Layer },
     LoadPreset { source: PresetSource },
+    /// Walk the combined Factory + User preset list by `delta` steps,
+    /// wrapping at either end, and load the resulting entry (0049).
+    /// Controller-side: the editor doesn't need to track the index — it
+    /// posts `delta = ±1` for prev/next and the controller resolves
+    /// against the same ordered list it publishes for the browser.
+    StepPreset { delta: i32 },
     SavePreset { name: String, folder: Option<String> },
     RenamePreset { path: PathBuf, new_name: String },
     DeletePreset { path: PathBuf },
@@ -47,6 +53,25 @@ pub enum UiEvent {
     /// The vizia editor never sends this — its on_idle hook polls
     /// `SharedParams` directly and doesn't need a re-broadcast.
     EditorReady,
+    /// Faceplate asks the editor backend to pop a floating text-input
+    /// window (host kbd capture workaround, 0048 / E011). `id` is a
+    /// JS-chosen correlation token returned verbatim in the matching
+    /// [`UiEvent::TextInputResult`]; `title` is the popup title;
+    /// `initial` seeds the text field. Controller just relays — the
+    /// backend (vxn-ui-web on macOS) opens the NSWindow.
+    RequestTextInput {
+        id: String,
+        title: String,
+        initial: String,
+    },
+    /// Floating text-input popup committed (`Some`) or cancelled
+    /// (`None`). Posted by the editor backend; controller forwards as
+    /// [`ViewEvent::TextInputResult`] so the originating JS callback
+    /// can fire.
+    TextInputResult {
+        id: String,
+        value: Option<String>,
+    },
 }
 
 /// Event extracted from the host's CLAP stream and handed to the controller.
@@ -99,5 +124,21 @@ pub enum ViewEvent {
     },
     Status {
         line: String,
+    },
+    /// Backend-bound: open the floating text-input popup (0048). Not
+    /// forwarded to the page — the editor backend intercepts in its
+    /// `push_view_event` impl and pops a native window. `id` matches
+    /// the originating [`UiEvent::RequestTextInput`].
+    OpenTextInput {
+        id: String,
+        title: String,
+        initial: String,
+    },
+    /// Page-bound result of a text-input popup. The JS dispatcher
+    /// fires the pending callback keyed by `id`. `value` is `None` on
+    /// cancel (Esc, click outside) or `Some` on commit.
+    TextInputResult {
+        id: String,
+        value: Option<String>,
     },
 }

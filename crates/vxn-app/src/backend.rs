@@ -5,7 +5,7 @@
 //! impl. Parent-window type is associated so this crate stays free of any
 //! windowing dependency.
 
-use crate::controller::ControllerHandle;
+use crate::controller::{ControllerHandle, CorpusHandle};
 use crate::events::ViewEvent;
 
 pub trait EditorBackend: 'static {
@@ -17,7 +17,14 @@ pub trait EditorBackend: 'static {
     /// Vizia/baseview; an `NSView` pointer for the WebView crate).
     type ParentWindow;
 
-    fn open(parent: Self::ParentWindow, ctrl: ControllerHandle) -> Self::Handle;
+    /// `corpus` is the controller-published preset snapshot. The backend
+    /// reads it on open to seed its browser panel and re-reads after each
+    /// [`ViewEvent::PresetCorpusChanged`].
+    fn open(
+        parent: Self::ParentWindow,
+        ctrl: ControllerHandle,
+        corpus: CorpusHandle,
+    ) -> Self::Handle;
     fn close(handle: &mut Self::Handle);
 
     /// Forward a `ViewEvent` into the backend's render context. Called from

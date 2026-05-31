@@ -3858,9 +3858,11 @@ dependencies = [
 name = "vxn-ui-web"
 version = "0.0.4"
 dependencies = [
+ "objc",
  "raw-window-handle 0.6.2",
  "serde_json",
  "vxn-app",
+ "windows-sys 0.61.2",
  "wry",
 ]
 

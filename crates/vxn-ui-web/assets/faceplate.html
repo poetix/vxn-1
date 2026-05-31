@@ -93,12 +93,416 @@ html, body {
   justify-content: center;
 }
 
-/* Empty slot. The vizia editor's preset bar overlays this during the
-   E010 → E011 transition (0049 replaces it with the HTML preset bar). */
+/* Preset bar (0049). Sits in the 30px row between banner and Row 1.
+   Carries the current preset name, prev/next walker buttons over the
+   combined Factory+User list, a Browse toggle (binds to 0050's browser
+   panel), and a Save As button (opens the 0048 floating popup). The
+   status chip is the same `.status-pill` primitive 0046 introduced —
+   re-anchored from the lower-right corner to the right of the name
+   (ticket §Notes). */
 .preset-bar-slot {
   height: var(--preset-bar-h);
-  background: transparent;
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--panel-corner);
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  gap: 6px;
+  box-sizing: border-box;
+  color: var(--text);
 }
+.pbar-btn {
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 2px;
+  color: var(--ctl-label);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  height: 18px;
+  cursor: pointer;
+  user-select: none;
+}
+.pbar-btn:hover { border-color: var(--glyph-active); color: #ececec; }
+.pbar-btn.active {
+  background: #1f9cff;
+  border-color: #84cdff;
+  color: #fff;
+}
+.pbar-step { padding: 0 6px; min-width: 18px; text-align: center; }
+.pbar-name {
+  font-size: 12px;
+  color: var(--ctl-value);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  min-width: 150px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pbar-spacer { flex: 1 1 auto; }
+
+/* Preset browser panel (0050). Floats inside the faceplate document, just
+   below the preset bar. Outside-click + ESC dismiss. Width sized to keep
+   long preset names readable without dominating the row beneath it; height
+   capped so it never reaches Row 4 even when the corpus is dense — content
+   scrolls inside each pane. The container's `.hoverable` doesn't matter
+   here (no Vizia rules in play), and `pointer-events: none` on the
+   anchored `position: relative` ancestor would be wrong anyway: clicks
+   inside the panel must work. */
+.faceplate { position: relative; }
+/* The `hidden` HTML attribute maps to UA `display: none`, but a class-set
+   `display: flex` on the panel beats it. Promote `[hidden]` explicitly so
+   the bootstrap-time render isn't visible before `setOpen(false)` would
+   normally hide it. */
+.browser-panel[hidden],
+.browser-backdrop[hidden] { display: none !important; }
+.browser-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  /* Invisible — its only job is to swallow outside clicks and dispatch
+     them to the close handler. Pointer events stay on so the click lands. */
+}
+.browser-panel {
+  position: absolute;
+  top: calc(var(--pad-outer) + var(--banner-h) + var(--row-vgap)
+           + var(--preset-bar-h) + var(--row-vgap));
+  left: var(--pad-outer);
+  width: 760px;
+  max-width: calc(var(--editor-w) - 2 * var(--pad-outer));
+  height: 420px;
+  z-index: 60;
+  background: var(--panel-bg);
+  border: 1px solid var(--ctl-value);
+  border-radius: var(--panel-corner);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  padding: 8px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.browser-close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  z-index: 1;
+  background: transparent;
+  border: none;
+  color: var(--ctl-label);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.browser-close:hover { color: #ececec; }
+.browser-search {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  flex: 0 0 auto;
+  padding-right: 22px; /* keep the search clear button clear of the close-X */
+}
+.browser-search input {
+  flex: 1 1 auto;
+  background: #0e0e0e;
+  border: 1px solid #2a2a2a;
+  border-radius: 2px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  height: 22px;
+  padding: 0 6px;
+  box-sizing: border-box;
+  outline: none;
+}
+.browser-search input:focus { border-color: var(--glyph-active); }
+.browser-panes {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  gap: 6px;
+}
+.browser-pane {
+  background: #0e0e0e;
+  border: 1px solid #2a2a2a;
+  border-radius: 2px;
+  overflow-y: auto;
+  padding: 2px;
+  box-sizing: border-box;
+}
+.browser-pane-folders { width: 220px; flex: 0 0 220px; }
+.browser-pane-presets { flex: 1 1 auto; }
+.browser-section {
+  font-size: 9px;
+  color: var(--ctl-value);
+  letter-spacing: 1px;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 6px 4px 4px;
+  height: 22px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: flex-end;
+}
+.browser-row {
+  font-size: 12px;
+  color: var(--text);
+  padding: 3px 8px;
+  border-radius: 2px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 16px;
+}
+.browser-row:hover { background: #1c1c1c; }
+.browser-row.selected {
+  background: #1c1c1c;
+  color: #ececec;
+  box-shadow: inset 2px 0 0 var(--ctl-value);
+}
+.browser-row.current {
+  color: var(--ctl-value);
+  font-weight: 600;
+}
+/* Search-mode rows lay out as `name + muted origin label` so cross-folder
+   matches don't read as ambiguous duplicates ("Brassy" in Factory/Lead
+   vs. user/Bass). The origin pushes right. */
+.browser-row.search-row { display: flex; align-items: baseline; gap: 8px; }
+.browser-row.search-row .browser-row-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.browser-row.search-row .browser-row-origin {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--ctl-label);
+  letter-spacing: 0.3px;
+}
+.browser-empty {
+  font-size: 11px;
+  color: var(--ctl-label);
+  padding: 8px;
+  font-style: italic;
+}
+/* "+ New" button mounted inline with the User section header (0051). The
+   section header is normally `display: flex; align-items: flex-end;` —
+   the button rides the right edge of that row. */
+.browser-section-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  padding-right: 4px;
+}
+.browser-section-row .browser-section { flex: 1 1 auto; padding-right: 0; }
+.browser-new-folder {
+  flex: 0 0 auto;
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 2px;
+  color: var(--ctl-label);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  height: 16px;
+  cursor: pointer;
+  user-select: none;
+  margin-bottom: 4px;
+}
+.browser-new-folder:hover { border-color: var(--glyph-active); color: #ececec; }
+
+/* Right-click context menu (0051). Mounts inside the browser panel as a
+   sibling of the panes; absolutely positioned at the click coordinates
+   (relative to the panel). The "Move to ▸" submenu is a child of its row,
+   shown on hover via CSS — no JS state for hover open. */
+.browser-menu {
+  position: absolute;
+  z-index: 70;
+  background: #1c1c1c;
+  border: 1px solid var(--ctl-value);
+  border-radius: 2px;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.5);
+  padding: 2px 0;
+  min-width: 120px;
+}
+.browser-menu-item {
+  position: relative;
+  font-size: 12px;
+  color: var(--text);
+  padding: 4px 12px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.browser-menu-item:hover { background: #2a2a2a; }
+.browser-menu-item.has-submenu::after {
+  content: '▸';
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--ctl-label);
+  font-size: 10px;
+}
+.browser-submenu {
+  display: none;
+  position: absolute;
+  left: 100%;
+  top: -3px;
+  background: #1c1c1c;
+  border: 1px solid var(--ctl-value);
+  border-radius: 2px;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.5);
+  padding: 2px 0;
+  min-width: 120px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.browser-menu-item.has-submenu:hover > .browser-submenu { display: block; }
+.browser-submenu-item {
+  font-size: 12px;
+  color: var(--text);
+  padding: 4px 12px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.browser-submenu-item:hover { background: #2a2a2a; }
+.browser-submenu-empty {
+  font-size: 11px;
+  color: var(--ctl-label);
+  padding: 4px 12px;
+  font-style: italic;
+}
+/* Confirm modal (0051). Centred inside the browser panel; backdrop
+   absorbs clicks so the panel beneath isn't dismissed by a confirm-click.
+   Replaces the Vizia version's two-click row-armed pattern (the right-
+   click menu obscured the row text under it). */
+.browser-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 80;
+  background: rgba(0, 0, 0, 0.55);
+}
+.browser-modal {
+  position: absolute;
+  z-index: 81;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: #1c1c1c;
+  border: 1px solid var(--ctl-value);
+  border-radius: var(--panel-corner);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.6);
+  padding: 14px 18px;
+  min-width: 260px;
+  max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.browser-modal-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--ctl-value);
+}
+.browser-modal-body {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.4;
+  word-break: break-word;
+}
+.browser-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.browser-modal-btn {
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 2px;
+  color: var(--ctl-label);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  padding: 4px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.browser-modal-btn:hover { border-color: var(--glyph-active); color: #ececec; }
+.browser-modal-btn.danger {
+  border-color: #ff5050;
+  color: #ff7676;
+}
+.browser-modal-btn.danger:hover {
+  background: #2a1414;
+  color: #ffb0b0;
+}
+.browser-modal-btn.disabled,
+.browser-modal-btn:disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+/* Save As modal form: two-row label + control grid. */
+.save-as-body { display: flex; flex-direction: column; gap: 8px; min-width: 320px; }
+.save-as-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.save-as-label {
+  flex: 0 0 56px;
+  font-size: 10px;
+  color: var(--ctl-label);
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.save-as-name {
+  flex: 1 1 auto;
+  background: #0e0e0e;
+  border: 1px solid #2a2a2a;
+  border-radius: 2px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.save-as-name.placeholder { color: var(--ctl-label); font-style: italic; }
+.save-as-select {
+  flex: 1 1 auto;
+  background: #0e0e0e;
+  border: 1px solid #2a2a2a;
+  border-radius: 2px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  height: 24px;
+  padding: 0 6px;
+  cursor: pointer;
+}
+.save-as-select:focus { outline: none; border-color: var(--glyph-active); }
 
 .row {
   display: flex;
@@ -223,22 +627,19 @@ html, body {
   z-index: 1000;
 }
 
-/* Status pill (0046) — lower-right corner notifier. Driven by the
-   controller's `Status { line }` ViewEvent (clamp warnings on preset load,
-   ad-hoc messages). Fades after ~2.4s; pure CSS animation so the JS side
-   just sets the line + toggles the `visible` class. */
+/* Status pill (0046) — inline chip in the preset bar, right of the
+   current name (0049 §Notes). Driven by the controller's `Status { line }`
+   ViewEvent (clamp warnings on preset load, save / load messages). Fades
+   after ~3s; pure CSS animation so the JS side just sets the line and
+   toggles the `visible` class. */
 .status-pill {
-  position: fixed;
-  right: 10px;
-  bottom: 10px;
   background: #0e0e0e;
   border: 1px solid var(--glyph-active);
   border-radius: 3px;
-  padding: 3px 8px;
+  padding: 2px 8px;
   font-size: 10px;
   color: #f6f6f6;
   white-space: nowrap;
-  z-index: 1000;
   opacity: 0;
   pointer-events: none;
   transition: opacity 240ms ease-out;
@@ -489,7 +890,38 @@ html, body {
 
   <div class="banner">VULPUS LABS &mdash; VXN-1</div>
 
-  <div class="preset-bar-slot" id="preset-bar-slot" aria-hidden="true"></div>
+  <!-- Preset bar (0049). Prev/next walk the combined Factory + User
+       list (controller-side via UiEvent::StepPreset); Browse toggles a
+       view-side `browserOpen` flag 0050 will bind a panel to; Save As
+       opens the 0048 floating popup, commits with `folder: null`
+       (defaults to user root until 0051 ties browser selection in). -->
+  <div class="preset-bar-slot" id="preset-bar-slot">
+    <button class="pbar-btn pbar-step" id="pbar-prev" type="button" aria-label="Previous preset">&lt;</button>
+    <div class="pbar-name" id="pbar-name"></div>
+    <button class="pbar-btn pbar-step" id="pbar-next" type="button" aria-label="Next preset">&gt;</button>
+    <button class="pbar-btn" id="pbar-browse" type="button">Browse</button>
+    <button class="pbar-btn" id="pbar-save" type="button">Save As</button>
+    <div class="pbar-spacer"></div>
+    <div class="status-pill" id="pbar-status"></div>
+  </div>
+
+  <!-- Preset browser panel (0050). Two-pane folders / presets list with a
+       case-insensitive substring search across the selected folder. Hidden
+       until the preset bar's Browse toggle flips on; populated from the
+       controller's corpus snapshot pushed via
+       `window.__vxn.applyPresetCorpus`. -->
+  <div class="browser-backdrop" id="browser-backdrop" hidden></div>
+  <div class="browser-panel" id="browser-panel" hidden>
+    <button class="browser-close" id="browser-close" type="button" aria-label="Close browser">&times;</button>
+    <div class="browser-search">
+      <input type="text" id="browser-search-input" placeholder="Search…" autocomplete="off" />
+      <button class="pbar-btn" id="browser-search-clear" type="button" aria-label="Clear search">x</button>
+    </div>
+    <div class="browser-panes">
+      <div class="browser-pane browser-pane-folders" id="browser-folders"></div>
+      <div class="browser-pane browser-pane-presets" id="browser-presets"></div>
+    </div>
+  </div>
 
   <!-- Row 1 — LFOs, oscillators, mixer. -->
   <div class="row row-1" data-row="1">
@@ -841,10 +1273,37 @@ window.vxn = {
 };
 // Batched bridge entry point. `init()` replaces this with the real dispatcher
 // once CONTROLS is built; until then, every event in the batch is buffered.
+// `applyPresetCorpus` is the 0050 corpus-snapshot entry point; same buffer
+// pattern — the latest snapshot held until the browser panel is alive to
+// consume it.
+let _earlyPresetCorpus = null;
 window.__vxn = {
   applyViewEvents: function (arr) {
     for (const ev of arr) _earlyViewEvents.push(ev);
   },
+  applyPresetCorpus: function (snap) { _earlyPresetCorpus = snap; },
+};
+
+// ─── Floating text-input popup bridge (0048) ───────────────────────────────
+//
+// `window.vxn.promptText(title, initial, cb)` posts a `request_text_input`
+// UiEvent and stashes `cb` in `_textInputCallbacks` keyed by a fresh id.
+// Rust opens a native NSWindow (macOS) outside the host's NSEvent monitor
+// scope, so Space and friends work as text input rather than transport.
+// On commit / cancel the controller emits a `text_input_result` ViewEvent;
+// the dispatcher looks up `id` and fires the matching callback exactly
+// once. `value` is `null` on Esc / click outside, a string on Enter.
+const _textInputCallbacks = new Map();
+let _textInputCounter = 0;
+window.vxn.promptText = function (title, initial, cb) {
+  const id = 'ti' + (++_textInputCounter);
+  _textInputCallbacks.set(id, cb);
+  window.vxn.send({
+    op: 'request_text_input',
+    id,
+    title: title || '',
+    initial: initial || '',
+  });
 };
 
 // ─── Floating value popup (single shared instance) ─────────────────────────
@@ -871,24 +1330,742 @@ const valuePop = (() => {
   };
 })();
 
-// ─── Status pill (0046) ────────────────────────────────────────────────────
+// ─── Status pill (0046, repositioned in 0049) ──────────────────────────────
 //
-// One shared <div> in the lower-right corner. `Status { line }` ViewEvents
-// flash it for ~2.4s then fade (CSS transition). Re-fired messages reset
-// the timer so a rapid burst stays readable.
+// Inline chip in the preset bar, right of the current preset name. The
+// markup lives in faceplate.html so the bar layout is one HTML edit, not
+// JS-built; this IIFE just binds and exposes a `.flash(text)` API.
+// `Status { line }` ViewEvents flash for ~3s then fade (CSS transition).
+// Re-fired messages reset the timer so a rapid burst stays readable.
 const statusPill = (() => {
-  const el = document.createElement('div');
-  el.className = 'status-pill';
-  document.body.appendChild(el);
+  const el = document.getElementById('pbar-status');
   let timer = null;
   return {
     flash(text) {
+      if (!el) return;
       el.textContent = text;
       el.classList.add('visible');
       if (timer) clearTimeout(timer);
-      timer = setTimeout(() => el.classList.remove('visible'), 2400);
+      timer = setTimeout(() => el.classList.remove('visible'), 3000);
     },
   };
+})();
+
+// ─── Preset browser panel (0050 / 0051) ────────────────────────────────────
+//
+// Floating two-pane folders/presets browser anchored under the preset bar.
+// Corpus snapshot arrives via `__vxn.applyPresetCorpus(snapshot)` — Rust
+// pushes a fresh one at first flush and on every `PresetCorpusChanged`
+// (`vxn_ui_web::EditorHandle::flush_view_events`). Folder selection +
+// search are pure view state. Loading a preset posts `load_factory` or
+// `load_user` UiEvents; the controller publishes a `preset_loaded` back
+// which feeds the highlight in `setCurrentSource`.
+//
+// 0051 adds the user-side mutation flows: right-click context menu on
+// user rows (Rename / Delete / Move to ▸ for presets; Rename / Delete
+// for folders), an inline "+ New" button on the user header, and a
+// modal "Delete X?" confirm for the irreversible op (the Vizia version's
+// two-click row-armed pattern was unreadable here — the right-click menu
+// obscured the row text).
+const browserPanel = (() => {
+  const panelEl    = document.getElementById('browser-panel');
+  const backdropEl = document.getElementById('browser-backdrop');
+  const foldersEl  = document.getElementById('browser-folders');
+  const presetsEl  = document.getElementById('browser-presets');
+  const inputEl    = document.getElementById('browser-search-input');
+  const clearEl    = document.getElementById('browser-search-clear');
+  const closeEl    = document.getElementById('browser-close');
+
+  // Default selection: user root (so Save As targets the user dir on first
+  // open before the user has chosen a folder explicitly).
+  let corpus = { factory: [], user: [] };
+  let selectedFolder = { kind: 'user', name: null };
+  let query = '';
+  let currentSource = null;
+  let isOpen = false;
+  let onOpenChange = null;
+
+  // 0051: single open menu at a time + at most one modal confirm.
+  let menuEl = null;
+  let modalEl = null;
+
+  // Match the Vizia browser's section labels (vxn_ui_vizia `browser-section`).
+  const FACTORY_HEADER = 'FACTORY';
+  const USER_HEADER    = 'USER';
+  const UNCATEGORISED  = 'Uncategorised';
+
+  function setCorpus(snap) {
+    corpus = snap || { factory: [], user: [] };
+    if (!folderExists(selectedFolder)) {
+      selectedFolder = { kind: 'user', name: null };
+    }
+    // Any in-flight menu / modal from before the corpus changed is
+    // stale — the target row may have been renamed / moved / deleted.
+    closeMenu();
+    closeModal();
+    renderFolders();
+    renderPresets();
+  }
+  function folderExists(key) {
+    if (!key) return false;
+    const list = key.kind === 'factory' ? corpus.factory : corpus.user;
+    if (!Array.isArray(list)) return false;
+    for (const g of list) {
+      const gn = key.kind === 'factory' ? g.category : g.name;
+      if (gn === key.name || (gn == null && key.name == null)) return true;
+    }
+    return false;
+  }
+  function folderLabel(key, group) {
+    if (key.kind === 'factory') return group.category || UNCATEGORISED;
+    return group.name || UNCATEGORISED;
+  }
+  function renderFolders() {
+    foldersEl.innerHTML = '';
+    appendSection(FACTORY_HEADER, null);
+    for (const g of corpus.factory) {
+      appendFolderRow({ kind: 'factory', name: g.category }, folderLabel({kind:'factory'}, g));
+    }
+    appendSection(USER_HEADER, () => {
+      window.vxn.promptText('New folder', 'New Folder', (value) => {
+        if (value == null) return;
+        const trimmed = value.trim();
+        if (!trimmed) return;
+        window.vxn.send({ op: 'new_folder', suggested: trimmed });
+      });
+    });
+    for (const g of corpus.user) {
+      appendFolderRow({ kind: 'user', name: g.name }, folderLabel({kind:'user'}, g));
+    }
+  }
+  function appendSection(text, onNewFolder) {
+    if (onNewFolder) {
+      const row = document.createElement('div');
+      row.className = 'browser-section-row';
+      const h = document.createElement('div');
+      h.className = 'browser-section';
+      h.textContent = text;
+      row.appendChild(h);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'browser-new-folder';
+      btn.textContent = '+ New';
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        closeMenu();
+        onNewFolder();
+      });
+      row.appendChild(btn);
+      foldersEl.appendChild(row);
+    } else {
+      const h = document.createElement('div');
+      h.className = 'browser-section';
+      h.textContent = text;
+      foldersEl.appendChild(h);
+    }
+  }
+  function appendFolderRow(key, label) {
+    const r = document.createElement('div');
+    r.className = 'browser-row';
+    r.textContent = label;
+    if (selectedFolder.kind === key.kind && selectedFolder.name === key.name) {
+      r.classList.add('selected');
+    }
+    r.addEventListener('click', () => {
+      selectedFolder = key;
+      closeMenu();
+      renderFolders();
+      renderPresets();
+    });
+    // Only user folders carry a context menu. Factory rows are read-only.
+    // The virtual user-root entry (`name == null`) can't be renamed or
+    // deleted either (it represents the user preset dir itself).
+    if (key.kind === 'user' && key.name != null) {
+      r.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        openMenu(e, { kind: 'folder', name: key.name });
+      });
+    }
+    foldersEl.appendChild(r);
+  }
+  function findGroup() {
+    const list = selectedFolder.kind === 'factory' ? corpus.factory : corpus.user;
+    for (const g of list) {
+      const gn = selectedFolder.kind === 'factory' ? g.category : g.name;
+      if (gn === selectedFolder.name) return g;
+    }
+    return null;
+  }
+  function renderPresets() {
+    presetsEl.innerHTML = '';
+    const q = query.trim().toLowerCase();
+    // Search mode: query spans the whole corpus, ignoring the folder
+    // selection. The right pane becomes a flat list of matches with an
+    // origin label per row so cross-folder duplicates stay readable.
+    if (q) {
+      const hits = collectSearchHits(q);
+      if (hits.length === 0) { appendEmpty('No matches'); return; }
+      for (const h of hits) appendSearchRow(h);
+      return;
+    }
+    // No query: browse the selected folder normally.
+    const group = findGroup();
+    if (!group) { appendEmpty('No presets'); return; }
+    for (const p of group.presets) {
+      const r = document.createElement('div');
+      r.className = 'browser-row';
+      r.textContent = p.name;
+      if (isCurrent(p)) r.classList.add('current');
+      r.addEventListener('click', () => {
+        closeMenu();
+        loadEntry(p);
+      });
+      // Only user-side presets get a context menu. Factory is read-only.
+      if (selectedFolder.kind === 'user') {
+        r.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          openMenu(e, { kind: 'preset', path: p.path, name: p.name, folder: selectedFolder.name });
+        });
+      }
+      presetsEl.appendChild(r);
+    }
+    if (!group.presets.length) appendEmpty('No presets');
+  }
+  // Flat search across factory + user. Returns `{name, source, origin}`
+  // tuples in factory-then-user order, alpha-by-name within each origin
+  // (same order corpus_snapshot_json ships).
+  function collectSearchHits(q) {
+    const out = [];
+    for (const g of corpus.factory) {
+      const cat = g.category || UNCATEGORISED;
+      for (const p of g.presets) {
+        if (!p.name.toLowerCase().includes(q)) continue;
+        out.push({
+          name: p.name,
+          source: { kind: 'factory', index: p.index },
+          origin: 'Factory · ' + cat,
+        });
+      }
+    }
+    for (const g of corpus.user) {
+      const folder = g.name || UNCATEGORISED;
+      for (const p of g.presets) {
+        if (!p.name.toLowerCase().includes(q)) continue;
+        out.push({
+          name: p.name,
+          source: { kind: 'user', path: p.path, folder: g.name },
+          origin: 'User · ' + folder,
+        });
+      }
+    }
+    return out;
+  }
+  function appendSearchRow(h) {
+    const r = document.createElement('div');
+    r.className = 'browser-row search-row';
+    const name = document.createElement('span');
+    name.className = 'browser-row-name';
+    name.textContent = h.name;
+    const origin = document.createElement('span');
+    origin.className = 'browser-row-origin';
+    origin.textContent = h.origin;
+    r.appendChild(name);
+    r.appendChild(origin);
+    if (isCurrentSource(h.source)) r.classList.add('current');
+    r.addEventListener('click', () => {
+      closeMenu();
+      if (h.source.kind === 'factory') {
+        window.vxn.send({ op: 'load_factory', index: h.source.index });
+      } else {
+        window.vxn.send({ op: 'load_user', path: h.source.path });
+      }
+    });
+    // User-side search hits keep their context menu (Rename / Delete /
+    // Move to), referencing the hit's own folder so Move-to's submenu
+    // excludes the right one.
+    if (h.source.kind === 'user') {
+      r.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        openMenu(e, {
+          kind: 'preset',
+          path: h.source.path,
+          name: h.name,
+          folder: h.source.folder,
+        });
+      });
+    }
+    presetsEl.appendChild(r);
+  }
+  function isCurrentSource(src) {
+    if (!currentSource || !src) return false;
+    if (src.kind === 'factory') {
+      return currentSource.kind === 'factory' && currentSource.index === src.index;
+    }
+    return currentSource.kind === 'user' && currentSource.path === src.path;
+  }
+  function appendEmpty(text) {
+    const e = document.createElement('div');
+    e.className = 'browser-empty';
+    e.textContent = text;
+    presetsEl.appendChild(e);
+  }
+  function isCurrent(p) {
+    if (!currentSource) return false;
+    if (selectedFolder.kind === 'factory') {
+      return currentSource.kind === 'factory' && currentSource.index === p.index;
+    }
+    return currentSource.kind === 'user' && currentSource.path === p.path;
+  }
+  function loadEntry(p) {
+    if (selectedFolder.kind === 'factory') {
+      window.vxn.send({ op: 'load_factory', index: p.index });
+    } else {
+      window.vxn.send({ op: 'load_user', path: p.path });
+    }
+  }
+  function setOpen(open) {
+    isOpen = !!open;
+    panelEl.hidden = !isOpen;
+    backdropEl.hidden = !isOpen;
+    window.vxn._browserOpen = isOpen;
+    if (isOpen) {
+      renderFolders();
+      renderPresets();
+      try { inputEl.focus(); } catch (_) {}
+    } else {
+      closeMenu();
+      closeModal();
+    }
+    if (onOpenChange) onOpenChange(isOpen);
+  }
+  function setCurrentSource(src) {
+    currentSource = src || null;
+    if (isOpen) renderPresets();
+  }
+  function getSaveFolder() {
+    if (selectedFolder.kind !== 'user') return null;
+    return selectedFolder.name;
+  }
+
+  // ── Context menu (0051) ──────────────────────────────────────────────
+  //
+  // Menu is a child of the browser panel so it inherits the panel's
+  // clipping; coordinates are relative to the panel. Outside-click and
+  // ESC both close it (panel ESC handler closes the whole panel after
+  // closing any open menu first, so ESC is "close one level").
+  function closeMenu() {
+    if (menuEl) {
+      menuEl.remove();
+      menuEl = null;
+    }
+  }
+  function openMenu(ev, target) {
+    closeMenu();
+    const m = document.createElement('div');
+    m.className = 'browser-menu';
+    // Position relative to the panel — convert client coords into panel-
+    // local coords using the panel's bounding box.
+    const rect = panelEl.getBoundingClientRect();
+    m.style.left = (ev.clientX - rect.left) + 'px';
+    m.style.top  = (ev.clientY - rect.top)  + 'px';
+
+    // Rename — both targets use the same op shape internals; preset takes
+    // `path`, folder takes `old_name`.
+    const renameLabel = target.kind === 'preset' ? target.name : target.name;
+    appendMenuItem(m, 'Rename', () => {
+      closeMenu();
+      window.vxn.promptText('Rename', renameLabel, (value) => {
+        if (value == null) return;
+        const trimmed = value.trim();
+        if (!trimmed || trimmed === renameLabel) return;
+        if (target.kind === 'preset') {
+          window.vxn.send({ op: 'rename_preset', path: target.path, new_name: trimmed });
+        } else {
+          window.vxn.send({ op: 'rename_folder', old_name: target.name, new_name: trimmed });
+        }
+      });
+    });
+    // Delete — modal confirm. The menu closes first so the row text
+    // isn't obscured behind the menu while the user reads the prompt.
+    appendMenuItem(m, 'Delete', () => {
+      closeMenu();
+      openDeleteConfirm(target);
+    });
+    // Move to ▸ — preset only. Submenu lists user folders except the
+    // current one; CSS shows the submenu on hover.
+    if (target.kind === 'preset') {
+      appendMoveSubmenu(m, target);
+    }
+    panelEl.appendChild(m);
+    menuEl = m;
+  }
+  function appendMenuItem(parent, label, onClick) {
+    const item = document.createElement('div');
+    item.className = 'browser-menu-item';
+    item.textContent = label;
+    item.addEventListener('click', (e) => {
+      e.stopPropagation();
+      onClick();
+    });
+    parent.appendChild(item);
+    return item;
+  }
+  function appendMoveSubmenu(parent, target) {
+    const item = document.createElement('div');
+    item.className = 'browser-menu-item has-submenu';
+    item.textContent = 'Move to';
+    const sub = document.createElement('div');
+    sub.className = 'browser-submenu';
+    const targets = moveTargets(target.folder);
+    if (targets.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'browser-submenu-empty';
+      empty.textContent = 'no other folders';
+      sub.appendChild(empty);
+    } else {
+      for (const t of targets) {
+        const subItem = document.createElement('div');
+        subItem.className = 'browser-submenu-item';
+        subItem.textContent = t.label;
+        subItem.addEventListener('click', (e) => {
+          e.stopPropagation();
+          closeMenu();
+          window.vxn.send({ op: 'move_preset', path: target.path, dest_folder: t.name });
+        });
+        sub.appendChild(subItem);
+      }
+    }
+    item.appendChild(sub);
+    parent.appendChild(item);
+    return item;
+  }
+  // Move targets order matches the left-pane order: Uncategorised first
+  // (the virtual user-root, `name: null`), then alpha-sorted named user
+  // folders. The current folder is suppressed (moving to the current
+  // folder is a no-op). Mirrors `vxn_ui_vizia::move_targets`.
+  function moveTargets(currentName) {
+    const out = [];
+    let hasRoot = false;
+    const named = [];
+    for (const g of corpus.user) {
+      if (g.name == null) { hasRoot = true; continue; }
+      named.push(g.name);
+    }
+    named.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+    if (hasRoot && currentName !== null) {
+      out.push({ name: null, label: UNCATEGORISED });
+    }
+    for (const n of named) {
+      if (n === currentName) continue;
+      out.push({ name: n, label: n });
+    }
+    return out;
+  }
+
+  // ── Modal confirm (0051) ─────────────────────────────────────────────
+  //
+  // Click Delete in the context menu → menu closes → modal opens, centred
+  // inside the browser panel. Cancel / Esc dismisses; Delete posts the
+  // corresponding UiEvent. Backdrop click cancels too.
+  function openDeleteConfirm(target) {
+    const isPreset = target.kind === 'preset';
+    const kindLabel = isPreset ? 'preset' : 'folder';
+    const name = isPreset ? target.name : target.name;
+    const message = isPreset
+      ? `Delete preset “${name}”? This cannot be undone.`
+      : `Delete folder “${name}” and every preset inside it? This cannot be undone.`;
+    openModal({
+      title: `Delete ${kindLabel}`,
+      body: message,
+      confirmLabel: 'Delete',
+      danger: true,
+      onConfirm: () => {
+        if (isPreset) {
+          window.vxn.send({ op: 'delete_preset', path: target.path });
+        } else {
+          window.vxn.send({ op: 'delete_folder', name: target.name });
+        }
+      },
+    });
+  }
+  function closeModal() {
+    if (modalEl) {
+      modalEl.remove();
+      modalEl = null;
+    }
+  }
+  // `body` is either a string (rendered as plain text) or a callback
+  // `(host) => void` that mounts its own elements into `host`. The
+  // callback form is what the Save As modal uses to host its name +
+  // folder controls. `extendActions` is an optional callback that gets
+  // the actions row plus a `setEnabled(bool)` hook for the OK button —
+  // useful for forms that need to gate Save until the input is valid.
+  function openModal({ title, body, confirmLabel, danger, onConfirm, extendActions }) {
+    closeModal();
+    closeMenu();
+    const wrap = document.createElement('div');
+    wrap.className = 'browser-modal-wrap';
+
+    const back = document.createElement('div');
+    back.className = 'browser-modal-backdrop';
+    back.addEventListener('click', closeModal);
+    wrap.appendChild(back);
+
+    const dialog = document.createElement('div');
+    dialog.className = 'browser-modal';
+
+    const t = document.createElement('div');
+    t.className = 'browser-modal-title';
+    t.textContent = title;
+    dialog.appendChild(t);
+
+    const b = document.createElement('div');
+    b.className = 'browser-modal-body';
+    if (typeof body === 'function') body(b);
+    else b.textContent = body;
+    dialog.appendChild(b);
+
+    const actions = document.createElement('div');
+    actions.className = 'browser-modal-actions';
+    const cancel = document.createElement('button');
+    cancel.type = 'button';
+    cancel.className = 'browser-modal-btn';
+    cancel.textContent = 'Cancel';
+    cancel.addEventListener('click', closeModal);
+    actions.appendChild(cancel);
+
+    const ok = document.createElement('button');
+    ok.type = 'button';
+    ok.className = 'browser-modal-btn' + (danger ? ' danger' : '');
+    ok.textContent = confirmLabel || 'OK';
+    ok.addEventListener('click', () => {
+      if (ok.disabled) return;
+      try { onConfirm(); } catch (e) { console.warn('modal onConfirm threw', e); }
+      closeModal();
+    });
+    actions.appendChild(ok);
+    if (extendActions) {
+      extendActions({ setEnabled: (on) => { ok.disabled = !on; ok.classList.toggle('disabled', !on); } });
+    }
+    dialog.appendChild(actions);
+    wrap.appendChild(dialog);
+
+    // Anchor over the whole faceplate, not just the browser panel — so
+    // Save As works whether the panel is open or not.
+    document.getElementById('faceplate').appendChild(wrap);
+    modalEl = wrap;
+    try { ok.focus(); } catch (_) {}
+  }
+
+  // ── Save As modal (0049 / 0051) ──────────────────────────────────────
+  //
+  // Single dialog with a name field + folder dropdown. The name field is
+  // captured via the existing native popup (`promptText`) so Space + other
+  // transport-mapped keys aren't swallowed by the host's NSEvent monitor;
+  // the dropdown is a plain `<select>` (mouse-driven select uses WKWebView's
+  // native popup menu — no key capture concerns). Save posts
+  // `save_preset { name, folder }`.
+  function openSaveAsModal(initialName) {
+    let name = (initialName || '').trim();
+    // Default folder selection: whichever folder the user has chosen in
+    // the browser panel (user side only); factory selections collapse to
+    // root, matching `getSaveFolder`.
+    const initialFolder = (selectedFolder.kind === 'user') ? selectedFolder.name : null;
+    let folder = initialFolder;
+    let setEnabledHook = null;
+    let nameLabel = null;
+
+    function valid() { return name.length > 0; }
+    function refreshEnabled() {
+      if (setEnabledHook) setEnabledHook(valid());
+    }
+
+    openModal({
+      title: 'Save preset as',
+      body: (host) => {
+        host.classList.add('save-as-body');
+
+        // Name row: read-only-looking label + Edit button that funnels
+        // through the native popup. Updates `name` and the label on commit.
+        const nameRow = document.createElement('div');
+        nameRow.className = 'save-as-row';
+        const nameLab = document.createElement('div');
+        nameLab.className = 'save-as-label';
+        nameLab.textContent = 'Name';
+        nameRow.appendChild(nameLab);
+        nameLabel = document.createElement('div');
+        nameLabel.className = 'save-as-name';
+        nameLabel.textContent = name || '(untitled)';
+        if (!name) nameLabel.classList.add('placeholder');
+        nameRow.appendChild(nameLabel);
+        const editBtn = document.createElement('button');
+        editBtn.type = 'button';
+        editBtn.className = 'browser-modal-btn';
+        editBtn.textContent = name ? 'Edit' : 'Name…';
+        editBtn.addEventListener('click', () => {
+          window.vxn.promptText('Preset name', name, (value) => {
+            if (value == null) return;
+            const trimmed = value.trim();
+            if (!trimmed) return;
+            name = trimmed;
+            nameLabel.textContent = name;
+            nameLabel.classList.remove('placeholder');
+            editBtn.textContent = 'Edit';
+            refreshEnabled();
+          });
+        });
+        nameRow.appendChild(editBtn);
+        host.appendChild(nameRow);
+
+        // Folder row: dropdown over user folders. Null = root
+        // (Uncategorised); named folders sorted alpha. Mirrors the left-
+        // pane order so the choices read the same.
+        const folderRow = document.createElement('div');
+        folderRow.className = 'save-as-row';
+        const folderLab = document.createElement('div');
+        folderLab.className = 'save-as-label';
+        folderLab.textContent = 'Folder';
+        folderRow.appendChild(folderLab);
+        const select = document.createElement('select');
+        select.className = 'save-as-select';
+        for (const opt of folderOptions()) {
+          const o = document.createElement('option');
+          o.value = opt.value;
+          o.textContent = opt.label;
+          if (opt.value === folderValue(folder)) o.selected = true;
+          select.appendChild(o);
+        }
+        select.addEventListener('change', () => {
+          folder = (select.value === '__root__') ? null : select.value;
+        });
+        folderRow.appendChild(select);
+        host.appendChild(folderRow);
+      },
+      confirmLabel: 'Save',
+      onConfirm: () => {
+        if (!valid()) return;
+        window.vxn.send({ op: 'save_preset', name, folder });
+      },
+      extendActions: ({ setEnabled }) => {
+        setEnabledHook = setEnabled;
+        setEnabled(valid());
+      },
+    });
+  }
+  function folderValue(name) {
+    return name == null ? '__root__' : name;
+  }
+  function folderOptions() {
+    const named = [];
+    let hasRoot = false;
+    for (const g of corpus.user) {
+      if (g.name == null) { hasRoot = true; continue; }
+      named.push(g.name);
+    }
+    named.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+    const out = [];
+    // Always offer the root, even if the snapshot didn't include the
+    // virtual folder yet (corpus seeds it lazily on first save).
+    out.push({ value: '__root__', label: UNCATEGORISED });
+    for (const n of named) out.push({ value: n, label: n });
+    return out;
+  }
+
+  inputEl.addEventListener('input', () => {
+    query = inputEl.value || '';
+    renderPresets();
+  });
+  clearEl.addEventListener('click', () => {
+    inputEl.value = '';
+    query = '';
+    renderPresets();
+    inputEl.focus();
+  });
+  backdropEl.addEventListener('click', () => setOpen(false));
+  closeEl.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setOpen(false);
+  });
+  // Click anywhere inside the panel that isn't the menu closes the menu
+  // (matches the Vizia browser's overlay click-out).
+  panelEl.addEventListener('click', (e) => {
+    if (menuEl && !menuEl.contains(e.target)) closeMenu();
+  });
+  document.addEventListener('keydown', (e) => {
+    if (e.key !== 'Escape') return;
+    if (!isOpen) return;
+    e.preventDefault();
+    // ESC closes one level: open modal → menu → panel.
+    if (modalEl) { closeModal(); return; }
+    if (menuEl)  { closeMenu();  return; }
+    setOpen(false);
+  });
+
+  return {
+    setCorpus,
+    setCurrentSource,
+    setOpen,
+    isOpen: () => isOpen,
+    getSaveFolder,
+    openSaveAs: openSaveAsModal,
+    onOpenChange: (cb) => { onOpenChange = cb; },
+    // Exposed for in-page tests.
+    _moveTargets: moveTargets,
+  };
+})();
+// Replace the bootstrap stub so future Rust pushes go straight to the
+// panel; drain any snapshot that arrived during bootstrap.
+window.__vxn.applyPresetCorpus = (snap) => browserPanel.setCorpus(snap);
+if (_earlyPresetCorpus) {
+  browserPanel.setCorpus(_earlyPresetCorpus);
+  _earlyPresetCorpus = null;
+}
+
+// ─── Preset bar wiring (0049 / 0050) ───────────────────────────────────────
+//
+// Prev/next post `step_preset` with a signed delta — the controller walks
+// the combined Factory + User list and emits a fresh `preset_loaded` for
+// us to pick up. The current name comes from the same `preset_loaded`
+// dispatch branch in `init()`. Browse toggles the 0050 browser panel
+// (open/close mirrored back via the panel's `onOpenChange` so the button's
+// `.active` class stays in sync with click-outside / ESC dismissals).
+// Save As opens the 0048 popup and on commit posts `save_preset` using
+// the browser panel's currently-selected user folder as the destination
+// (factory selections collapse to user root — there's no write target
+// inside the factory bank).
+const presetBar = (() => {
+  const nameEl   = document.getElementById('pbar-name');
+  const prevEl   = document.getElementById('pbar-prev');
+  const nextEl   = document.getElementById('pbar-next');
+  const browseEl = document.getElementById('pbar-browse');
+  const saveEl   = document.getElementById('pbar-save');
+  let currentName = '';
+
+  function setName(name) {
+    currentName = name || '';
+    if (nameEl) nameEl.textContent = currentName;
+  }
+  if (prevEl) {
+    prevEl.addEventListener('click', () => window.vxn.send({ op: 'step_preset', delta: -1 }));
+  }
+  if (nextEl) {
+    nextEl.addEventListener('click', () => window.vxn.send({ op: 'step_preset', delta: 1 }));
+  }
+  if (browseEl) {
+    browseEl.addEventListener('click', () => browserPanel.setOpen(!browserPanel.isOpen()));
+  }
+  browserPanel.onOpenChange((open) => {
+    if (browseEl) browseEl.classList.toggle('active', open);
+  });
+  if (saveEl) {
+    // Save As opens the combined name + folder modal. The name field
+    // funnels through the existing native popup (`promptText`) for
+    // spacebar-safe entry; the folder dropdown is mouse-driven (no kbd
+    // capture concern). The modal anchors over the faceplate, so it
+    // works whether or not the browser panel itself is open.
+    saveEl.addEventListener('click', () => browserPanel.openSaveAs(currentName));
+  }
+  return { setName };
 })();
 
 // ─── Waveform glyph polylines ──────────────────────────────────────────────
@@ -1947,10 +3124,39 @@ function init() {
       statusPill.flash(ev.line);
       return;
     }
-    // key_mode_changed / preset_loaded / preset_corpus_changed land here.
-    // E011 / 0049+ wire the Keys + preset browser areas; for now they are
-    // intentional no-ops so the bridge stays quiet under normal play.
-    // Uncomment for verbose tracing during development:
+    if (ev.kind === 'text_input_result') {
+      // Fire-once: drop the entry before invoking so a re-entrant
+      // promptText() from inside the callback can't see a stale id.
+      const cb = _textInputCallbacks.get(ev.id);
+      if (cb) {
+        _textInputCallbacks.delete(ev.id);
+        try { cb(ev.value == null ? null : ev.value); }
+        catch (e) { console.warn('promptText callback threw', e); }
+      }
+      return;
+    }
+    if (ev.kind === 'preset_loaded') {
+      // 0049: preset bar name binds here. Warnings (if any) flash
+      // through the status chip — they belong with the load result,
+      // not in the corner.
+      presetBar.setName(ev.name);
+      // 0050: feed the browser panel's "currently loaded" highlight
+      // from the same event. `source` is null on host state-load
+      // (no on-disk anchor) — the panel just clears the highlight.
+      browserPanel.setCurrentSource(ev.source || null);
+      if (Array.isArray(ev.warnings) && ev.warnings.length) {
+        statusPill.flash(ev.warnings.join('; '));
+      }
+      return;
+    }
+    // 0050: corpus snapshot arrives via __vxn.applyPresetCorpus
+    // (separate Rust→JS channel), not through this batch. The
+    // PresetCorpusChanged ViewEvent is the trigger for that push, so
+    // the page-side render has already happened by the time we get
+    // here — nothing else to do unless we want to follow the
+    // `ev.follow` path (0051 territory).
+    // key_mode_changed lands here too. Uncomment for verbose
+    // tracing during development:
     // console.log('vxn:view', ev);
   };
   // Batched bridge entry — Rust calls this once per controller tick.

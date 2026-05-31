@@ -903,6 +903,11 @@ impl Model for UiModel {
                     ViewEvent::Status { line } => {
                         self.status.set(line);
                     }
+                    ViewEvent::OpenTextInput { .. } | ViewEvent::TextInputResult { .. } => {
+                        // 0048 (E011) is HTML-faceplate-only — Vizia editor
+                        // is on its way out (0054) and never asks the
+                        // controller for a text-input popup.
+                    }
                 }
             }
         });

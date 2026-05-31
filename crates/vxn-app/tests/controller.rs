@@ -545,6 +545,67 @@ fn set_edit_layer_echoes_as_view_event() {
 }
 
 #[test]
+fn request_text_input_relays_to_open_text_input() {
+    // 0048: faceplate posts `RequestTextInput`; controller relays
+    // verbatim as `OpenTextInput` for the editor backend to intercept
+    // and pop a native NSWindow. No model mutation.
+    let (mut ctrl, _model, view_rx) = build(2);
+    ctrl.ui_sender()
+        .send(UiEvent::RequestTextInput {
+            id: "ti7".into(),
+            title: "Rename Preset".into(),
+            initial: "Pad 1".into(),
+        })
+        .unwrap();
+    ctrl.tick();
+    let events = drain(&view_rx);
+    assert!(
+        events.iter().any(|ev| matches!(
+            ev,
+            ViewEvent::OpenTextInput { id, title, initial }
+                if id == "ti7" && title == "Rename Preset" && initial == "Pad 1"
+        )),
+        "missing OpenTextInput(ti7) in {events:?}"
+    );
+}
+
+#[test]
+fn text_input_result_relays_back_to_page() {
+    // Commit and cancel both round-trip through the controller so the
+    // page's pending-callback map can fire from one dispatcher branch.
+    let (mut ctrl, _model, view_rx) = build(2);
+    ctrl.ui_sender()
+        .send(UiEvent::TextInputResult {
+            id: "ti7".into(),
+            value: Some("Pad 2".into()),
+        })
+        .unwrap();
+    ctrl.ui_sender()
+        .send(UiEvent::TextInputResult {
+            id: "ti8".into(),
+            value: None,
+        })
+        .unwrap();
+    ctrl.tick();
+    let events = drain(&view_rx);
+    assert!(
+        events.iter().any(|ev| matches!(
+            ev,
+            ViewEvent::TextInputResult { id, value: Some(v) }
+                if id == "ti7" && v == "Pad 2"
+        )),
+        "missing commit echo: {events:?}"
+    );
+    assert!(
+        events.iter().any(|ev| matches!(
+            ev,
+            ViewEvent::TextInputResult { id, value: None } if id == "ti8"
+        )),
+        "missing cancel echo: {events:?}"
+    );
+}
+
+#[test]
 fn controller_save_then_list_round_trip() {
     // Real disk IO through `PresetStore` — proves the controller's
     // SavePreset → refresh_user_corpus → PresetCorpusChanged path actually
@@ -613,5 +674,202 @@ fn controller_save_then_list_round_trip() {
             tmp.path().join("Init.preset"),
             tmp.path().join("Lead/Brassy.preset"),
         ]
+    );
+}
+
+#[test]
+fn step_preset_walks_combined_list_factory_then_user_alpha() {
+    // 0049: prev/next walker. Combined order = factory alpha-by-name then
+    // user alpha-by-name across all folders; wraps at either end. With no
+    // prior preset, `delta=+1` seeds at index 0 and `delta=-1` at the last
+    // entry — matches the vizia `step_index` semantics so the walker is
+    // backend-agnostic.
+    let blob_for = |v: f32| {
+        let mut b = Vec::new();
+        b.extend_from_slice(&1u32.to_le_bytes());
+        b.extend_from_slice(&v.to_le_bytes());
+        b
+    };
+    // Factory entries deliberately not alpha-sorted in the bank so the
+    // walker has to do the sort itself.
+    let factory = vec![
+        (PresetMeta { name: "Brass".into(), ..Default::default() }, blob_for(0.10)),
+        (PresetMeta { name: "Aether".into(), ..Default::default() }, blob_for(0.20)),
+        (PresetMeta { name: "Choir".into(), ..Default::default() }, blob_for(0.30)),
+    ];
+    let store = Box::new(MockPresetStore::with_factory(factory));
+    let (mut ctrl, model, view_rx) = build_with(1, store);
+
+    // No prior preset, delta=+1 → first by alpha order ("Aether" → 0.20).
+    ctrl.ui_sender()
+        .send(UiEvent::StepPreset { delta: 1 })
+        .unwrap();
+    ctrl.tick();
+    assert!((model.get(ParamId::new(0)) - 0.20).abs() < 1e-6);
+    let names: Vec<String> = drain(&view_rx)
+        .into_iter()
+        .filter_map(|ev| match ev {
+            ViewEvent::PresetLoaded { meta, .. } => Some(meta.name),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["Aether"]);
+
+    // Step forward → "Brass" → "Choir" → wrap to "Aether".
+    for expected in ["Brass", "Choir", "Aether"] {
+        ctrl.ui_sender()
+            .send(UiEvent::StepPreset { delta: 1 })
+            .unwrap();
+        ctrl.tick();
+        let names: Vec<String> = drain(&view_rx)
+            .into_iter()
+            .filter_map(|ev| match ev {
+                ViewEvent::PresetLoaded { meta, .. } => Some(meta.name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec![expected.to_string()]);
+    }
+
+    // Step backward from "Aether" wraps to "Choir".
+    ctrl.ui_sender()
+        .send(UiEvent::StepPreset { delta: -1 })
+        .unwrap();
+    ctrl.tick();
+    let names: Vec<String> = drain(&view_rx)
+        .into_iter()
+        .filter_map(|ev| match ev {
+            ViewEvent::PresetLoaded { meta, .. } => Some(meta.name),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(names, vec!["Choir".to_string()]);
+}
+
+#[test]
+fn step_preset_spans_factory_into_user() {
+    // 0049: factory entries come first, then user entries, both alpha. A
+    // forward step from the last factory entry lands on the first user
+    // entry — proves the walker treats the two halves as one ordered list.
+    let tmp = tempfile::TempDir::new().unwrap();
+    // Mixed source: one factory entry (no engine), one user entry on disk.
+    // Use the tempdir store wrapped so that factory_load returns a known
+    // blob and the user side hits disk.
+    struct MixedStore {
+        factory: Vec<(PresetMeta, Vec<u8>)>,
+        user_root: PathBuf,
+    }
+    impl PresetStore for MixedStore {
+        fn factory_len(&self) -> usize { self.factory.len() }
+        fn factory_load(&self, i: usize) -> Result<PresetLoad, String> {
+            let (m, b) = self.factory.get(i).ok_or("oob")?;
+            Ok(PresetLoad { meta: m.clone(), blob: b.clone(), warnings: Vec::new() })
+        }
+        fn factory_meta(&self, i: usize) -> Option<PresetMeta> {
+            self.factory.get(i).map(|(m, _)| m.clone())
+        }
+        fn user_load(&self, path: &Path) -> Result<PresetLoad, String> {
+            let blob = fs::read(path).map_err(|e| e.to_string())?;
+            let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+            Ok(PresetLoad { meta: PresetMeta { name, ..Default::default() }, blob, warnings: Vec::new() })
+        }
+        fn user_save(&self, _: &str, _: Option<&str>, _: &PresetMeta, _: &[u8]) -> Result<PathBuf, String> { Err("ro".into()) }
+        fn user_delete(&self, _: &Path) -> Result<(), String> { Ok(()) }
+        fn user_rename(&self, _: &Path, _: &str) -> Result<PathBuf, String> { Ok(PathBuf::new()) }
+        fn user_move(&self, _: &Path, _: Option<&str>) -> Result<PathBuf, String> { Ok(PathBuf::new()) }
+        fn user_create_folder(&self, _: &str) -> Result<(PathBuf, String), String> { Ok((PathBuf::new(), String::new())) }
+        fn user_rename_folder(&self, _: &str, _: &str) -> Result<(PathBuf, String), String> { Ok((PathBuf::new(), String::new())) }
+        fn user_delete_folder(&self, _: &str) -> Result<(), String> { Ok(()) }
+        fn list_user_tree(&self) -> Vec<UserFolderEntry> {
+            let mut presets = Vec::new();
+            if let Ok(rd) = fs::read_dir(&self.user_root) {
+                for e in rd.flatten() {
+                    if let Some(n) = e.path().file_stem().and_then(|s| s.to_str()) {
+                        presets.push(UserPresetEntry {
+                            path: e.path(),
+                            meta: PresetMeta { name: n.to_string(), ..Default::default() },
+                            folder: None,
+                        });
+                    }
+                }
+            }
+            presets.sort_by_key(|p| p.meta.name.to_lowercase());
+            vec![UserFolderEntry { name: None, presets }]
+        }
+    }
+
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&1u32.to_le_bytes());
+    blob.extend_from_slice(&0.42_f32.to_le_bytes());
+    fs::write(tmp.path().join("UserFoo.preset"), &blob).unwrap();
+
+    let factory = vec![
+        (PresetMeta { name: "FactoryOnly".into(), ..Default::default() }, blob.clone()),
+    ];
+    let store = Box::new(MixedStore { factory, user_root: tmp.path().to_path_buf() });
+    let (mut ctrl, _model, view_rx) = build_with(1, store);
+
+    // Forward from cold → factory "FactoryOnly".
+    ctrl.ui_sender().send(UiEvent::StepPreset { delta: 1 }).unwrap();
+    ctrl.tick();
+    let names: Vec<String> = drain(&view_rx).into_iter().filter_map(|ev| match ev {
+        ViewEvent::PresetLoaded { meta, .. } => Some(meta.name),
+        _ => None,
+    }).collect();
+    assert_eq!(names, vec!["FactoryOnly".to_string()]);
+
+    // Next step → first user entry "UserFoo".
+    ctrl.ui_sender().send(UiEvent::StepPreset { delta: 1 }).unwrap();
+    ctrl.tick();
+    let names: Vec<String> = drain(&view_rx).into_iter().filter_map(|ev| match ev {
+        ViewEvent::PresetLoaded { meta, .. } => Some(meta.name),
+        _ => None,
+    }).collect();
+    assert_eq!(names, vec!["UserFoo".to_string()]);
+}
+
+#[test]
+fn editor_ready_replays_params_and_corpus() {
+    // 0050 race fix: EditorReady kicks a full param broadcast, the KeyMode,
+    // *and* a benign PresetCorpusChanged. The corpus signal is what
+    // re-triggers the webview backend's corpus push when the very first
+    // one raced ahead of the page's bootstrap script.
+    let (mut ctrl, _model, view_rx) = build(2);
+    ctrl.ui_sender().send(UiEvent::EditorReady).unwrap();
+    ctrl.tick();
+    let events = drain(&view_rx);
+    assert!(
+        events
+            .iter()
+            .filter(|ev| matches!(ev, ViewEvent::ParamChanged { .. }))
+            .count()
+            >= 2,
+        "expected a ParamChanged per param: {events:?}",
+    );
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, ViewEvent::KeyModeChanged { .. })),
+        "expected KeyModeChanged: {events:?}",
+    );
+    assert!(
+        events
+            .iter()
+            .any(|ev| matches!(ev, ViewEvent::PresetCorpusChanged { follow: None })),
+        "expected PresetCorpusChanged (corpus re-push trigger): {events:?}",
+    );
+}
+
+#[test]
+fn step_preset_empty_corpus_is_noop() {
+    // Cold start with no factory and no user presets: StepPreset must not
+    // emit a PresetLoaded or touch the model.
+    let (mut ctrl, _model, view_rx) = build(1);
+    ctrl.ui_sender().send(UiEvent::StepPreset { delta: 1 }).unwrap();
+    ctrl.tick();
+    let events = drain(&view_rx);
+    assert!(
+        !events.iter().any(|ev| matches!(ev, ViewEvent::PresetLoaded { .. })),
+        "expected no PresetLoaded with empty corpus: {events:?}"
     );
 }

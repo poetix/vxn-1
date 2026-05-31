@@ -16,7 +16,7 @@
 //! 0047 flips it from vizia to this crate. Until then, the trait surface is
 //! the contract a future shell programs against.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::c_void;
 
@@ -24,11 +24,14 @@ use raw_window_handle::{
     HandleError, HasWindowHandle, RawWindowHandle, WindowHandle as RwhWindowHandle,
 };
 use vxn_app::{
-    ControllerHandle, EditorBackend, KeyMode, Layer, PATCH_COUNT, ParamDesc, ParamId, ParamKind,
-    PresetSource, TOTAL_PARAMS, UiEvent, ViewEvent, desc_for_clap_id,
+    ControllerHandle, CorpusHandle, EditorBackend, KeyMode, Layer, PATCH_COUNT, ParamDesc, ParamId,
+    ParamKind, PresetCorpus, PresetSource, TOTAL_PARAMS, UNCATEGORIZED, UiEvent, ViewEvent,
+    desc_for_clap_id,
 };
 use wry::{Rect, WebView, WebViewBuilder};
 use wry::dpi::{LogicalPosition, LogicalSize};
+
+mod text_input;
 
 /// Logical pixel dimensions of the editor. Matches the vizia editor's
 /// [`vxn_ui_vizia::EDITOR_WIDTH`] / `_HEIGHT` so swapping backends doesn't reflow
@@ -51,13 +54,50 @@ pub struct EditorHandle {
     /// tick, then [`Self::flush_view_events`] once at the end — one
     /// `evaluate_script` per tick, not per event.
     buf: RefCell<Vec<ViewEvent>>,
+    /// Raw native parent (NSView on macOS, HWND on Windows, xcb window id
+    /// on Linux). Held for the editor's lifetime so the floating text-input
+    /// popup (0048) can centre over the host plugin window without
+    /// re-plumbing the parent through every ViewEvent.
+    parent: *mut c_void,
+    /// Controller post handle. The popup callback uses it to fire
+    /// [`UiEvent::TextInputResult`] back when the user commits / cancels.
+    ctrl: ControllerHandle,
+    /// Shared preset corpus snapshot the controller refreshes on every
+    /// disk-mutating preset op (0050). Serialized + pushed to JS at first
+    /// flush and on every [`ViewEvent::PresetCorpusChanged`] in the batch
+    /// so the browser panel stays in sync without a controller→view payload
+    /// channel for the full corpus.
+    corpus: CorpusHandle,
+    /// `false` until the first batch flush has carried a corpus snapshot.
+    /// On the next flush we always seed one so the page can render its
+    /// browser even before any user-side mutation fires.
+    corpus_seeded: Cell<bool>,
 }
 
 impl EditorHandle {
     /// Buffer one [`ViewEvent`] for the current tick. Flushed by
     /// [`Self::flush_view_events`]; nothing crosses into JS until then.
+    ///
+    /// [`ViewEvent::OpenTextInput`] is intercepted here and dispatched to
+    /// the native popup primitive (0048) — it never reaches the JS bridge.
+    /// On commit / cancel the popup posts [`UiEvent::TextInputResult`]
+    /// through the controller, which echoes [`ViewEvent::TextInputResult`]
+    /// back into this buffer for the page's pending-callback map.
     pub fn push_view_event(&self, event: ViewEvent) {
+        if let ViewEvent::OpenTextInput { id, title, initial } = event {
+            self.open_text_input(id, title, initial);
+            return;
+        }
         self.buf.borrow_mut().push(event);
+    }
+
+    fn open_text_input(&self, id: String, title: String, initial: String) {
+        let ctrl = self.ctrl.clone();
+        text_input::prompt_text(self.parent, &title, &initial, move |value| {
+            // Channel-full / disconnected: nothing useful to do — the
+            // popup is already torn down. Drop silently.
+            let _ = ctrl.post(UiEvent::TextInputResult { id, value });
+        });
     }
 
     /// Drain the batch into one `__vxn.applyViewEvents` call (or several, if
@@ -65,8 +105,30 @@ impl EditorHandle {
     /// id within the batch — only the latest value per param survives, which
     /// caps the bridge at one update per param per tick regardless of how
     /// many automation writes the audio thread did between ticks.
+    ///
+    /// Corpus seeding (0050): the preset corpus snapshot is sized like a
+    /// few hundred metas and never deduped, so it ships as a separate
+    /// `applyPresetCorpus` JS call rather than going through the
+    /// [`ViewEvent`] batch. We push it once at first flush and once per
+    /// flush that carries a [`ViewEvent::PresetCorpusChanged`].
     pub fn flush_view_events(&self) {
         let events = std::mem::take(&mut *self.buf.borrow_mut());
+        let needs_corpus = !self.corpus_seeded.get()
+            || events
+                .iter()
+                .any(|e| matches!(e, ViewEvent::PresetCorpusChanged { .. }));
+        if events.is_empty() && !needs_corpus {
+            return;
+        }
+        if needs_corpus {
+            if let Some(json) = self.serialize_corpus() {
+                let js = format!(
+                    "if(window.__vxn&&window.__vxn.applyPresetCorpus){{window.__vxn.applyPresetCorpus({json})}}"
+                );
+                let _ = self.webview.evaluate_script(&js);
+                self.corpus_seeded.set(true);
+            }
+        }
         if events.is_empty() {
             return;
         }
@@ -76,6 +138,13 @@ impl EditorHandle {
             );
             let _ = self.webview.evaluate_script(&js);
         }
+    }
+
+    /// Build the JSON corpus payload from the shared snapshot. Returns `None`
+    /// if the mutex was poisoned (caller skips the push; next flush retries).
+    fn serialize_corpus(&self) -> Option<String> {
+        let corpus = self.corpus.lock().ok()?;
+        Some(corpus_snapshot_json(&corpus))
     }
 
     /// Marker for shape parity with vizia's `WindowHandle::close` — the
@@ -96,8 +165,12 @@ impl EditorBackend for WebEditor {
     /// already extracts these per-platform in `gui::set_parent`.
     type ParentWindow = *mut c_void;
 
-    fn open(parent: Self::ParentWindow, ctrl: ControllerHandle) -> Self::Handle {
-        open_editor(parent, ctrl)
+    fn open(
+        parent: Self::ParentWindow,
+        ctrl: ControllerHandle,
+        corpus: CorpusHandle,
+    ) -> Self::Handle {
+        open_editor(parent, ctrl, corpus)
     }
 
     fn close(handle: &mut Self::Handle) {
@@ -119,10 +192,16 @@ impl EditorBackend for WebEditor {
 /// Build the WebView under `parent`, wire the IPC handler to `ctrl`, and load
 /// the faceplate page. `parent` is the same raw pointer the host hands the
 /// clack shell in `gui::set_parent` (NSView / HWND / xcb-window-id).
-pub fn open_editor(parent: *mut c_void, ctrl: ControllerHandle) -> EditorHandle {
-    let parent = ParentWindow { raw: build_raw(parent) };
+pub fn open_editor(
+    parent: *mut c_void,
+    ctrl: ControllerHandle,
+    corpus: CorpusHandle,
+) -> EditorHandle {
+    let parent_raw = parent;
+    let parent_wrap = ParentWindow { raw: build_raw(parent_raw) };
     let html = build_faceplate_html();
-    let webview = WebViewBuilder::new_as_child(&parent)
+    let ipc_ctrl = ctrl.clone();
+    let webview = WebViewBuilder::new_as_child(&parent_wrap)
         .with_html(html)
         .with_bounds(Rect {
             position: LogicalPosition::new(0i32, 0i32).into(),
@@ -130,12 +209,19 @@ pub fn open_editor(parent: *mut c_void, ctrl: ControllerHandle) -> EditorHandle 
         })
         .with_ipc_handler(move |req| {
             if let Some(ev) = parse_ui_event(req.body()) {
-                let _ = ctrl.post(ev);
+                let _ = ipc_ctrl.post(ev);
             }
         })
         .build()
         .expect("wry WebView build failed");
-    EditorHandle { webview, buf: RefCell::new(Vec::new()) }
+    EditorHandle {
+        webview,
+        buf: RefCell::new(Vec::new()),
+        parent: parent_raw,
+        ctrl,
+        corpus,
+        corpus_seeded: Cell::new(false),
+    }
 }
 
 /// Splice the runtime param-descriptor JSON into the faceplate template. The
@@ -297,6 +383,56 @@ fn parse_ui_event(body: &str) -> Option<UiEvent> {
                 index: v.get("index")?.as_u64()? as usize,
             },
         }),
+        // 0050: browser panel posts this when the user clicks a user-side
+        // preset row. `path` is the absolute on-disk path the corpus
+        // snapshot ships (`p.path` in `corpus_snapshot_json`).
+        "load_user" => Some(UiEvent::LoadPreset {
+            source: PresetSource::User {
+                path: std::path::PathBuf::from(v.get("path")?.as_str()?.to_owned()),
+            },
+        }),
+        // 0051: user-side mutation ops. Paths round-trip as strings the
+        // controller maps back to `PathBuf`; the controller is the only
+        // place that touches disk (refreshes the corpus and re-emits
+        // `PresetCorpusChanged` after each).
+        "rename_preset" => Some(UiEvent::RenamePreset {
+            path: std::path::PathBuf::from(v.get("path")?.as_str()?.to_owned()),
+            new_name: v.get("new_name")?.as_str()?.to_owned(),
+        }),
+        "delete_preset" => Some(UiEvent::DeletePreset {
+            path: std::path::PathBuf::from(v.get("path")?.as_str()?.to_owned()),
+        }),
+        "move_preset" => Some(UiEvent::MovePreset {
+            path: std::path::PathBuf::from(v.get("path")?.as_str()?.to_owned()),
+            // `dest_folder: null` moves to user root; any string names the
+            // destination subfolder.
+            dest_folder: v
+                .get("dest_folder")
+                .and_then(|x| x.as_str())
+                .map(str::to_owned),
+        }),
+        "rename_folder" => Some(UiEvent::RenameFolder {
+            old_name: v.get("old_name")?.as_str()?.to_owned(),
+            new_name: v.get("new_name")?.as_str()?.to_owned(),
+        }),
+        "delete_folder" => Some(UiEvent::DeleteFolder {
+            name: v.get("name")?.as_str()?.to_owned(),
+        }),
+        "new_folder" => Some(UiEvent::NewFolder {
+            suggested: v.get("suggested")?.as_str()?.to_owned(),
+        }),
+        // 0049: prev/next walker. `delta` is signed; the controller wraps
+        // against the combined Factory + User list it publishes.
+        "step_preset" => Some(UiEvent::StepPreset {
+            delta: v.get("delta")?.as_i64()? as i32,
+        }),
+        // 0049: Save As — name from the floating popup, folder from the
+        // browser panel's selection (0050+). For 0049 the page sends
+        // `folder: null` unconditionally → saves to user root.
+        "save_preset" => Some(UiEvent::SavePreset {
+            name: v.get("name")?.as_str()?.to_owned(),
+            folder: v.get("folder").and_then(|x| x.as_str()).map(str::to_owned),
+        }),
         "set_key_mode" => Some(UiEvent::SetKeyMode {
             mode: parse_key_mode(v.get("mode")?)?,
         }),
@@ -311,6 +447,21 @@ fn parse_ui_event(body: &str) -> Option<UiEvent> {
         // ViewEvents that raced ahead of the bootstrap script get re-sent
         // into a known-ready listener.
         "ready" => Some(UiEvent::EditorReady),
+        // 0048: faceplate asks for the floating text-input popup. The
+        // controller relays this as `ViewEvent::OpenTextInput`; the
+        // editor backend intercepts and pops the native window.
+        "request_text_input" => Some(UiEvent::RequestTextInput {
+            id: v.get("id")?.as_str()?.to_owned(),
+            title: v.get("title")?.as_str()?.to_owned(),
+            initial: v.get("initial")?.as_str().unwrap_or("").to_owned(),
+        }),
+        // Reserved for direct page-side posts (in-page tests, or a future
+        // platform where the popup lives JS-side). Production flow on
+        // macOS routes through the native popup → `ctrl.post` instead.
+        "text_input_result" => Some(UiEvent::TextInputResult {
+            id: v.get("id")?.as_str()?.to_owned(),
+            value: v.get("value").and_then(|x| x.as_str()).map(|s| s.to_owned()),
+        }),
         _ => None,
     }
 }
@@ -415,8 +566,87 @@ fn view_event_to_json(ev: &ViewEvent) -> String {
             "kind": "status",
             "line": line,
         }),
+        // OpenTextInput is intercepted in `push_view_event` before
+        // batching, so this arm is unreachable on the happy path. Serialize
+        // a benign marker rather than `panic!` so a future refactor that
+        // leaks it into the buffer fails closed (JS dispatcher ignores
+        // unknown `kind`s).
+        ViewEvent::OpenTextInput { id, title, initial } => json!({
+            "kind": "open_text_input",
+            "id": id,
+            "title": title,
+            "initial": initial,
+        }),
+        ViewEvent::TextInputResult { id, value } => json!({
+            "kind": "text_input_result",
+            "id": id,
+            "value": value,
+        }),
     };
     v.to_string()
+}
+
+/// Serialize a [`PresetCorpus`] for the JS browser panel (0050). Factory
+/// presets are grouped by `meta.category` (presets without a category fall
+/// into [`UNCATEGORIZED`]); user folders preserve their `Option<String>`
+/// shape so the page can show "Uncategorised" first then sorted named
+/// folders. Within each group, presets are alpha-sorted by name
+/// (case-insensitive) — same order the prev/next walker uses.
+fn corpus_snapshot_json(corpus: &PresetCorpus) -> String {
+    use serde_json::{Value, json};
+
+    let mut factory_groups: HashMap<String, Vec<(usize, &str)>> = HashMap::new();
+    for (i, m) in corpus.factory.iter().enumerate() {
+        let cat = m
+            .category
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(UNCATEGORIZED)
+            .to_string();
+        factory_groups
+            .entry(cat)
+            .or_default()
+            .push((i, m.name.as_str()));
+    }
+    let mut factory: Vec<(String, Vec<(usize, &str)>)> = factory_groups.into_iter().collect();
+    factory.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    for g in factory.iter_mut() {
+        g.1.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+    }
+    let factory_v: Vec<Value> = factory
+        .into_iter()
+        .map(|(category, presets)| {
+            let entries: Vec<Value> = presets
+                .into_iter()
+                .map(|(idx, name)| json!({"name": name, "index": idx}))
+                .collect();
+            json!({"category": category, "presets": entries})
+        })
+        .collect();
+
+    let mut user = corpus.user.clone();
+    user.sort_by(|a, b| match (&a.name, &b.name) {
+        (None, None) => std::cmp::Ordering::Equal,
+        (None, _) => std::cmp::Ordering::Less,
+        (_, None) => std::cmp::Ordering::Greater,
+        (Some(x), Some(y)) => x.to_lowercase().cmp(&y.to_lowercase()),
+    });
+    let user_v: Vec<Value> = user
+        .into_iter()
+        .map(|f| {
+            let mut presets = f.presets;
+            presets.sort_by(|a, b| a.meta.name.to_lowercase().cmp(&b.meta.name.to_lowercase()));
+            let entries: Vec<Value> = presets
+                .into_iter()
+                .map(|p| {
+                    json!({"name": p.meta.name, "path": p.path.display().to_string()})
+                })
+                .collect();
+            json!({"name": f.name, "presets": entries})
+        })
+        .collect();
+    json!({"factory": factory_v, "user": user_v}).to_string()
 }
 
 fn preset_source_json(src: Option<&PresetSource>) -> serde_json::Value {
@@ -468,6 +698,69 @@ mod tests {
     }
 
     #[test]
+    fn parses_mutation_ops() {
+        // 0051: each of the user-side mutation flows posts a dedicated
+        // op. The controller already handles the matching UiEvents.
+        let ev = parse_ui_event(
+            r#"{"op":"rename_preset","path":"/u/x.preset","new_name":"Y"}"#,
+        ).unwrap();
+        match ev {
+            UiEvent::RenamePreset { path, new_name } => {
+                assert_eq!(path, PathBuf::from("/u/x.preset"));
+                assert_eq!(new_name, "Y");
+            }
+            _ => panic!("wrong variant: {ev:?}"),
+        }
+        let ev = parse_ui_event(r#"{"op":"delete_preset","path":"/u/x.preset"}"#).unwrap();
+        assert!(matches!(ev, UiEvent::DeletePreset { ref path } if path == &PathBuf::from("/u/x.preset")));
+        let ev = parse_ui_event(
+            r#"{"op":"move_preset","path":"/u/x.preset","dest_folder":"Bass"}"#,
+        ).unwrap();
+        match ev {
+            UiEvent::MovePreset { path, dest_folder } => {
+                assert_eq!(path, PathBuf::from("/u/x.preset"));
+                assert_eq!(dest_folder.as_deref(), Some("Bass"));
+            }
+            _ => panic!("wrong variant: {ev:?}"),
+        }
+        // dest_folder: null routes to user root.
+        let ev = parse_ui_event(
+            r#"{"op":"move_preset","path":"/u/x.preset","dest_folder":null}"#,
+        ).unwrap();
+        assert!(matches!(
+            ev,
+            UiEvent::MovePreset { dest_folder: None, .. },
+        ));
+        let ev = parse_ui_event(
+            r#"{"op":"rename_folder","old_name":"Bass","new_name":"Bassline"}"#,
+        ).unwrap();
+        match ev {
+            UiEvent::RenameFolder { old_name, new_name } => {
+                assert_eq!(old_name, "Bass");
+                assert_eq!(new_name, "Bassline");
+            }
+            _ => panic!("wrong variant: {ev:?}"),
+        }
+        let ev = parse_ui_event(r#"{"op":"delete_folder","name":"Bass"}"#).unwrap();
+        assert!(matches!(ev, UiEvent::DeleteFolder { ref name } if name == "Bass"));
+        let ev = parse_ui_event(r#"{"op":"new_folder","suggested":"Pads"}"#).unwrap();
+        assert!(matches!(ev, UiEvent::NewFolder { ref suggested } if suggested == "Pads"));
+    }
+
+    #[test]
+    fn parses_user_load() {
+        // 0050: browser panel posts `load_user` with the absolute path
+        // from the corpus snapshot when the user clicks a user-side row.
+        let ev = parse_ui_event(r#"{"op":"load_user","path":"/u/p/Bass/My Patch.preset"}"#).unwrap();
+        match ev {
+            UiEvent::LoadPreset { source: PresetSource::User { path } } => {
+                assert_eq!(path, PathBuf::from("/u/p/Bass/My Patch.preset"));
+            }
+            _ => panic!("wrong variant: {ev:?}"),
+        }
+    }
+
+    #[test]
     fn parses_layer_and_key_mode() {
         let ev = parse_ui_event(r#"{"op":"set_edit_layer","layer":"lower"}"#).unwrap();
         assert!(matches!(ev, UiEvent::SetEditLayer { layer: Layer::Lower }));
@@ -480,6 +773,45 @@ mod tests {
         assert!(parse_ui_event("not json").is_none());
         assert!(parse_ui_event(r#"{"op":"unknown"}"#).is_none());
         assert!(parse_ui_event(r#"{"op":"set_param_norm","id":42}"#).is_none());
+    }
+
+    #[test]
+    fn parses_step_preset_signed_delta() {
+        // 0049: prev posts -1, next posts +1. delta is signed so the parser
+        // must accept negative values.
+        let ev = parse_ui_event(r#"{"op":"step_preset","delta":-1}"#).unwrap();
+        assert!(matches!(ev, UiEvent::StepPreset { delta: -1 }));
+        let ev = parse_ui_event(r#"{"op":"step_preset","delta":1}"#).unwrap();
+        assert!(matches!(ev, UiEvent::StepPreset { delta: 1 }));
+    }
+
+    #[test]
+    fn parses_save_preset_with_and_without_folder() {
+        // 0049: Save As. `folder: null` saves to user root; a string
+        // names the destination subfolder (0050+ sources this from the
+        // browser panel's selection).
+        let ev = parse_ui_event(
+            r#"{"op":"save_preset","name":"Pad 1","folder":null}"#,
+        )
+        .unwrap();
+        match ev {
+            UiEvent::SavePreset { name, folder } => {
+                assert_eq!(name, "Pad 1");
+                assert!(folder.is_none());
+            }
+            _ => panic!("wrong variant: {ev:?}"),
+        }
+        let ev = parse_ui_event(
+            r#"{"op":"save_preset","name":"Brassy","folder":"Lead"}"#,
+        )
+        .unwrap();
+        match ev {
+            UiEvent::SavePreset { name, folder } => {
+                assert_eq!(name, "Brassy");
+                assert_eq!(folder.as_deref(), Some("Lead"));
+            }
+            _ => panic!("wrong variant: {ev:?}"),
+        }
     }
 
     fn param_changed(id: usize, plain: f32) -> ViewEvent {
@@ -764,13 +1096,295 @@ mod tests {
     }
 
     #[test]
+    fn faceplate_text_input_bridge_wired() {
+        // 0048: faceplate exposes `window.vxn.promptText(title, initial,
+        // cb)` and the dispatcher routes `text_input_result` back to the
+        // pending callback. JS plumbing only — the actual NSWindow is
+        // verified by running the plugin in-DAW (see ticket Acceptance).
+        assert!(PLACEHOLDER_HTML.contains("window.vxn.promptText"));
+        assert!(PLACEHOLDER_HTML.contains("_textInputCallbacks"));
+        assert!(PLACEHOLDER_HTML.contains("op: 'request_text_input'"));
+        assert!(PLACEHOLDER_HTML.contains("ev.kind === 'text_input_result'"));
+    }
+
+    #[test]
+    fn parses_request_and_result_text_input() {
+        // Faceplate → controller: `request_text_input` carries the
+        // correlation id + title + initial.
+        let ev = parse_ui_event(
+            r#"{"op":"request_text_input","id":"ti1","title":"Rename","initial":"Pad 1"}"#,
+        )
+        .unwrap();
+        match ev {
+            UiEvent::RequestTextInput { id, title, initial } => {
+                assert_eq!(id, "ti1");
+                assert_eq!(title, "Rename");
+                assert_eq!(initial, "Pad 1");
+            }
+            _ => panic!("wrong variant: {ev:?}"),
+        }
+        // Direct page-side result post (in-page tests): null `value`
+        // round-trips as `None`, string round-trips as `Some`.
+        let ev = parse_ui_event(r#"{"op":"text_input_result","id":"ti1","value":null}"#).unwrap();
+        assert!(matches!(
+            ev,
+            UiEvent::TextInputResult { ref id, value: None } if id == "ti1"
+        ));
+        let ev = parse_ui_event(
+            r#"{"op":"text_input_result","id":"ti2","value":"new name"}"#,
+        )
+        .unwrap();
+        match ev {
+            UiEvent::TextInputResult { id, value } => {
+                assert_eq!(id, "ti2");
+                assert_eq!(value.as_deref(), Some("new name"));
+            }
+            _ => panic!("wrong variant: {ev:?}"),
+        }
+    }
+
+    #[test]
+    fn text_input_result_serializes() {
+        // Controller → page: commit echoes the string; cancel echoes
+        // null (JS dispatcher fires the pending callback with null).
+        let s = view_event_to_json(&ViewEvent::TextInputResult {
+            id: "ti9".into(),
+            value: Some("Pad 1".into()),
+        });
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["kind"], "text_input_result");
+        assert_eq!(v["id"], "ti9");
+        assert_eq!(v["value"], "Pad 1");
+
+        let s = view_event_to_json(&ViewEvent::TextInputResult {
+            id: "ti10".into(),
+            value: None,
+        });
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(v["value"].is_null());
+    }
+
+    #[test]
     fn faceplate_status_pill_wired() {
-        // 0046: Status ViewEvent flashes a pill in the lower-right corner.
+        // 0046: Status ViewEvent flashes the status chip. 0049 re-anchored
+        // it from the lower-right corner into the preset bar; the
+        // `.status-pill` class + `statusPill.flash` API are unchanged so
+        // the bridge contract here stays the same.
         assert!(PLACEHOLDER_HTML.contains(".status-pill"));
         assert!(PLACEHOLDER_HTML.contains(".status-pill.visible"));
         assert!(PLACEHOLDER_HTML.contains("statusPill"));
         assert!(PLACEHOLDER_HTML.contains("statusPill.flash"));
         assert!(PLACEHOLDER_HTML.contains("ev.kind === 'status'"));
+    }
+
+    #[test]
+    fn faceplate_preset_bar_wired() {
+        // 0049: preset bar replaces the empty placeholder div. Markup
+        // carries the current-name slot, prev/next walker buttons, the
+        // Browse toggle, the Save As button, and the in-bar status chip.
+        for id in [
+            "id=\"pbar-prev\"",
+            "id=\"pbar-name\"",
+            "id=\"pbar-next\"",
+            "id=\"pbar-browse\"",
+            "id=\"pbar-save\"",
+            "id=\"pbar-status\"",
+        ] {
+            assert!(PLACEHOLDER_HTML.contains(id), "preset bar missing {id}");
+        }
+        // JS bridge: prev/next post `step_preset` with signed delta; Save
+        // As funnels through the 0048 popup then posts `save_preset` with
+        // `folder: null`; preset_loaded sets the name.
+        assert!(PLACEHOLDER_HTML.contains("op: 'step_preset'"));
+        assert!(PLACEHOLDER_HTML.contains("delta: -1"));
+        assert!(PLACEHOLDER_HTML.contains("delta: 1"));
+        assert!(PLACEHOLDER_HTML.contains("op: 'save_preset'"));
+        // Save As funnels through the in-WebView modal (name field +
+        // folder dropdown) rather than going straight through the native
+        // popup. The modal posts `save_preset` directly; presetBar just
+        // opens it. `browserPanel.getSaveFolder()` is still exposed for
+        // other call sites but no longer the Save As path.
+        assert!(PLACEHOLDER_HTML.contains("browserPanel.openSaveAs"));
+        assert!(PLACEHOLDER_HTML.contains("ev.kind === 'preset_loaded'"));
+        assert!(PLACEHOLDER_HTML.contains("presetBar.setName"));
+        // 0050: Browse toggles the panel itself; `_browserOpen` mirrors
+        // open/close so external code (tests, integrations) can observe it.
+        assert!(PLACEHOLDER_HTML.contains("browserPanel.setOpen"));
+        assert!(PLACEHOLDER_HTML.contains("window.vxn._browserOpen"));
+    }
+
+    #[test]
+    fn faceplate_browser_mutation_flows_wired() {
+        // 0051: every mutation op the controller exposes has a JS post
+        // site inside the browser panel. The IIFE wires:
+        // - Rename: posts `rename_preset` / `rename_folder` via the
+        //   text-input popup.
+        // - Delete: modal confirm posts `delete_preset` / `delete_folder`
+        //   (the Vizia version's two-click row-armed pattern was scrapped
+        //   here — the right-click menu obscured the row text).
+        // - Move to: submenu posts `move_preset` with the destination
+        //   folder (or null for user root).
+        // - New Folder: "+ New" button on the user header posts
+        //   `new_folder` after the popup commits.
+        assert!(PLACEHOLDER_HTML.contains("op: 'rename_preset'"));
+        assert!(PLACEHOLDER_HTML.contains("op: 'rename_folder'"));
+        assert!(PLACEHOLDER_HTML.contains("op: 'delete_preset'"));
+        assert!(PLACEHOLDER_HTML.contains("op: 'delete_folder'"));
+        assert!(PLACEHOLDER_HTML.contains("op: 'move_preset'"));
+        assert!(PLACEHOLDER_HTML.contains("op: 'new_folder'"));
+        // Modal confirm primitive present; ESC tears down modal → menu →
+        // panel in that order (one level per press).
+        assert!(PLACEHOLDER_HTML.contains("openDeleteConfirm"));
+        assert!(PLACEHOLDER_HTML.contains(".browser-modal"));
+        assert!(PLACEHOLDER_HTML.contains(".browser-modal-backdrop"));
+        assert!(PLACEHOLDER_HTML.contains("if (modalEl)"));
+        // Right-click hooks on both row types (factory rows must not
+        // attach one — the JS gates by selectedFolder.kind / key.kind).
+        assert!(PLACEHOLDER_HTML.contains("'contextmenu'"));
+        // Move-to submenu helper present; mirrors `vxn_ui_vizia::move_targets`.
+        assert!(PLACEHOLDER_HTML.contains("moveTargets(currentName)"));
+        assert!(PLACEHOLDER_HTML.contains(".browser-menu"));
+        assert!(PLACEHOLDER_HTML.contains(".browser-submenu"));
+        assert!(PLACEHOLDER_HTML.contains(".browser-new-folder"));
+    }
+
+    #[test]
+    fn faceplate_save_as_modal_wired() {
+        // Save As modal hosts a name field (captured via the native
+        // popup for spacebar-safe entry) + a folder dropdown over user
+        // folders. The modal posts `save_preset { name, folder }`.
+        assert!(PLACEHOLDER_HTML.contains("openSaveAsModal"));
+        // The name field reuses `promptText` so Space and friends still
+        // route through the native NSWindow on macOS.
+        assert!(PLACEHOLDER_HTML.contains("window.vxn.promptText('Preset name'"));
+        // Folder choices come from a `<select>` populated from the corpus.
+        assert!(PLACEHOLDER_HTML.contains("folderOptions"));
+        assert!(PLACEHOLDER_HTML.contains(".save-as-select"));
+        // Modal anchors over the faceplate, not the browser panel — so
+        // Save As works whether the browser is open or not.
+        assert!(PLACEHOLDER_HTML.contains("getElementById('faceplate').appendChild(wrap)"));
+        // openModal's extendActions hook gates the Save button on a
+        // valid (non-empty) name.
+        assert!(PLACEHOLDER_HTML.contains("extendActions"));
+        assert!(PLACEHOLDER_HTML.contains(".browser-modal-btn:disabled"));
+    }
+
+    #[test]
+    fn faceplate_browser_search_is_cross_folder() {
+        // Non-empty query: the right pane switches to flat search results
+        // covering the whole corpus (factory + user) instead of filtering
+        // within the selected folder only.
+        assert!(PLACEHOLDER_HTML.contains("collectSearchHits"));
+        assert!(PLACEHOLDER_HTML.contains("'Factory · '"));
+        assert!(PLACEHOLDER_HTML.contains("'User · '"));
+        // Search-mode row carries name + muted origin label.
+        assert!(PLACEHOLDER_HTML.contains(".browser-row.search-row"));
+        assert!(PLACEHOLDER_HTML.contains(".browser-row-origin"));
+    }
+
+    #[test]
+    fn faceplate_browser_panel_wired() {
+        // 0050: floating two-pane browser. Markup carries the search input,
+        // the folders + presets panes, and the click-outside backdrop. The
+        // panel and its backdrop start hidden (`hidden` attribute, toggled
+        // by `setOpen`).
+        for needle in [
+            r#"id="browser-panel""#,
+            r#"id="browser-backdrop""#,
+            r#"id="browser-folders""#,
+            r#"id="browser-presets""#,
+            r#"id="browser-search-input""#,
+            r#"id="browser-search-clear""#,
+        ] {
+            assert!(PLACEHOLDER_HTML.contains(needle), "browser panel missing {needle}");
+        }
+        // JS module + Rust→JS corpus channel.
+        assert!(PLACEHOLDER_HTML.contains("const browserPanel"));
+        assert!(PLACEHOLDER_HTML.contains("window.__vxn.applyPresetCorpus"));
+        // Bootstrap stub funnels the first snapshot into `_earlyPresetCorpus`
+        // so any corpus push that races init() is replayed.
+        assert!(PLACEHOLDER_HTML.contains("_earlyPresetCorpus"));
+        // Click handlers: folder click rerenders presets, preset click posts
+        // load_factory or load_user (browser panel routes by folder kind).
+        assert!(PLACEHOLDER_HTML.contains("op: 'load_factory'"));
+        assert!(PLACEHOLDER_HTML.contains("op: 'load_user'"));
+        // Dismissal: ESC + outside-click backdrop both close the panel.
+        assert!(PLACEHOLDER_HTML.contains("e.key !== 'Escape'"));
+        assert!(PLACEHOLDER_HTML.contains("backdropEl.addEventListener('click'"));
+        // Highlight: preset_loaded fans `source` into the panel's
+        // currently-loaded marker.
+        assert!(PLACEHOLDER_HTML.contains("browserPanel.setCurrentSource"));
+        // Section headers match the Vizia browser's labels.
+        assert!(PLACEHOLDER_HTML.contains("'FACTORY'"));
+        assert!(PLACEHOLDER_HTML.contains("'USER'"));
+    }
+
+    #[test]
+    fn corpus_snapshot_groups_and_sorts() {
+        use vxn_app::{UserFolderEntry, UserPresetEntry};
+        let factory = vec![
+            PresetMeta { name: "zeta".into(), category: Some("Lead".into()), ..Default::default() },
+            PresetMeta { name: "Alpha".into(), category: Some("Lead".into()), ..Default::default() },
+            PresetMeta { name: "Pad-A".into(), category: Some("Pad".into()), ..Default::default() },
+            PresetMeta { name: "loose".into(), category: None, ..Default::default() },
+        ];
+        let user = vec![
+            UserFolderEntry {
+                name: Some("Bass".into()),
+                presets: vec![
+                    UserPresetEntry {
+                        path: PathBuf::from("/u/Bass/B.preset"),
+                        meta: PresetMeta { name: "B".into(), ..Default::default() },
+                        folder: Some("Bass".into()),
+                    },
+                    UserPresetEntry {
+                        path: PathBuf::from("/u/Bass/a.preset"),
+                        meta: PresetMeta { name: "a".into(), ..Default::default() },
+                        folder: Some("Bass".into()),
+                    },
+                ],
+            },
+            UserFolderEntry {
+                name: None,
+                presets: vec![UserPresetEntry {
+                    path: PathBuf::from("/u/loose.preset"),
+                    meta: PresetMeta { name: "loose".into(), ..Default::default() },
+                    folder: None,
+                }],
+            },
+            UserFolderEntry {
+                name: Some("Aux".into()),
+                presets: vec![],
+            },
+        ];
+        let corpus = vxn_app::PresetCorpus { factory, user };
+        let s = corpus_snapshot_json(&corpus);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        // Factory groups sorted by category (case-insensitive), each
+        // group's presets sorted by name.
+        let fac = v["factory"].as_array().unwrap();
+        let cats: Vec<&str> = fac.iter().map(|g| g["category"].as_str().unwrap()).collect();
+        assert_eq!(cats, vec!["Lead", "Pad", UNCATEGORIZED]);
+        let lead = fac[0]["presets"].as_array().unwrap();
+        assert_eq!(lead[0]["name"], "Alpha");
+        assert_eq!(lead[1]["name"], "zeta");
+        // Factory index points back into the original corpus order
+        // (so `load_factory { index }` works).
+        assert_eq!(lead[0]["index"], 1);
+        assert_eq!(lead[1]["index"], 0);
+        // Uncategorised group carries the orphan factory preset.
+        assert_eq!(fac[2]["presets"][0]["name"], "loose");
+
+        // User folders: root (None) first, then sorted named folders;
+        // each folder's presets sorted by name.
+        let user = v["user"].as_array().unwrap();
+        assert!(user[0]["name"].is_null(), "root folder must come first");
+        assert_eq!(user[1]["name"], "Aux");
+        assert_eq!(user[2]["name"], "Bass");
+        let bass = user[2]["presets"].as_array().unwrap();
+        assert_eq!(bass[0]["name"], "a");
+        assert_eq!(bass[1]["name"], "B");
+        assert_eq!(bass[0]["path"], "/u/Bass/a.preset");
     }
 
     // ── Row 1 + Row 2 control mount points (0041, 0041a, 0042, 0043) ────

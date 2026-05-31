@@ -22,3 +22,31 @@ raw-window-handle = "0.6"
 # IPC payloads are JSON; the bridge stays small enough that hand-rolled
 # matching beats pulling serde derives down into vxn-app.
 serde_json = "1"
+
+# Floating NSWindow text-input popup (0048): pinned objc 0.2 — same major
+# vxn-clap uses for its parent NSView introspection, so the toolchain is
+# already happy with the deprecated `msg_send!` expansion. NSTextField key
+# handling needs a small declared subclass; objc 0.2's `declare::ClassDecl`
+# covers it without pulling cocoa.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc = "0.2"
+
+# Floating Win32 popup (0048, Windows side): subclass an EDIT control inside
+# a WS_POPUP owner-anchored to the host HWND so VK_RETURN / VK_ESCAPE bypass
+# the host's transport key swallow. windows-sys 0.61 is already in wry's
+# dep tree, so the version pin doesn't bloat the lockfile.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_System_LibraryLoader",
+    "Win32_Graphics_Gdi",
+] }
+
+[lints.rust]
+# The `objc` 0.2 `msg_send!`/`sel_impl!` macros expand to a deprecated
+# `#[cfg(feature = "cargo-clippy")]`, which trips `unexpected_cfgs` under
+# `cargo clippy`. Mirror vxn-clap's suppression so the popup module
+# doesn't surface noise from the macro expansion.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }

@@ -10,7 +10,6 @@ use clack_extensions::gui::*;
 #[cfg(feature = "webview")]
 use clack_extensions::timer::HostTimer;
 use clack_plugin::prelude::*;
-#[cfg(feature = "vizia")]
 use std::sync::Arc;
 #[cfg(feature = "vizia")]
 use vxn_app::ParamModel;
@@ -152,12 +151,14 @@ impl PluginGuiImpl for VxnMainThread<'_> {
         }
         #[cfg(feature = "webview")]
         {
-            // The webview backend only needs the parent and a controller
-            // handle. View-event drain + controller tick are driven from the
-            // host's main-thread timer (registered below) instead of an
-            // editor-internal idle hook.
+            // The webview backend takes the parent, a controller handle, and
+            // the shared preset-corpus snapshot (0050) — the editor's browser
+            // panel re-reads this on every `PresetCorpusChanged`. View-event
+            // drain + controller tick are driven from the host's main-thread
+            // timer (registered below), not an editor-internal idle hook.
             let ctrl_handle = crate::lock_mut(&self.controller).handle();
-            self.gui = Some(vxn_editor::open_editor(parent, ctrl_handle));
+            let corpus = Arc::clone(&self.corpus);
+            self.gui = Some(vxn_editor::open_editor(parent, ctrl_handle, corpus));
 
             // Register a periodic main-thread timer so `on_timer` can drain
             // ViewEvents into the WebView. Hosts without `timer-support`
