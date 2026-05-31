@@ -18,13 +18,13 @@ events from the controller.
 
 ## Status
 
-**Partially complete.** This commit lands the infrastructure (timer
-pump, descriptor push, dispatch) plus Osc 1. Osc 2, Mixer, and the
-remaining three primitives roll into a follow-up (0041a).
+**Complete.** Infrastructure (timer pump, descriptor push, dispatch)
+plus all five primitives and the three Row-1 oscillator/mixer panels
+landed across the 0041 + 0041a commits.
 
 ## Acceptance criteria
 
-- [ ] JS control primitives implemented:
+- [x] JS control primitives implemented:
       - [x] `Fader(id, label)` — vertical slider, pointer down/up
             brackets `BeginGesture` / `EndGesture`, drag posts
             `SetParamNorm`. Uses pointer-capture so the drag tracks
@@ -32,20 +32,26 @@ remaining three primitives roll into a follow-up (0041a).
       - [x] `WaveformKnob(id, label)` — rotary selector with the same
             glyph set as `wave_points` (Sine, Tri, Saw, Pulse, etc.).
             Glyphs arranged on a -120°…+120° arc; click selects.
-      - [ ] `Switch(id, label)` — vertical toggle for bools.
-      - [ ] `ButtonGroup(id, label, variants)` — for Oversample,
-            CrossModType, AssignMode.
-      - [ ] `Dropdown(id, label, variants)` — fallback for any other
-            multi-variant enum.
+      - [x] `Switch(id, label)` — vertical toggle for bools; also
+            renders a 2-variant enum (NoiseColor etc.) as two
+            exclusive labelled toggles, matching vizia's
+            `Ctl::Switch`. Click brackets begin/end gestures.
+      - [x] `ButtonGroup(id, label, variants)` — for Oversample,
+            CrossModType, AssignMode. Vertical stack of labelled
+            toggles under the column label.
+      - [x] `Dropdown(id, label, variants)` — native `<select>`
+            fallback styled to the dark palette.
 - [x] Osc 1 panel renders Wave (rotary), Oct (fader), Semi (fader),
       Fine (fader), PW (fader). Layer hard-bound to Upper; the
       Upper/Lower edit-layer toggle is deferred to 0045 along with
       the Voice panel.
-- [ ] Osc 2 panel — identical control set, different param IDs.
-      Deferred to 0041a; the primitives + plumbing are reusable.
-- [ ] Mixer panel — four faders (Osc1, Osc2, Ring, Noise) + Col
-      switch (White/Pink, two-variant enum). Deferred to 0041a
-      (needs the Switch primitive).
+- [x] Osc 2 panel — identical control set, different param IDs
+      (`osc2_*`). Reuses the Osc 1 mount markup verbatim.
+- [x] Mixer panel — four faders (Osc1, Osc2, Ring, Noise) + Col
+      switch (White/Pink, two-variant enum). The Col switch sits in
+      a new `.panel-strip` (absolutely placed at the bottom of the
+      panel, mirroring vizia's bottom-strip layout) so it never
+      competes for ctl-column flex space.
 - [x] Each control's value display reads from the descriptor
       `display` string carried in the `ParamChanged` ViewEvent (the
       Vizia formatting routes through the same controller path).
@@ -59,13 +65,11 @@ remaining three primitives roll into a follow-up (0041a).
       WaveformKnob's discrete write is wrapped in a `begin/end`
       pair too so the host records one edit, not zero.
 
-## Follow-up: 0041a
+## Follow-up: 0041a (landed in this ticket)
 
-- Switch / ButtonGroup / Dropdown primitives (CSS + JS pattern is
-  set by Fader; mostly mechanical).
-- Osc 2 panel (clone of Osc 1 with `osc2_*` param names).
-- Mixer panel (Osc1Level/Osc2Level/RingLevel/NoiseLevel faders +
-  NoiseColor switch).
+- [x] Switch / ButtonGroup / Dropdown primitives.
+- [x] Osc 2 panel.
+- [x] Mixer panel (faders + NoiseColor switch in `.panel-strip`).
 
 ## Architecture notes (kept here for the follow-ups)
 
