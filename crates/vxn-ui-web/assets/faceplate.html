@@ -1089,6 +1089,11 @@ function makeSwitch(el, id, desc) {
 function makeButtonGroup(el, id, desc) {
   const label = el.dataset.label || desc.label;
   const variants = desc.variants || [];
+  // Tag the cell so `.ctl-buttongroup .ctl-tg-rows { flex-direction: column }`
+  // kicks in — without this the inline-flex `.ctl-tg-row` children flow
+  // horizontally and overflow the column. The shape (vertical alongside
+  // faders inside panel-body) matches vizia's `enum_list_body`.
+  el.classList.add('ctl-buttongroup');
   el.innerHTML =
     '<div class="ctl-label">' + label.toUpperCase() + '</div>' +
     '<div class="ctl-tg-rows"></div>';
@@ -1117,6 +1122,7 @@ function makeButtonGroup(el, id, desc) {
 function makeDropdown(el, id, desc) {
   const label = el.dataset.label || desc.label;
   const variants = desc.variants || [];
+  el.classList.add('ctl-dropdown');
   el.innerHTML =
     '<div class="ctl-label">' + label.toUpperCase() + '</div>' +
     '<select></select>';
