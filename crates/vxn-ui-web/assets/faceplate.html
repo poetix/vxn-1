@@ -302,6 +302,15 @@ html, body {
 }
 .panel-strip > * { pointer-events: auto; }
 
+/* Master's strip stacks Oversample (horizontal toggle row) over Limit
+   (single toggle) — `panel-strip` defaults to a single horizontal row,
+   so this is the one panel that overrides it. */
+.master-strip {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+}
+
 /* Toggle row — small box + inline label. Matches vizia .tg-row /
    .tg-box / .tg-lbl exactly (#1f9cff active fill, 9×9 box, 7 px label). */
 .ctl-tg-row {
@@ -744,16 +753,22 @@ html, body {
         <div class="ctl-strip" data-control="switch" data-param="delay_pingpong" data-label="P-Pong"></div>
       </div>
     </div>
-    <!-- Master (0045): Tune/Volume faders, Limit (bare on/off — no column
-         header, like vxn-ui-vizia's `limiter_cell`), Oversample buttongroup
-         (descriptor labels: O/S OFF / 2x / 4x / 8x). -->
+    <!-- Master (0045): Tune/Volume faders in the body; Oversample (4 enum
+         variants: O/S OFF / 2x / 4x / 8x) renders as a horizontal row of
+         labelled toggles at the bottom of the panel (matches
+         `vxn_ui_vizia::in_bottom_strip` for Oversample), with the Limit
+         switch stacked underneath in its own row. The vertical strip
+         layout overrides the panel-strip's default `flex-direction: row`
+         (see `.master-strip` below). -->
     <div class="panel" data-name="Master">
       <div class="panel-header">MASTER</div>
       <div class="panel-body">
         <div class="ctl" data-control="fader" data-param="master_tune" data-label="Tune"></div>
         <div class="ctl" data-control="fader" data-param="master_volume" data-label="Volume"></div>
-        <div class="ctl" data-control="switch" data-param="limiter_on" data-label="Limit"></div>
-        <div class="ctl" data-control="buttongroup" data-param="oversample" data-label="OvSmp"></div>
+      </div>
+      <div class="panel-strip master-strip">
+        <div class="ctl-strip" data-control="switch" data-param="oversample" data-label="OvSmp"></div>
+        <div class="ctl-strip" data-control="switch" data-param="limiter_on" data-label="Limit"></div>
       </div>
     </div>
   </div>

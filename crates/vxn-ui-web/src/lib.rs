@@ -745,10 +745,10 @@ mod tests {
             ("detune-legato", "unison_detune",   "Detune"),
             ("fader",         "portamento_time", "Glide"),
             // Master
-            ("fader",       "master_tune",   "Tune"),
-            ("fader",       "master_volume", "Volume"),
-            ("switch",      "limiter_on",    "Limit"),
-            ("buttongroup", "oversample",    "OvSmp"),
+            ("fader",  "master_tune",   "Tune"),
+            ("fader",  "master_volume", "Volume"),
+            ("switch", "oversample",    "OvSmp"),
+            ("switch", "limiter_on",    "Limit"),
             // Chorus
             ("header-switch", "chorus_on",    ""),
             ("fader",         "chorus_rate",  "Rate"),
@@ -812,13 +812,16 @@ mod tests {
         // Switches:
         //   Row 1: 4 (LfoSync, Lfo2Sync, Lfo1FreeRun, NoiseColor)
         //   Row 2: 5 (Env1Shape, Env2Shape, Gate, Slope, KeyTrk)
-        //   Row 4: 3 (LimiterOn, DelaySync, DelayPingPong)
-        //   Total = 12.
+        //   Row 4: 4 (Oversample as multi-toggle row, LimiterOn,
+        //            DelaySync, DelayPingPong)
+        //   Total = 13.
         // Button groups:
         //   Row 2: 2 (AmpLfoSrc, FilterMode)
         //   Row 3: 6 (Pitch/PWM LFO+Env sources, CrossModType, Osc2PitchEnvSrc)
-        //   Row 4: 2 (AssignMode, Oversample)
-        //   Total = 10.
+        //   Row 4: 1 (AssignMode) — Oversample renders as a horizontal
+        //     switch row at the bottom of Master, not a vertical
+        //     buttongroup column.
+        //   Total = 9.
         // Header switches: 2 (Chorus, Delay).
         // Detune-Legato composite: 1 (Voice).
         assert_eq!(
@@ -833,13 +836,13 @@ mod tests {
         );
         assert_eq!(
             PLACEHOLDER_HTML.matches(r#"data-control="switch""#).count(),
-            12,
-            "expected 12 switch cells (Row 1 + Row 2 + Row 4)",
+            13,
+            "expected 13 switch cells (Row 1 + Row 2 + Row 4)",
         );
         assert_eq!(
             PLACEHOLDER_HTML.matches(r#"data-control="buttongroup""#).count(),
-            10,
-            "expected 10 buttongroup cells (Row 2 + Row 3 + Row 4)",
+            9,
+            "expected 9 buttongroup cells (Row 2 + Row 3 + Row 4)",
         );
         assert_eq!(
             PLACEHOLDER_HTML.matches(r#"data-control="dropdown""#).count(),
