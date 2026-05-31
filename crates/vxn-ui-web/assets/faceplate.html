@@ -375,12 +375,11 @@ html, body {
    mounts. */
 .ctl.dimmed, .ctl-strip.dimmed, .route-col.dimmed { opacity: 0.4; }
 
-/* Mod-route column (0044): "fader on top, source selector beneath" — a
-   pair of cells stacked under a single column header. The route header
-   names the source (LFO/Env) so its child buttongroup omits its own
-   label (kept structurally for the variant rows). Each child cell ends
-   up looking like a thinner .ctl (header height is the route's, not the
-   ctl's own). */
+/* Mod-route column (0044): one column header (LFO / Env) over a
+   horizontal pair — source selector on the left, depth fader on the
+   right — mirroring vxn_ui_vizia's `mod_route_view`. The child
+   buttongroup omits its own label (kept structurally for the variant
+   rows) since the route header already names the source. */
 .route-col {
   display: flex;
   flex-direction: column;
@@ -397,6 +396,12 @@ html, body {
   letter-spacing: 0.5px;
   height: var(--ctl-label-h);
   line-height: var(--ctl-label-h);
+}
+.route-col-body {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 6px;
 }
 .route-col .ctl {
   height: auto;
@@ -600,22 +605,28 @@ html, body {
 
   <!-- Row 3 — per-osc mod routes + performance wheels (Bend is fixed-width). -->
   <div class="row row-3" data-row="3">
-    <!-- Pitch Mod (0044): two route columns (LFO depth+src, Env depth+src).
-         Source buttongroup carries `data-no-label` so the route header is
-         the only column label, and `data-dim-when-zero` so it dims grey
-         when the source reads Off (variant 0). -->
+    <!-- Pitch Mod (0044): two route columns. Each column = one header
+         (LFO / Env) over a horizontal pair: source buttongroup left,
+         depth fader right (matches vxn_ui_vizia's `mod_route_view`). The
+         source buttongroup carries `data-no-label` (route header is the
+         only column label) and `data-dim-when-zero` (dims grey when the
+         source reads Off, variant 0). -->
     <div class="panel" data-name="Pitch Mod" data-layered>
       <div class="panel-header">PITCH MOD</div>
       <div class="panel-body">
         <div class="route-col">
           <div class="route-col-head">LFO</div>
-          <div class="ctl" data-control="fader" data-param="pitch_lfo_depth" data-label="Depth"></div>
-          <div class="ctl" data-control="buttongroup" data-param="pitch_lfo_src" data-label="LFO" data-no-label data-dim-when-zero></div>
+          <div class="route-col-body">
+            <div class="ctl" data-control="buttongroup" data-param="pitch_lfo_src" data-label="LFO" data-no-label data-dim-when-zero></div>
+            <div class="ctl" data-control="fader" data-param="pitch_lfo_depth" data-label="Depth"></div>
+          </div>
         </div>
         <div class="route-col">
           <div class="route-col-head">Env</div>
-          <div class="ctl" data-control="fader" data-param="pitch_env_depth" data-label="Depth"></div>
-          <div class="ctl" data-control="buttongroup" data-param="pitch_env_src" data-label="Env" data-no-label data-dim-when-zero></div>
+          <div class="route-col-body">
+            <div class="ctl" data-control="buttongroup" data-param="pitch_env_src" data-label="Env" data-no-label data-dim-when-zero></div>
+            <div class="ctl" data-control="fader" data-param="pitch_env_depth" data-label="Depth"></div>
+          </div>
         </div>
       </div>
     </div>
@@ -624,13 +635,17 @@ html, body {
       <div class="panel-body">
         <div class="route-col">
           <div class="route-col-head">LFO</div>
-          <div class="ctl" data-control="fader" data-param="pwm_lfo_depth" data-label="Depth"></div>
-          <div class="ctl" data-control="buttongroup" data-param="pwm_lfo_src" data-label="LFO" data-no-label data-dim-when-zero></div>
+          <div class="route-col-body">
+            <div class="ctl" data-control="buttongroup" data-param="pwm_lfo_src" data-label="LFO" data-no-label data-dim-when-zero></div>
+            <div class="ctl" data-control="fader" data-param="pwm_lfo_depth" data-label="Depth"></div>
+          </div>
         </div>
         <div class="route-col">
           <div class="route-col-head">Env</div>
-          <div class="ctl" data-control="fader" data-param="pwm_env_depth" data-label="Depth"></div>
-          <div class="ctl" data-control="buttongroup" data-param="pwm_env_src" data-label="Env" data-no-label data-dim-when-zero></div>
+          <div class="route-col-body">
+            <div class="ctl" data-control="buttongroup" data-param="pwm_env_src" data-label="Env" data-no-label data-dim-when-zero></div>
+            <div class="ctl" data-control="fader" data-param="pwm_env_depth" data-label="Depth"></div>
+          </div>
         </div>
       </div>
     </div>
