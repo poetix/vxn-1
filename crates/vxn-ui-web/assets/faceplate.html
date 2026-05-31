@@ -197,12 +197,20 @@ html, body {
   color: var(--ctl-value);
   height: var(--ctl-value-h);
   line-height: var(--ctl-value-h);
-  /* Pin width so the cell doesn't jitter when text length changes. */
+  /* Pin width so the cell doesn't shift when text length changes. */
   width: 100%;
   text-align: center;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  /* Hidden by default — readouts pop only on hover / drag so a long
+     value string can't push the rest of the cell around. visibility
+     (not display:none) keeps the height reserved, no layout shift. */
+  visibility: hidden;
+}
+.ctl:hover .ctl-value,
+.ctl.ctl-active .ctl-value {
+  visibility: visible;
 }
 
 /* Fader — vertical track + thumb. Pointer ops issue Begin/EndGesture
@@ -259,33 +267,39 @@ html, body {
   position: relative;
   width: var(--dial);
   height: var(--dial);
+  /* Faint outline keeps the dial's footprint discoverable even with no
+     glyphs lit — empty wave columns used to read as a missing control. */
+  border: 1px solid #2a2a2a;
+  border-radius: 50%;
+  box-sizing: border-box;
 }
 .ctl-wave-glyph {
   position: absolute;
-  width: 16px;
-  height: 12px;
+  width: 22px;
+  height: 16px;
   /* Position resolved per-variant by `--gx` / `--gy` set in JS via inline
      style — keeps the glyph layout one place to change. */
-  left: calc(var(--gx) - 8px);
-  top: calc(var(--gy) - 6px);
+  left: calc(var(--gx) - 11px);
+  top: calc(var(--gy) - 8px);
   color: var(--glyph);
   cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
 }
 .ctl-wave-glyph.active {
   color: var(--glyph-active);
 }
+/* Explicit width/height on the SVG element (not just CSS) — some WebKit
+   versions ignore CSS sizing on inline SVG and render at the 300×150
+   intrinsic default, overflowing the glyph box. */
 .ctl-wave-glyph svg {
-  width: 100%;
-  height: 100%;
+  width: 22px;
+  height: 16px;
   display: block;
+  overflow: visible;
 }
 .ctl-wave-glyph svg path {
   fill: none;
   stroke: currentColor;
-  stroke-width: 1.3;
+  stroke-width: 1.4;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -457,9 +471,13 @@ const WAVE_GLYPHS = {
 
 function glyphSvg(label) {
   const pts = WAVE_GLYPHS[label];
-  if (!pts) return label; // fall back to text label for non-waveform enums
-  const d = pts.map((p, i) => (i === 0 ? 'M' : 'L') + (p[0] * 100).toFixed(1) + ' ' + (p[1] * 100).toFixed(1)).join(' ');
-  return `<svg viewBox="0 0 100 100" preserveAspectRatio="none"><path d="${d}"/></svg>`;
+  if (!pts) {
+    // Fall back to a text label for non-waveform enums (Filter Mode, etc.)
+    // so the dial isn't silently empty.
+    return `<span style="font-size:8px;color:inherit">${label}</span>`;
+  }
+  const d = pts.map((p, i) => (i === 0 ? 'M' : 'L') + (p[0] * 22).toFixed(1) + ' ' + (p[1] * 16).toFixed(1)).join(' ');
+  return `<svg width="22" height="16" viewBox="0 0 22 16"><path d="${d}"/></svg>`;
 }
 
 // ─── Control primitives ────────────────────────────────────────────────────
@@ -492,27 +510,31 @@ function makeFader(el, id, desc) {
 
   function pointerNorm(ev) {
     const r = fader.getBoundingClientRect();
-    return 1 - (ev.clientY - r.top) / r.height;
+    return Math.max(0, Math.min(1, 1 - (ev.clientY - r.top) / r.height));
   }
 
   fader.addEventListener('pointerdown', (ev) => {
     ev.preventDefault();
     dragging = true;
     fader.classList.add('dragging');
+    el.classList.add('ctl-active'); // pin the value readout open while dragging
     fader.setPointerCapture(ev.pointerId);
     window.vxn.send({ op: 'begin_gesture', id });
-    const n = Math.max(0, Math.min(1, pointerNorm(ev)));
+    const n = pointerNorm(ev);
+    setThumb(n);                                          // local: no round-trip wait
     window.vxn.send({ op: 'set_param_norm', id, norm: n });
   });
   fader.addEventListener('pointermove', (ev) => {
     if (!dragging) return;
-    const n = Math.max(0, Math.min(1, pointerNorm(ev)));
+    const n = pointerNorm(ev);
+    setThumb(n);                                          // local feedback every frame
     window.vxn.send({ op: 'set_param_norm', id, norm: n });
   });
   const endDrag = (ev) => {
     if (!dragging) return;
     dragging = false;
     fader.classList.remove('dragging');
+    el.classList.remove('ctl-active');
     try { fader.releasePointerCapture(ev.pointerId); } catch (e) {}
     window.vxn.send({ op: 'end_gesture', id });
   };
@@ -521,7 +543,12 @@ function makeFader(el, id, desc) {
 
   return {
     update(plain, norm, display) {
-      if (!dragging) setThumb(norm);
+      // ViewEvent echo — always position the thumb so DAW automation
+      // moves it even mid-drag (engine value is authoritative). During a
+      // drag the local pointermove `setThumb` and the round-trip echo
+      // converge on the same value, so the thumb stays glued to the
+      // cursor without flicker.
+      setThumb(norm);
       valueEl.textContent = display;
     },
   };
@@ -538,16 +565,15 @@ function makeWave(el, id, desc) {
   const dial = el.querySelector('.ctl-wave');
   const valueEl = el.querySelector('.ctl-value');
 
-  // Arrange glyphs on an arc around the dial centre. 0 at top, going
-  // clockwise. Radius slightly inside the dial box so glyph edges stay
-  // inside the bounds.
-  const radius = 22;
+  // Arrange glyphs evenly around the dial, first at top (0°), going
+  // clockwise. For 4 waves that lands them at top / right / bottom / left;
+  // for 6 (LFO shapes) it spreads them around the circle without overlap.
+  // Radius is sized so a 22-wide glyph at the cardinal extremes stays just
+  // inside the 62 px dial bounds.
+  const radius = 19;
   const cx = 31, cy = 31;
   const glyphEls = variants.map((v, i) => {
-    const t = variants.length === 1 ? 0 : (i / (variants.length - 1));
-    // Spread across (-120°..120°) so the glyphs span the bottom of the dial,
-    // matching the Vizia wave selector's arc.
-    const angle = (-120 + 240 * t) * Math.PI / 180;
+    const angle = (i / variants.length) * Math.PI * 2;
     const gx = cx + radius * Math.sin(angle);
     const gy = cy - radius * Math.cos(angle);
     const g = document.createElement('div');

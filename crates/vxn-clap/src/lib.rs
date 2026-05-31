@@ -134,6 +134,8 @@ impl DefaultPluginFactory for VxnPlugin {
             host,
             #[cfg(feature = "webview")]
             timer: None,
+            #[cfg(feature = "webview")]
+            last_seen: vec![f32::NAN; TOTAL_PARAMS],
         })
     }
 }
@@ -159,11 +161,9 @@ pub struct VxnMainThread<'a> {
     /// so there is no real contention.
     controller: Arc<Mutex<Controller<SharedParams>>>,
     /// View-bound events the controller emits. The editor's idle callback
-    /// drains this; when the GUI is closed it stays here and the bounded
-    /// channel drops on full (controller emits via `try_send`). Webview
-    /// backend hasn't wired its drain pump yet (0041+) — kept here so the
-    /// controller still has somewhere to publish.
-    #[cfg_attr(feature = "webview", allow(dead_code))]
+    /// (vizia) or the timer drain (webview) consumes this; when the GUI is
+    /// closed it stays here and the bounded channel drops on full
+    /// (controller emits via `try_send`).
     view_rx: Arc<Mutex<Receiver<ViewEvent>>>,
     /// Shared snapshot of the preset corpus the controller publishes for the
     /// editor's browser. Refreshed by the controller after every disk op.
@@ -186,6 +186,14 @@ pub struct VxnMainThread<'a> {
     /// closed or the host doesn't support `timer-support`.
     #[cfg(feature = "webview")]
     timer: Option<(HostTimer, TimerId)>,
+    /// Last param values seen by the webview's diff pump. Audio-thread
+    /// automation writes [`SharedParams`] directly without round-tripping
+    /// the controller, so the editor would otherwise never see it. On each
+    /// tick we diff the current values against this vector and push a
+    /// `ParamChanged` for any drift. Seeded all-`NaN` so the first tick
+    /// after open broadcasts the whole table to populate the page.
+    #[cfg(feature = "webview")]
+    last_seen: Vec<f32>,
 }
 
 impl<'a> PluginMainThread<'a, VxnShared> for VxnMainThread<'a> {}
@@ -204,6 +212,41 @@ impl<'a> VxnMainThread<'a> {
             handle.push_view_event(ev);
         }
     }
+
+    /// Diff the shared param store against `last_seen` and push a
+    /// `ParamChanged` for any drift. This is the path that catches
+    /// audio-thread automation: `process()` writes `SharedParams` directly
+    /// (via `LocalParams::publish`) without routing through the controller,
+    /// so the controller's view-event queue stays empty for those changes.
+    /// The vizia editor handles this by polling `SharedParams` on idle;
+    /// here we centralize the equivalent in one diff loop.
+    fn push_param_diffs(&mut self) {
+        let Some(handle) = self.gui.as_ref() else {
+            return;
+        };
+        let model = &*self.shared.params;
+        let n = ParamModel::total(model).min(self.last_seen.len());
+        for i in 0..n {
+            let id = ParamId::new(i);
+            let plain = ParamModel::get(model, id);
+            // NaN-aware: NaN never equals itself, so the seeded all-NaN
+            // vector forces a full broadcast on the first tick after open.
+            if plain == self.last_seen[i] {
+                continue;
+            }
+            self.last_seen[i] = plain;
+            let norm = ParamModel::get_normalized(model, id);
+            let display = ParamModel::descriptor(model, id)
+                .map(|d| d.display(plain))
+                .unwrap_or_default();
+            handle.push_view_event(ViewEvent::ParamChanged {
+                id,
+                plain,
+                norm,
+                display,
+            });
+        }
+    }
 }
 
 #[cfg(feature = "webview")]
@@ -214,6 +257,11 @@ impl<'a> PluginTimerImpl for VxnMainThread<'a> {
         // round-trip latency on a knob drag.
         lock_mut(&self.controller).tick();
         self.drain_view_events();
+        // Then catch any audio-thread automation the controller never saw.
+        // The two pushes can echo the same param twice in a tick (controller
+        // emit + diff push); the WebView's `update` is idempotent, so the
+        // overlap is just a wasted evaluate_script — no visible effect.
+        self.push_param_diffs();
     }
 }
 
