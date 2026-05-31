@@ -623,23 +623,25 @@ html, body {
          (LFO / Env) over a horizontal pair: source buttongroup left,
          depth fader right (matches vxn_ui_vizia's `mod_route_view`). The
          source buttongroup carries `data-no-label` (route header is the
-         only column label) and `data-dim-when-zero` (dims grey when the
-         source reads Off, variant 0). -->
+         only column label) and stays full-opacity so a routed-Off path
+         is still readable + clickable; the *depth fader* dims via
+         `data-dim-when-src-off` when its source reads Off (variant 0),
+         signalling that the slider does nothing right now. -->
     <div class="panel" data-name="Pitch Mod" data-layered>
       <div class="panel-header">PITCH MOD</div>
       <div class="panel-body">
         <div class="route-col">
           <div class="route-col-head">LFO</div>
           <div class="route-col-body">
-            <div class="ctl" data-control="buttongroup" data-param="pitch_lfo_src" data-label="LFO" data-no-label data-dim-when-zero></div>
-            <div class="ctl" data-control="fader" data-param="pitch_lfo_depth" data-label="Depth"></div>
+            <div class="ctl" data-control="buttongroup" data-param="pitch_lfo_src" data-label="LFO" data-no-label></div>
+            <div class="ctl" data-control="fader" data-param="pitch_lfo_depth" data-label="Depth" data-dim-when-src-off="pitch_lfo_src"></div>
           </div>
         </div>
         <div class="route-col">
           <div class="route-col-head">Env</div>
           <div class="route-col-body">
-            <div class="ctl" data-control="buttongroup" data-param="pitch_env_src" data-label="Env" data-no-label data-dim-when-zero></div>
-            <div class="ctl" data-control="fader" data-param="pitch_env_depth" data-label="Depth"></div>
+            <div class="ctl" data-control="buttongroup" data-param="pitch_env_src" data-label="Env" data-no-label></div>
+            <div class="ctl" data-control="fader" data-param="pitch_env_depth" data-label="Depth" data-dim-when-src-off="pitch_env_src"></div>
           </div>
         </div>
       </div>
@@ -650,15 +652,15 @@ html, body {
         <div class="route-col">
           <div class="route-col-head">LFO</div>
           <div class="route-col-body">
-            <div class="ctl" data-control="buttongroup" data-param="pwm_lfo_src" data-label="LFO" data-no-label data-dim-when-zero></div>
-            <div class="ctl" data-control="fader" data-param="pwm_lfo_depth" data-label="Depth"></div>
+            <div class="ctl" data-control="buttongroup" data-param="pwm_lfo_src" data-label="LFO" data-no-label></div>
+            <div class="ctl" data-control="fader" data-param="pwm_lfo_depth" data-label="Depth" data-dim-when-src-off="pwm_lfo_src"></div>
           </div>
         </div>
         <div class="route-col">
           <div class="route-col-head">Env</div>
           <div class="route-col-body">
-            <div class="ctl" data-control="buttongroup" data-param="pwm_env_src" data-label="Env" data-no-label data-dim-when-zero></div>
-            <div class="ctl" data-control="fader" data-param="pwm_env_depth" data-label="Depth"></div>
+            <div class="ctl" data-control="buttongroup" data-param="pwm_env_src" data-label="Env" data-no-label></div>
+            <div class="ctl" data-control="fader" data-param="pwm_env_depth" data-label="Depth" data-dim-when-src-off="pwm_env_src"></div>
           </div>
         </div>
       </div>
@@ -1631,11 +1633,11 @@ function locateSyncPartners(layer) {
 // ─── Generic dim rules (0044) ──────────────────────────────────────────────
 //
 // Per-cell HTML markers register a dim rule resolved at bind time:
-//   `data-dim-when-zero` — dim self when self.value < 0.5 (source
-//     selector reads `Off`, the first variant of any `Off/...` enum).
 //   `data-dim-when-src-off="srcName"` — dim self when the named source
-//     selector reads `Off` (used for the Cross Mod depth fader paired
-//     with its Src selector).
+//     selector reads `Off` (the depth fader paired with a source
+//     buttongroup: Pitch/PWM Mod, Cross Mod's osc2 Mod). Source
+//     selectors themselves stay bright; only their paired fader dims so
+//     a routed-Off path is still readable + clickable.
 //   `data-dim-unless-fm="typeName"` — dim self unless the named type
 //     selector reads the `FM` variant. Cross Mod's Amount fader only
 //     drives PM (labelled FM, ADR 0004 §3), so it greys out for Off and
@@ -1649,13 +1651,6 @@ const DIM_RULES = [];        // [{ watchId, predicate, target }] — keyed by id
 
 function collectDimRuleSpecs() {
   DIM_RULE_SPECS.length = 0;
-  document.querySelectorAll('[data-dim-when-zero]').forEach((el) => {
-    DIM_RULE_SPECS.push({
-      kind: 'zero',
-      watchName: el.dataset.param,
-      target: el,
-    });
-  });
   document.querySelectorAll('[data-dim-when-src-off]').forEach((el) => {
     DIM_RULE_SPECS.push({
       kind: 'src-off',
@@ -1678,7 +1673,7 @@ function resolveDimRules(layer) {
     const watchId = paramIdByNameAtLayer(spec.watchName, layer);
     if (watchId == null) continue;
     let predicate;
-    if (spec.kind === 'zero' || spec.kind === 'src-off') {
+    if (spec.kind === 'src-off') {
       predicate = (plain) => Math.round(plain) === 0;
     } else if (spec.kind === 'unless-fm') {
       const variants = window.vxn.params[watchId].variants || [];

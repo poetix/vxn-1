@@ -862,28 +862,39 @@ mod tests {
     }
 
     #[test]
-    fn cross_mod_dim_rules_present() {
+    fn mod_route_dim_rules_present() {
         // 0044: Cross Mod's Amount fader dims unless Type = FM (matches
         // vxn_ui_vizia::xmod_pair's FM-only enable); Mod fader dims when
-        // Src = Off (same rule as the route-column source selectors).
+        // Src = Off. Pitch/PWM Mod follow the same convention — the
+        // *depth fader* dims when its source reads Off, not the source
+        // selector itself (selector stays bright so a routed-Off path is
+        // still readable / clickable).
         assert!(
             PLACEHOLDER_HTML.contains(r#"data-dim-unless-fm="cross_mod_type""#),
             "Cross Mod Amount missing data-dim-unless-fm wiring",
         );
-        assert!(
-            PLACEHOLDER_HTML.contains(r#"data-dim-when-src-off="osc2_pitch_env_src""#),
-            "Cross Mod depth missing data-dim-when-src-off wiring",
-        );
-        // Route-column source selectors carry the self-dim marker.
-        for name in ["pitch_lfo_src", "pitch_env_src", "pwm_lfo_src", "pwm_env_src"] {
+        for (depth, src) in [
+            ("osc2_pitch_env_depth", "osc2_pitch_env_src"),
+            ("pitch_lfo_depth",      "pitch_lfo_src"),
+            ("pitch_env_depth",      "pitch_env_src"),
+            ("pwm_lfo_depth",        "pwm_lfo_src"),
+            ("pwm_env_depth",        "pwm_env_src"),
+        ] {
             assert!(
                 PLACEHOLDER_HTML.contains(&format!(
-                    r#"data-param="{name}" data-label="{}" data-no-label data-dim-when-zero"#,
-                    if name.contains("lfo") { "LFO" } else { "Env" },
+                    r#"data-param="{depth}" data-label="{}" data-dim-when-src-off="{src}""#,
+                    if depth == "osc2_pitch_env_depth" { "Mod" } else { "Depth" },
                 )),
-                "route-col source {name} missing dim-when-zero marker",
+                "route depth {depth} missing dim-when-src-off=\"{src}\"",
             );
         }
+        // Route-column source selectors must NOT carry the self-dim
+        // marker — selectors stay bright; only the paired fader dims.
+        assert_eq!(
+            PLACEHOLDER_HTML.matches("data-dim-when-zero").count(),
+            0,
+            "route-col source selectors should no longer self-dim",
+        );
         // JS dispatch wires the generic dim rule into ParamChanged.
         assert!(PLACEHOLDER_HTML.contains("applyDimRulesFor("));
         assert!(PLACEHOLDER_HTML.contains("collectDimRuleSpecs"));
