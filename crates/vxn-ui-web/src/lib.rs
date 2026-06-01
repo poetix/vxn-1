@@ -229,8 +229,22 @@ pub fn open_editor(
 /// `{name, label, kind, min, max, default, taper, unit, variants?}`. JSON
 /// generation is one place so a future schema bump (e.g. adding a `module`
 /// field) stays self-contained.
+///
+/// CSS + the three JS modules (bridge / panels / dispatch) live in sibling
+/// files spliced in here — the wry WebView serves the page via `with_html`,
+/// so external `<link href>` / `<script src>` would need a custom protocol
+/// handler to resolve. Inlining keeps the page self-contained without that
+/// plumbing. JS splice order matters: bridge defines `window.vxn` /
+/// `__vxn` / `valuePop` / `statusPill`, panels register controls and
+/// browser/preset/keys UI against that bridge, dispatch wires `init()` and
+/// the ViewEvent fan-out last.
 fn build_faceplate_html() -> String {
     PLACEHOLDER_HTML
+        .replace("__CSS__", FACEPLATE_CSS)
+        .replace("__BRIDGE_JS__", BRIDGE_JS)
+        .replace("__BROWSER_JS__", BROWSER_JS)
+        .replace("__PANELS_JS__", PANELS_JS)
+        .replace("__DISPATCH_JS__", DISPATCH_JS)
         .replace("__PARAMS_JSON__", &build_params_json())
         .replace("__SUBDIVISIONS_JSON__", &build_subdivisions_json())
         .replace("__PATCH_COUNT__", &PATCH_COUNT.to_string())
@@ -664,11 +678,31 @@ fn preset_source_json(src: Option<&PresetSource>) -> serde_json::Value {
 
 // ── Faceplate page ──────────────────────────────────────────────────────────
 
-/// Static HTML/CSS faceplate scaffold (0040). Four-row panel grid with empty
-/// bodies; 0041+ populates each panel with controls. Inline `<style>` block
-/// keeps the page openable in a browser for visual previewing without the
-/// wry runtime.
+/// Faceplate HTML scaffold (0040). Four-row panel grid; controls populated
+/// at runtime by the JS modules. The HTML carries placeholders for the CSS
+/// and the three JS modules so each file stays editable on its own without
+/// hunting for the boundaries inside a 3500-line blob — `build_faceplate_html`
+/// splices them back together at editor-open time.
 const PLACEHOLDER_HTML: &str = include_str!("../assets/faceplate.html");
+/// Stylesheet — spliced into the `<style>__CSS__</style>` slot of the HTML.
+const FACEPLATE_CSS: &str = include_str!("../assets/faceplate.css");
+/// IPC bootstrap + shared UI scaffolding (`window.vxn` / `window.__vxn`,
+/// text-input bridge, value popup, status pill). Defines the globals every
+/// later module relies on, so it splices first inside `<script>`.
+const BRIDGE_JS: &str = include_str!("../assets/bridge.js");
+/// Preset browser panel — corpus model, folder/preset rendering, search,
+/// context menu, modal confirms (delete + save-as), DnD. Splices between
+/// bridge and the rest of panels because the bar IIFE
+/// (`const presetBar = …`) references `browserPanel`.
+const BROWSER_JS: &str = include_str!("../assets/browser.js");
+/// Panel UI — preset bar, Keys panel, waveform glyphs, control primitives
+/// (fader / wave / switch / buttongroup / dropdown / header-switch /
+/// detune-legato). Registers everything against `model.controls` so
+/// dispatch can fan ViewEvents to the right cell.
+const PANELS_JS: &str = include_str!("../assets/panels.js");
+/// `init()` + per-tick ViewEvent dispatcher + dim rules + layer rebind.
+/// Splices last because it references the panel objects defined above.
+const DISPATCH_JS: &str = include_str!("../assets/dispatch.js");
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -945,45 +979,55 @@ mod tests {
     // would be overkill. The asserts here catch silent regressions (a row
     // dropped, a panel renamed, a data attr lost) without pinning markup.
 
+    // Assemble once per test run — `build_faceplate_html` walks every CLAP
+    // id to build the descriptor map, so caching keeps the structural-check
+    // suite under a millisecond instead of paying that per test.
+    fn assembled() -> &'static str {
+        use std::sync::OnceLock;
+        static CACHED: OnceLock<String> = OnceLock::new();
+        CACHED.get_or_init(build_faceplate_html).as_str()
+    }
+
     fn count(needle: &str) -> usize {
-        PLACEHOLDER_HTML.matches(needle).count()
+        assembled().matches(needle).count()
     }
 
     #[test]
     fn faceplate_has_banner_and_preset_bar_slot() {
-        assert!(PLACEHOLDER_HTML.contains(r#"class="banner""#));
-        assert!(PLACEHOLDER_HTML.contains("VULPUS LABS"));
-        assert!(PLACEHOLDER_HTML.contains("VXN-1"));
-        assert!(PLACEHOLDER_HTML.contains(r#"class="preset-bar-slot""#));
+        assert!(assembled().contains(r#"class="banner""#));
+        assert!(assembled().contains("VULPUS LABS"));
+        assert!(assembled().contains("VXN-1"));
+        assert!(assembled().contains(r#"class="preset-bar-slot""#));
     }
 
     #[test]
     fn faceplate_has_four_rows() {
         for r in 1..=4 {
             assert!(
-                PLACEHOLDER_HTML.contains(&format!(r#"data-row="{r}""#)),
+                assembled().contains(&format!(r#"data-row="{r}""#)),
                 "missing data-row=\"{r}\"",
             );
         }
-        // Five panels per row × 4 rows = 20 panels total. Catches an
-        // accidental row collapse or duplicate emit.
-        assert_eq!(count(r#"class="panel""#), 20, "panel count drift");
+        // Rows 1-3 = 5 panels each; row 4 = 6 panels (E012 / 0058 added Reverb).
+        // 5+5+5+6 = 21. Catches an accidental row collapse or duplicate emit.
+        assert_eq!(count(r#"class="panel""#), 21, "panel count drift");
     }
 
     #[test]
     fn faceplate_panel_names_match_rows() {
         // Same titles as `vxn_ui_vizia::ROWS`; reordering or rename would have to
-        // happen here in lockstep.
+        // happen here in lockstep. Reverb (E012 / 0058) lives in row 4 between
+        // Delay and Master.
         let expected: &[&[&str]] = &[
             &["LFO 1", "LFO 2", "Osc 1", "Osc 2", "Mixer"],
             &["Env 1", "Env 2", "VCA", "Filter", "Filter Mod"],
             &["Pitch Mod", "PWM Mod", "Cross Mod", "Mod Wheel", "Bend"],
-            &["Keys", "Voice", "Chorus", "Delay", "Master"],
+            &["Keys", "Voice", "Chorus", "Delay", "Reverb", "Master"],
         ];
         for row in expected {
             for name in *row {
                 assert!(
-                    PLACEHOLDER_HTML.contains(&format!(r#"data-name="{name}""#)),
+                    assembled().contains(&format!(r#"data-name="{name}""#)),
                     "missing panel {name}",
                 );
             }
@@ -1003,7 +1047,7 @@ mod tests {
         for name in layered {
             let marker = format!(r#"data-name="{name}" data-layered"#);
             assert!(
-                PLACEHOLDER_HTML.contains(&marker),
+                assembled().contains(&marker),
                 "panel {name} missing data-layered",
             );
         }
@@ -1017,13 +1061,11 @@ mod tests {
     }
 
     #[test]
-    fn faceplate_reserves_chorus_delay_header_toggle() {
-        // Header switch lives on Chorus + Delay only (`vxn_ui_vizia::panel_view`,
-        // `header_switch` matcher). Reserve the slot now; widget arrives in
-        // 0045.
-        for name in ["Chorus", "Delay"] {
+    fn faceplate_reserves_fx_header_toggles() {
+        // Header switch idiom: Chorus + Delay (0045), Reverb (E012 / 0058).
+        for name in ["Chorus", "Delay", "Reverb"] {
             assert!(
-                PLACEHOLDER_HTML
+                assembled()
                     .contains(&format!(r#"data-name="{name}" data-header-toggle"#)),
                 "{name} missing data-header-toggle",
             );
@@ -1032,8 +1074,8 @@ mod tests {
         // CSS `[data-header-toggle]` selectors don't have the closing `>`.
         assert_eq!(
             count("data-header-toggle>"),
-            2,
-            "header-toggle expected on Chorus + Delay only",
+            3,
+            "header-toggle expected on Chorus + Delay + Reverb only",
         );
     }
 
@@ -1042,13 +1084,13 @@ mod tests {
         // Pixel literals live in CSS vars (ticket: "a future resize policy
         // should be one variable change"). Sanity check the load-bearing
         // ones against `vxn_ui_vizia` constants.
-        assert!(PLACEHOLDER_HTML.contains("--panel-h: 156px"));
-        assert!(PLACEHOLDER_HTML.contains("--col-h: 120px"));
-        assert!(PLACEHOLDER_HTML.contains("--fader-h: 74px"));
-        assert!(PLACEHOLDER_HTML.contains("--dial: 62px"));
-        assert!(PLACEHOLDER_HTML.contains("--banner-h: 26px"));
-        assert!(PLACEHOLDER_HTML.contains("--preset-bar-h: 30px"));
-        assert!(PLACEHOLDER_HTML.contains("--pad-outer: 10px"));
+        assert!(assembled().contains("--panel-h: 156px"));
+        assert!(assembled().contains("--col-h: 120px"));
+        assert!(assembled().contains("--fader-h: 74px"));
+        assert!(assembled().contains("--dial: 62px"));
+        assert!(assembled().contains("--banner-h: 26px"));
+        assert!(assembled().contains("--preset-bar-h: 30px"));
+        assert!(assembled().contains("--pad-outer: 10px"));
     }
 
     #[test]
@@ -1069,22 +1111,22 @@ mod tests {
             ("Filter Mod", "1.0"),
         ] {
             assert!(
-                PLACEHOLDER_HTML
+                assembled()
                     .contains(&format!(r#".panel[data-name="{sel}"]"#))
-                    && PLACEHOLDER_HTML.contains(&format!("flex-grow: {share}")),
+                    && assembled().contains(&format!("flex-grow: {share}")),
                 "share for {sel} ≠ {share}",
             );
         }
         // Bend is the only fixed-width panel.
-        assert!(PLACEHOLDER_HTML.contains("flex: 0 0 54px"));
+        assert!(assembled().contains("flex: 0 0 54px"));
     }
 
     #[test]
     fn faceplate_bridge_object_intact() {
         // Bridge from 0039 still present — 0040 only adds layout.
-        assert!(PLACEHOLDER_HTML.contains("window.vxn"));
-        assert!(PLACEHOLDER_HTML.contains("window.ipc.postMessage"));
-        assert!(PLACEHOLDER_HTML.contains("onViewEvent"));
+        assert!(assembled().contains("window.vxn"));
+        assert!(assembled().contains("window.ipc.postMessage"));
+        assert!(assembled().contains("onViewEvent"));
     }
 
     #[test]
@@ -1092,11 +1134,11 @@ mod tests {
         // 0046: Rust calls `window.__vxn.applyViewEvents(arr)` once per
         // controller tick. Bootstrap installs a buffering stub; init() swaps
         // in the real dispatcher.
-        assert!(PLACEHOLDER_HTML.contains("window.__vxn"));
-        assert!(PLACEHOLDER_HTML.contains("applyViewEvents"));
+        assert!(assembled().contains("window.__vxn"));
+        assert!(assembled().contains("applyViewEvents"));
         // Bootstrap stub still funnels into `_earlyViewEvents` so events
         // that race the inline init() are not lost.
-        assert!(PLACEHOLDER_HTML.contains("_earlyViewEvents"));
+        assert!(assembled().contains("_earlyViewEvents"));
     }
 
     #[test]
@@ -1105,10 +1147,10 @@ mod tests {
         // cb)` and the dispatcher routes `text_input_result` back to the
         // pending callback. JS plumbing only — the actual NSWindow is
         // verified by running the plugin in-DAW (see ticket Acceptance).
-        assert!(PLACEHOLDER_HTML.contains("window.vxn.promptText"));
-        assert!(PLACEHOLDER_HTML.contains("_textInputCallbacks"));
-        assert!(PLACEHOLDER_HTML.contains("op: 'request_text_input'"));
-        assert!(PLACEHOLDER_HTML.contains("ev.kind === 'text_input_result'"));
+        assert!(assembled().contains("window.vxn.promptText"));
+        assert!(assembled().contains("_textInputCallbacks"));
+        assert!(assembled().contains("send.requestTextInput("));
+        assert!(assembled().contains("ev.kind === 'text_input_result'"));
     }
 
     #[test]
@@ -1174,11 +1216,11 @@ mod tests {
         // it from the lower-right corner into the preset bar; the
         // `.status-pill` class + `statusPill.flash` API are unchanged so
         // the bridge contract here stays the same.
-        assert!(PLACEHOLDER_HTML.contains(".status-pill"));
-        assert!(PLACEHOLDER_HTML.contains(".status-pill.visible"));
-        assert!(PLACEHOLDER_HTML.contains("statusPill"));
-        assert!(PLACEHOLDER_HTML.contains("statusPill.flash"));
-        assert!(PLACEHOLDER_HTML.contains("ev.kind === 'status'"));
+        assert!(assembled().contains(".status-pill"));
+        assert!(assembled().contains(".status-pill.visible"));
+        assert!(assembled().contains("statusPill"));
+        assert!(assembled().contains("statusPill.flash"));
+        assert!(assembled().contains("ev.kind === 'status'"));
     }
 
     #[test]
@@ -1194,27 +1236,26 @@ mod tests {
             "id=\"pbar-save\"",
             "id=\"pbar-status\"",
         ] {
-            assert!(PLACEHOLDER_HTML.contains(id), "preset bar missing {id}");
+            assert!(assembled().contains(id), "preset bar missing {id}");
         }
         // JS bridge: prev/next post `step_preset` with signed delta; Save
         // As funnels through the 0048 popup then posts `save_preset` with
         // `folder: null`; preset_loaded sets the name.
-        assert!(PLACEHOLDER_HTML.contains("op: 'step_preset'"));
-        assert!(PLACEHOLDER_HTML.contains("delta: -1"));
-        assert!(PLACEHOLDER_HTML.contains("delta: 1"));
-        assert!(PLACEHOLDER_HTML.contains("op: 'save_preset'"));
+        assert!(assembled().contains("send.stepPreset(-1)"));
+        assert!(assembled().contains("send.stepPreset(1)"));
+        assert!(assembled().contains("send.savePreset("));
         // Save As funnels through the in-WebView modal (name field +
         // folder dropdown) rather than going straight through the native
         // popup. The modal posts `save_preset` directly; presetBar just
         // opens it. `browserPanel.getSaveFolder()` is still exposed for
         // other call sites but no longer the Save As path.
-        assert!(PLACEHOLDER_HTML.contains("browserPanel.openSaveAs"));
-        assert!(PLACEHOLDER_HTML.contains("ev.kind === 'preset_loaded'"));
-        assert!(PLACEHOLDER_HTML.contains("presetBar.setName"));
+        assert!(assembled().contains("browserPanel.openSaveAs"));
+        assert!(assembled().contains("ev.kind === 'preset_loaded'"));
+        assert!(assembled().contains("presetBar.setName"));
         // 0050: Browse toggles the panel itself; `_browserOpen` mirrors
         // open/close so external code (tests, integrations) can observe it.
-        assert!(PLACEHOLDER_HTML.contains("browserPanel.setOpen"));
-        assert!(PLACEHOLDER_HTML.contains("window.vxn._browserOpen"));
+        assert!(assembled().contains("browserPanel.setOpen"));
+        assert!(assembled().contains("window.vxn._browserOpen"));
     }
 
     #[test]
@@ -1230,26 +1271,26 @@ mod tests {
         //   folder (or null for user root).
         // - New Folder: "+ New" button on the user header posts
         //   `new_folder` after the popup commits.
-        assert!(PLACEHOLDER_HTML.contains("op: 'rename_preset'"));
-        assert!(PLACEHOLDER_HTML.contains("op: 'rename_folder'"));
-        assert!(PLACEHOLDER_HTML.contains("op: 'delete_preset'"));
-        assert!(PLACEHOLDER_HTML.contains("op: 'delete_folder'"));
-        assert!(PLACEHOLDER_HTML.contains("op: 'move_preset'"));
-        assert!(PLACEHOLDER_HTML.contains("op: 'new_folder'"));
+        assert!(assembled().contains("send.renamePreset("));
+        assert!(assembled().contains("send.renameFolder("));
+        assert!(assembled().contains("send.deletePreset("));
+        assert!(assembled().contains("send.deleteFolder("));
+        assert!(assembled().contains("send.movePreset("));
+        assert!(assembled().contains("send.newFolder("));
         // Modal confirm primitive present; ESC tears down modal → menu →
         // panel in that order (one level per press).
-        assert!(PLACEHOLDER_HTML.contains("openDeleteConfirm"));
-        assert!(PLACEHOLDER_HTML.contains(".browser-modal"));
-        assert!(PLACEHOLDER_HTML.contains(".browser-modal-backdrop"));
-        assert!(PLACEHOLDER_HTML.contains("if (modalEl)"));
+        assert!(assembled().contains("openDeleteConfirm"));
+        assert!(assembled().contains(".browser-modal"));
+        assert!(assembled().contains(".browser-modal-backdrop"));
+        assert!(assembled().contains("if (modalEl)"));
         // Right-click hooks on both row types (factory rows must not
         // attach one — the JS gates by selectedFolder.kind / key.kind).
-        assert!(PLACEHOLDER_HTML.contains("'contextmenu'"));
+        assert!(assembled().contains("'contextmenu'"));
         // Move-to submenu helper present; mirrors `vxn_ui_vizia::move_targets`.
-        assert!(PLACEHOLDER_HTML.contains("moveTargets(currentName)"));
-        assert!(PLACEHOLDER_HTML.contains(".browser-menu"));
-        assert!(PLACEHOLDER_HTML.contains(".browser-submenu"));
-        assert!(PLACEHOLDER_HTML.contains(".browser-new-folder"));
+        assert!(assembled().contains("moveTargets(currentName)"));
+        assert!(assembled().contains(".browser-menu"));
+        assert!(assembled().contains(".browser-submenu"));
+        assert!(assembled().contains(".browser-new-folder"));
     }
 
     #[test]
@@ -1257,20 +1298,20 @@ mod tests {
         // Save As modal hosts a name field (captured via the native
         // popup for spacebar-safe entry) + a folder dropdown over user
         // folders. The modal posts `save_preset { name, folder }`.
-        assert!(PLACEHOLDER_HTML.contains("openSaveAsModal"));
+        assert!(assembled().contains("openSaveAsModal"));
         // The name field reuses `promptText` so Space and friends still
         // route through the native NSWindow on macOS.
-        assert!(PLACEHOLDER_HTML.contains("window.vxn.promptText('Preset name'"));
+        assert!(assembled().contains("window.vxn.promptText('Preset name'"));
         // Folder choices come from a `<select>` populated from the corpus.
-        assert!(PLACEHOLDER_HTML.contains("folderOptions"));
-        assert!(PLACEHOLDER_HTML.contains(".save-as-select"));
+        assert!(assembled().contains("folderOptions"));
+        assert!(assembled().contains(".save-as-select"));
         // Modal anchors over the faceplate, not the browser panel — so
         // Save As works whether the browser is open or not.
-        assert!(PLACEHOLDER_HTML.contains("getElementById('faceplate').appendChild(wrap)"));
-        // openModal's extendActions hook gates the Save button on a
-        // valid (non-empty) name.
-        assert!(PLACEHOLDER_HTML.contains("extendActions"));
-        assert!(PLACEHOLDER_HTML.contains(".browser-modal-btn:disabled"));
+        assert!(assembled().contains("getElementById('faceplate').appendChild(wrap)"));
+        // Save button is disabled until the name field is non-empty
+        // (gateOk toggles the disabled attribute directly).
+        assert!(assembled().contains("gateOk"));
+        assert!(assembled().contains(".browser-modal-btn:disabled"));
     }
 
     #[test]
@@ -1278,12 +1319,12 @@ mod tests {
         // Non-empty query: the right pane switches to flat search results
         // covering the whole corpus (factory + user) instead of filtering
         // within the selected folder only.
-        assert!(PLACEHOLDER_HTML.contains("collectSearchHits"));
-        assert!(PLACEHOLDER_HTML.contains("'Factory · '"));
-        assert!(PLACEHOLDER_HTML.contains("'User · '"));
+        assert!(assembled().contains("collectSearchHits"));
+        assert!(assembled().contains("'Factory · '"));
+        assert!(assembled().contains("'User · '"));
         // Search-mode row carries name + muted origin label.
-        assert!(PLACEHOLDER_HTML.contains(".browser-row.search-row"));
-        assert!(PLACEHOLDER_HTML.contains(".browser-row-origin"));
+        assert!(assembled().contains(".browser-row.search-row"));
+        assert!(assembled().contains(".browser-row-origin"));
     }
 
     #[test]
@@ -1300,27 +1341,27 @@ mod tests {
             r#"id="browser-search-input""#,
             r#"id="browser-search-clear""#,
         ] {
-            assert!(PLACEHOLDER_HTML.contains(needle), "browser panel missing {needle}");
+            assert!(assembled().contains(needle), "browser panel missing {needle}");
         }
         // JS module + Rust→JS corpus channel.
-        assert!(PLACEHOLDER_HTML.contains("const browserPanel"));
-        assert!(PLACEHOLDER_HTML.contains("window.__vxn.applyPresetCorpus"));
+        assert!(assembled().contains("const browserPanel"));
+        assert!(assembled().contains("window.__vxn.applyPresetCorpus"));
         // Bootstrap stub funnels the first snapshot into `_earlyPresetCorpus`
         // so any corpus push that races init() is replayed.
-        assert!(PLACEHOLDER_HTML.contains("_earlyPresetCorpus"));
+        assert!(assembled().contains("_earlyPresetCorpus"));
         // Click handlers: folder click rerenders presets, preset click posts
         // load_factory or load_user (browser panel routes by folder kind).
-        assert!(PLACEHOLDER_HTML.contains("op: 'load_factory'"));
-        assert!(PLACEHOLDER_HTML.contains("op: 'load_user'"));
+        assert!(assembled().contains("send.loadFactory("));
+        assert!(assembled().contains("send.loadUser("));
         // Dismissal: ESC + outside-click backdrop both close the panel.
-        assert!(PLACEHOLDER_HTML.contains("e.key !== 'Escape'"));
-        assert!(PLACEHOLDER_HTML.contains("backdropEl.addEventListener('click'"));
+        assert!(assembled().contains("e.key !== 'Escape'"));
+        assert!(assembled().contains("backdropEl.addEventListener('click'"));
         // Highlight: preset_loaded fans `source` into the panel's
         // currently-loaded marker.
-        assert!(PLACEHOLDER_HTML.contains("browserPanel.setCurrentSource"));
+        assert!(assembled().contains("browserPanel.setCurrentSource"));
         // Section headers match the Vizia browser's labels.
-        assert!(PLACEHOLDER_HTML.contains("'FACTORY'"));
-        assert!(PLACEHOLDER_HTML.contains("'USER'"));
+        assert!(assembled().contains("'FACTORY'"));
+        assert!(assembled().contains("'USER'"));
     }
 
     #[test]
@@ -1427,7 +1468,7 @@ mod tests {
             // Mixer
             ("fader",  "osc1_level",  "Osc1"),
             ("fader",  "osc2_level",  "Osc2"),
-            ("fader",  "ring_level",  "Ring"),
+            ("fader",  "sub_level",   "Sub"),
             ("fader",  "noise_level", "Noise"),
             ("switch", "noise_color", "Col"),
         ] {
@@ -1435,7 +1476,7 @@ mod tests {
                 r#"data-control="{kind}" data-param="{name}" data-label="{label}""#,
             );
             assert!(
-                PLACEHOLDER_HTML.contains(&marker),
+                assembled().contains(&marker),
                 "Row 1 mount point missing: {marker}",
             );
         }
@@ -1486,7 +1527,7 @@ mod tests {
                 r#"data-control="{kind}" data-param="{name}" data-label="{label}""#,
             );
             assert!(
-                PLACEHOLDER_HTML.contains(&marker),
+                assembled().contains(&marker),
                 "Row 2 mount point missing: {marker}",
             );
         }
@@ -1503,10 +1544,12 @@ mod tests {
         // break the HTML.
         for (kind, name, label) in [
             // Pitch Mod
-            ("fader",       "pitch_lfo_depth", "Depth"),
-            ("buttongroup", "pitch_lfo_src",   "LFO"),
-            ("fader",       "pitch_env_depth", "Depth"),
-            ("buttongroup", "pitch_env_src",   "Env"),
+            ("fader",       "pitch_lfo_depth",    "Depth"),
+            ("buttongroup", "pitch_lfo_src",      "LFO"),
+            ("switch",      "pitch_lfo_mod_only", "Mod"),
+            ("fader",       "pitch_env_depth",    "Depth"),
+            ("buttongroup", "pitch_env_src",      "Env"),
+            ("switch",      "pitch_env_mod_only", "Mod"),
             // PWM Mod
             ("fader",       "pwm_lfo_depth", "Depth"),
             ("buttongroup", "pwm_lfo_src",   "LFO"),
@@ -1515,13 +1558,11 @@ mod tests {
             // Cross Mod
             ("buttongroup", "cross_mod_type",       "Type"),
             ("fader",       "cross_mod_amount",     "Amt"),
-            ("buttongroup", "osc2_pitch_env_src",   "Src"),
-            ("fader",       "osc2_pitch_env_depth", "Mod"),
             // Mod Wheel
             ("fader", "mod_wheel_pwm",        "PWM"),
             ("fader", "mod_wheel_cutoff",     "Cutoff"),
             ("fader", "mod_wheel_reso",       "Reso"),
-            ("fader", "mod_wheel_osc2_pitch", "O2 Pitch"),
+            ("fader", "mod_wheel_cross_mod_sweep", "X-Mod"),
             // Bend
             ("fader", "pitch_wheel_depth", "Range"),
         ] {
@@ -1529,7 +1570,7 @@ mod tests {
                 r#"data-control="{kind}" data-param="{name}" data-label="{label}""#,
             );
             assert!(
-                PLACEHOLDER_HTML.contains(&marker),
+                assembled().contains(&marker),
                 "Row 3 mount point missing: {marker}",
             );
         }
@@ -1566,6 +1607,11 @@ mod tests {
             ("fader",         "delay_mix",      "Mix"),
             ("switch",        "delay_sync",     "Sync"),
             ("switch",        "delay_pingpong", "P-Pong"),
+            // Reverb (E012 / 0058)
+            ("header-switch", "reverb_on",    ""),
+            ("buttongroup",   "reverb_type",  "Type"),
+            ("fader",         "reverb_depth", "Depth"),
+            ("fader",         "reverb_mix",   "Mix"),
         ] {
             // Header-switch slots carry no `data-label` attribute; assert
             // on the kind+name pair instead.
@@ -1577,7 +1623,7 @@ mod tests {
                 )
             };
             assert!(
-                PLACEHOLDER_HTML.contains(&needle),
+                assembled().contains(&needle),
                 "Row 4 mount point missing: {needle}",
             );
         }
@@ -1586,17 +1632,17 @@ mod tests {
         // Poly/Twin/Unison/Solo). If the descriptor order changes, this
         // attribute changes alongside; the test guards the wiring.
         assert!(
-            PLACEHOLDER_HTML.contains(r#"data-param="assign_mode" data-label="Assign" data-order="0,3,1,2""#),
+            assembled().contains(r#"data-param="assign_mode" data-label="Assign" data-order="0,3,1,2""#),
             "AssignMode missing display-order remap",
         );
         // Detune-Legato carries its two extra param-name dependencies so
         // a layer rebind can re-resolve both alongside the primary param.
         assert!(
-            PLACEHOLDER_HTML.contains(r#"data-legato-param="legato""#),
+            assembled().contains(r#"data-legato-param="legato""#),
             "Detune-Legato missing data-legato-param",
         );
         assert!(
-            PLACEHOLDER_HTML.contains(r#"data-mode-param="assign_mode""#),
+            assembled().contains(r#"data-mode-param="assign_mode""#),
             "Detune-Legato missing data-mode-param",
         );
     }
@@ -1608,59 +1654,61 @@ mod tests {
         // kind across all four rows.
         //
         // Faders:
-        //   Row 1: LFO1 3 (Rate/Delay/Fade), LFO2 1 (Rate), Osc1 4, Osc2 4, Mixer 4 = 16
+        //   Row 1: LFO1 3 (Rate/Delay/Fade), LFO2 1 (Rate), Osc1 4, Osc2 4, Mixer 3 = 15
         //   Row 2: Env1 4, Env2 4, VCA 1, Filter 4, FilterMod 4              = 17
-        //   Row 3: PitchMod 2, PwmMod 2, CrossMod 2, ModWheel 4, Bend 1      = 11
-        //   Row 4: Voice 1 (Glide), Master 2, Chorus 3, Delay 3              =  9
+        //   Row 3: PitchMod 2, PwmMod 2, CrossMod 1, ModWheel 4, Bend 1      = 10
+        //   Row 4: Voice 1 (Glide), Master 2, Chorus 3, Delay 3,
+        //          Reverb 2 (Depth/Mix)                                      = 11
         //   Total = 53.
         // Waves: 4 (LFO 1/2 Shape, Osc 1/2 Wave).
         // Switches:
         //   Row 1: 4 (LfoSync, Lfo2Sync, Lfo1FreeRun, NoiseColor)
         //   Row 2: 5 (Env1Shape, Env2Shape, Gate, Slope, KeyTrk)
+        //   Row 3: 2 (PitchLfoModOnly, PitchEnvModOnly)
         //   Row 4: 4 (Oversample as multi-toggle row, LimiterOn,
         //            DelaySync, DelayPingPong)
-        //   Total = 13.
+        //   Total = 15.
         // Button groups:
         //   Row 2: 2 (AmpLfoSrc, FilterMode)
-        //   Row 3: 6 (Pitch/PWM LFO+Env sources, CrossModType, Osc2PitchEnvSrc)
-        //   Row 4: 1 (AssignMode) — Oversample renders as a horizontal
-        //     switch row at the bottom of Master, not a vertical
+        //   Row 3: 5 (Pitch/PWM LFO+Env sources, CrossModType)
+        //   Row 4: 2 (AssignMode, ReverbType) — Oversample renders as a
+        //     horizontal switch row at the bottom of Master, not a vertical
         //     buttongroup column.
         //   Total = 9.
-        // Header switches: 2 (Chorus, Delay).
+        // Header switches: 3 (Chorus, Delay, Reverb).
         // Detune-Legato composite: 1 (Voice).
         assert_eq!(
-            PLACEHOLDER_HTML.matches(r#"data-control="fader""#).count(),
-            53,
-            "expected 53 fader cells across all four rows",
+            assembled().matches(r#"data-control="fader""#).count(),
+            54,
+            "expected 54 fader cells across all four rows",
         );
         assert_eq!(
-            PLACEHOLDER_HTML.matches(r#"data-control="wave""#).count(),
+            assembled().matches(r#"data-control="wave""#).count(),
             4,
             "expected 4 wave cells (LFO 1, LFO 2, Osc 1, Osc 2)",
         );
         assert_eq!(
-            PLACEHOLDER_HTML.matches(r#"data-control="switch""#).count(),
-            13,
-            "expected 13 switch cells (Row 1 + Row 2 + Row 4)",
+            assembled().matches(r#"data-control="switch""#).count(),
+            15,
+            "expected 15 switch cells (Row 1 + Row 2 + Row 3 + Row 4)",
         );
         assert_eq!(
-            PLACEHOLDER_HTML.matches(r#"data-control="buttongroup""#).count(),
+            assembled().matches(r#"data-control="buttongroup""#).count(),
             9,
             "expected 9 buttongroup cells (Row 2 + Row 3 + Row 4)",
         );
         assert_eq!(
-            PLACEHOLDER_HTML.matches(r#"data-control="dropdown""#).count(),
+            assembled().matches(r#"data-control="dropdown""#).count(),
             0,
             "no dropdown cells expected (all enums fit ButtonGroup)",
         );
         assert_eq!(
-            PLACEHOLDER_HTML.matches(r#"data-control="header-switch""#).count(),
-            2,
-            "expected 2 header-switch cells (Chorus, Delay)",
+            assembled().matches(r#"data-control="header-switch""#).count(),
+            3,
+            "expected 3 header-switch cells (Chorus, Delay, Reverb)",
         );
         assert_eq!(
-            PLACEHOLDER_HTML.matches(r#"data-control="detune-legato""#).count(),
+            assembled().matches(r#"data-control="detune-legato""#).count(),
             1,
             "expected 1 detune-legato composite (Voice)",
         );
@@ -1675,23 +1723,21 @@ mod tests {
         // selector itself (selector stays bright so a routed-Off path is
         // still readable / clickable).
         assert!(
-            PLACEHOLDER_HTML.contains(r#"data-dim-unless-fm="cross_mod_type""#),
+            assembled().contains(r#"data-dim-unless-fm="cross_mod_type""#),
             "Cross Mod Amount missing data-dim-unless-fm wiring",
         );
         for (depth, src) in [
-            ("osc2_pitch_env_depth", "osc2_pitch_env_src"),
-            ("pitch_lfo_depth",      "pitch_lfo_src"),
-            ("pitch_env_depth",      "pitch_env_src"),
-            ("pwm_lfo_depth",        "pwm_lfo_src"),
-            ("pwm_env_depth",        "pwm_env_src"),
+            ("pitch_lfo_depth", "pitch_lfo_src"),
+            ("pitch_env_depth", "pitch_env_src"),
+            ("pwm_lfo_depth",   "pwm_lfo_src"),
+            ("pwm_env_depth",   "pwm_env_src"),
             // VCA's Amp LFO Depth follows the same rule (Off / LFO 1 /
             // LFO 2 source → fader dims on Off).
-            ("amp_lfo_depth",        "amp_lfo_src"),
+            ("amp_lfo_depth",   "amp_lfo_src"),
         ] {
             assert!(
-                PLACEHOLDER_HTML.contains(&format!(
-                    r#"data-param="{depth}" data-label="{}" data-dim-when-src-off="{src}""#,
-                    if depth == "osc2_pitch_env_depth" { "Mod" } else { "Depth" },
+                assembled().contains(&format!(
+                    r#"data-param="{depth}" data-label="Depth" data-dim-when-src-off="{src}""#,
                 )),
                 "route depth {depth} missing dim-when-src-off=\"{src}\"",
             );
@@ -1699,13 +1745,13 @@ mod tests {
         // Route-column source selectors must NOT carry the self-dim
         // marker — selectors stay bright; only the paired fader dims.
         assert_eq!(
-            PLACEHOLDER_HTML.matches("data-dim-when-zero").count(),
+            assembled().matches("data-dim-when-zero").count(),
             0,
             "route-col source selectors should no longer self-dim",
         );
         // JS dispatch wires the generic dim rule into ParamChanged.
-        assert!(PLACEHOLDER_HTML.contains("applyDimRulesFor("));
-        assert!(PLACEHOLDER_HTML.contains("collectDimRuleSpecs"));
+        assert!(assembled().contains("applyDimRulesFor("));
+        assert!(assembled().contains("collectDimRuleSpecs"));
     }
 
     #[test]
@@ -1714,10 +1760,12 @@ mod tests {
         // present. The actual rebind walks LAYERED_CELLS and re-resolves
         // each per-patch name → id via paramIdByNameAtLayer using the
         // patchCount splice.
-        assert!(PLACEHOLDER_HTML.contains("edit_layer_changed"));
-        assert!(PLACEHOLDER_HTML.contains("rebindAllForLayer"));
-        assert!(PLACEHOLDER_HTML.contains("paramIdByNameAtLayer"));
-        assert!(PLACEHOLDER_HTML.contains("__PATCH_COUNT__"));
+        assert!(assembled().contains("edit_layer_changed"));
+        assert!(assembled().contains("rebindAllForLayer"));
+        assert!(assembled().contains("paramIdByNameAtLayer"));
+        // Placeholder lives in bridge.js pre-splice — assembled() has already
+        // replaced it, so check the raw bridge module.
+        assert!(BRIDGE_JS.contains("__PATCH_COUNT__"));
         // The splice replaces the placeholder at render time.
         let html = build_faceplate_html();
         assert!(!html.contains("__PATCH_COUNT__"), "patchCount placeholder must be replaced");
@@ -1731,9 +1779,9 @@ mod tests {
     fn header_switch_primitive_wired() {
         // 0045: Chorus + Delay carry a header-switch in
         // `.panel-header-toggle-slot`; CSS provides the active palette.
-        assert!(PLACEHOLDER_HTML.contains("makeHeaderSwitch"));
-        assert!(PLACEHOLDER_HTML.contains(".panel-header-switch"));
-        assert!(PLACEHOLDER_HTML.contains(".panel-header-switch.active"));
+        assert!(assembled().contains("makeHeaderSwitch"));
+        assert!(assembled().contains(".panel-header-switch"));
+        assert!(assembled().contains(".panel-header-switch.active"));
     }
 
     #[test]
@@ -1772,30 +1820,30 @@ mod tests {
         //   - edit_layer_changed → keysPanel.setLayer (in addition to
         //     the per-patch rebind)
         //   - split_point_changed → keysPanel.setSplit
-        assert!(PLACEHOLDER_HTML.contains("const keysPanel = "));
-        assert!(PLACEHOLDER_HTML.contains("op: 'set_key_mode'"));
-        assert!(PLACEHOLDER_HTML.contains("op: 'set_edit_layer'"));
-        assert!(PLACEHOLDER_HTML.contains("op: 'set_split_point'"));
-        assert!(PLACEHOLDER_HTML.contains("op: 'reset_layer'"));
-        assert!(PLACEHOLDER_HTML.contains("ev.kind === 'key_mode_changed'"));
-        assert!(PLACEHOLDER_HTML.contains("ev.kind === 'split_point_changed'"));
-        assert!(PLACEHOLDER_HTML.contains("keysPanel.setMode"));
-        assert!(PLACEHOLDER_HTML.contains("keysPanel.setLayer"));
-        assert!(PLACEHOLDER_HTML.contains("keysPanel.setSplit"));
+        assert!(assembled().contains("const keysPanel = "));
+        assert!(assembled().contains("send.setKeyMode("));
+        assert!(assembled().contains("send.setEditLayer("));
+        assert!(assembled().contains("send.setSplitPoint("));
+        assert!(assembled().contains("send.resetLayer("));
+        assert!(assembled().contains("ev.kind === 'key_mode_changed'"));
+        assert!(assembled().contains("ev.kind === 'split_point_changed'"));
+        assert!(assembled().contains("keysPanel.setMode"));
+        assert!(assembled().contains("keysPanel.setLayer"));
+        assert!(assembled().contains("keysPanel.setSplit"));
         // Note-name readout: covers a C0..C7 span, matches the vizia
         // editor's `note_name`.
-        assert!(PLACEHOLDER_HTML.contains("function keysNoteName("));
-        assert!(PLACEHOLDER_HTML.contains("KEYS_SPLIT_MIN = 12"));
-        assert!(PLACEHOLDER_HTML.contains("KEYS_SPLIT_MAX = 96"));
+        assert!(assembled().contains("function keysNoteName("));
+        assert!(assembled().contains("KEYS_SPLIT_MIN = 12"));
+        assert!(assembled().contains("KEYS_SPLIT_MAX = 96"));
         // Default split: matches DEFAULT_SPLIT_POINT (C4) so a
         // double-click reset lands on the same plain value the vizia
         // editor's `on_double_click` posts.
         assert_eq!(vxn_app::DEFAULT_SPLIT_POINT, 60);
-        assert!(PLACEHOLDER_HTML.contains("KEYS_DEFAULT_SPLIT = 60"));
+        assert!(assembled().contains("KEYS_DEFAULT_SPLIT = 60"));
         // The slot reserved by 0040 now carries real markup, not a
         // bare placeholder. The vizia overlay note is gone.
-        assert!(PLACEHOLDER_HTML.contains("data-name=\"Keys\""));
-        assert!(!PLACEHOLDER_HTML.contains("still rendered by vizia"));
+        assert!(assembled().contains("data-name=\"Keys\""));
+        assert!(!assembled().contains("still rendered by vizia"));
     }
 
     #[test]
@@ -1809,24 +1857,24 @@ mod tests {
         //     Notch variant by label (so a `FILTER_MODE_LABELS` reorder
         //     doesn't desync).
         //   - The dispatch branch keys on `FILTER_MODE_ID`.
-        // Asserting on PLACEHOLDER_HTML keeps the test substring-based —
+        // Asserting on the assembled HTML keeps the test substring-based —
         // the existing Free-run dim has the same shape.
         assert!(
-            PLACEHOLDER_HTML.contains(".ctl-strip.dimmed"),
+            assembled().contains(".ctl-strip.dimmed"),
             "missing strip dim selector (slope dim relies on it)",
         );
-        assert!(PLACEHOLDER_HTML.contains("locateSlopeDimCells"));
-        assert!(PLACEHOLDER_HTML.contains("FILTER_MODE_ID = paramIdByNameAtLayer('filter_mode'"));
-        assert!(PLACEHOLDER_HTML.contains("variants.indexOf('Notch')"));
-        assert!(PLACEHOLDER_HTML.contains("data-param=\"filter_slope\""));
-        assert!(PLACEHOLDER_HTML.contains("ev.id === FILTER_MODE_ID"));
+        assert!(assembled().contains("BUILTIN_DIM_SPECS"));
+        assert!(assembled().contains("'filter-notch'"));
+        assert!(assembled().contains("variantIdx('filter_mode', 'Notch'"));
+        assert!(assembled().contains("data-param=\"filter_slope\""));
+        assert!(assembled().contains("applyDimRulesFor("));
     }
 
     #[test]
     fn faceplate_has_subdivisions_json_placeholder() {
         // SUBDIVISIONS table is spliced as a JSON array of labels; the LFO
         // rate fader's displayOverride indexes it when sync is on (0042).
-        assert!(PLACEHOLDER_HTML.contains("__SUBDIVISIONS_JSON__"));
+        assert!(BRIDGE_JS.contains("__SUBDIVISIONS_JSON__"));
         let html = build_faceplate_html();
         assert!(!html.contains("__SUBDIVISIONS_JSON__"));
         // Sanity check: array matches the Rust table 1:1.
@@ -1843,7 +1891,7 @@ mod tests {
     fn faceplate_has_params_json_placeholder() {
         // The template carries `__PARAMS_JSON__` for runtime descriptor
         // injection; build_faceplate_html() splices it.
-        assert!(PLACEHOLDER_HTML.contains("__PARAMS_JSON__"));
+        assert!(BRIDGE_JS.contains("__PARAMS_JSON__"));
         let html = build_faceplate_html();
         assert!(!html.contains("__PARAMS_JSON__"), "placeholder must be replaced");
         // Page references the bridge property; sanity check the rendered HTML
@@ -1909,39 +1957,39 @@ mod tests {
         // The Move-to ▸ submenu (0051) shares the `move_preset` op
         // string, so this test additionally asserts the DnD-specific
         // bridge surface (drag listeners, MIME, drop CSS).
-        assert!(PLACEHOLDER_HTML.contains("'vxn/preset'"));
-        assert!(PLACEHOLDER_HTML.contains("wirePresetDragSource"));
-        assert!(PLACEHOLDER_HTML.contains("'dragstart'"));
-        assert!(PLACEHOLDER_HTML.contains("'dragover'"));
-        assert!(PLACEHOLDER_HTML.contains("'dragleave'"));
-        assert!(PLACEHOLDER_HTML.contains("'dragend'"));
+        assert!(assembled().contains("'vxn/preset'"));
+        assert!(assembled().contains("wirePresetDragSource"));
+        assert!(assembled().contains("'dragstart'"));
+        assert!(assembled().contains("'dragover'"));
+        assert!(assembled().contains("'dragleave'"));
+        assert!(assembled().contains("'dragend'"));
         // The drop handler shares the `move_preset` op with the Move-to
         // submenu; the DnD-specific path passes `dragSourcePath` rather
         // than the menu's `target.path`. The `dragSourcePath` identifier
         // is used by both the dragstart write and the drop read — its
         // mere presence proves the bridge is wired through.
-        assert!(PLACEHOLDER_HTML.contains("path: dragSourcePath"));
+        assert!(assembled().contains("send.movePreset(dragSourcePath"));
         // Drop-target gating: factory rows must not get listeners. The
         // `appendFolderRow` gate keys on `key.kind === 'user'`; assert
         // the source folder no-op branch is present (key.name ===
         // dragSourceFolder).
-        assert!(PLACEHOLDER_HTML.contains("key.name === dragSourceFolder"));
+        assert!(assembled().contains("key.name === dragSourceFolder"));
         // CSS for drop-target highlight + source-folder block + drag-
         // source dimming. `.drag-over` is the live drop highlight;
         // `.drag-blocked` shows the source folder mid-drag.
-        assert!(PLACEHOLDER_HTML.contains(".browser-row.drag-over"));
-        assert!(PLACEHOLDER_HTML.contains(".browser-row.drag-blocked"));
-        assert!(PLACEHOLDER_HTML.contains(".browser-row.dragging"));
+        assert!(assembled().contains(".browser-row.drag-over"));
+        assert!(assembled().contains(".browser-row.drag-blocked"));
+        assert!(assembled().contains(".browser-row.dragging"));
         // Follow-path plumbing: PresetCorpusChanged carries an
         // Option<PathBuf>; non-null means reselect the folder and
         // scroll the moved row into view. Dispatcher branch + module
         // method both present.
-        assert!(PLACEHOLDER_HTML.contains("ev.kind === 'preset_corpus_changed'"));
-        assert!(PLACEHOLDER_HTML.contains("browserPanel.followPath"));
-        assert!(PLACEHOLDER_HTML.contains("function followPath("));
+        assert!(assembled().contains("ev.kind === 'preset_corpus_changed'"));
+        assert!(assembled().contains("browserPanel.followPath"));
+        assert!(assembled().contains("function followPath("));
         // Rendered rows tag themselves with `data-path` so followPath
         // can locate the moved row via a CSS attribute selector.
-        assert!(PLACEHOLDER_HTML.contains("r.dataset.path = p.path"));
-        assert!(PLACEHOLDER_HTML.contains("r.dataset.path = h.source.path"));
+        assert!(assembled().contains("r.dataset.path = p.path"));
+        assert!(assembled().contains("r.dataset.path = h.source.path"));
     }
 }

@@ -1,0 +1,1043 @@
+/* Faceplate scaffold (0040). Mirrors the vizia editor's geometry from
+   `target/vxn-layout.jsonl`: 1024×772 logical, 10px outer padding, 8px
+   vertical gap between banner / preset-bar / 4×156 rows, 6px horizontal
+   gap between panels in a row. CSS vars are named after the vxn-ui Rust
+   constants so the mapping stays obvious; pixel literals stay out of
+   selectors so a future resize policy is one variable change. */
+:root {
+  /* Palette (matches vxn-ui-vizia's STYLE block). */
+  --face-bg: #2b2b2b;
+  --panel-bg: #1c1c1c;
+  --panel-border: #0e0e0e;
+  --panel-corner: 4px;
+  --header-bg: #a7cfe2;
+  --header-fg: #141414;
+  --banner-fg: #a7cfe2;
+  --text: #d6d6d6;
+  --ctl-label: #aeaeae;
+  --ctl-value: #d9701b;          /* orange readout — Vizia .ctl-value */
+  --track-bg: #0e0e0e;
+  --track-fill: #d9701b;
+  --thumb-bg: #c4c4c4;
+  --thumb-border: #a7cfe2;       /* matches --glyph-active / --knob-indicator */
+  --glyph: #888888;
+  --glyph-active: #a7cfe2;
+  --knob-face: #2a2a2a;
+  --knob-rim: #444444;
+  --knob-dimple: #222222;
+  --knob-dimple-rim: #333333;
+  --knob-indicator: #a7cfe2;       /* matches --glyph-active */
+
+  /* Geometry (matches vxn-ui-vizia's PANEL_H / FADER_H / COL_H / DIAL plus
+     row + chrome heights derived from `target/vxn-layout.jsonl`). */
+  --editor-w: 1024px;
+  --pad-outer: 10px;
+  --banner-h: 26px;
+  --preset-bar-h: 30px;
+  --panel-h: 156px;           /* PANEL_H */
+  --col-h: 120px;             /* COL_H — per-control column inside a panel */
+  --fader-h: 74px;            /* FADER_H — fader travel */
+  --dial: 62px;               /* DIAL — selector-knob box */
+  --panel-pad: 5px;
+  --panel-vgap: 4px;
+  --row-vgap: 8px;
+  --row-hgap: 6px;
+  --header-h: 16px;
+  --header-toggle-slot: 16px; /* reserves the Chorus/Delay header switch (0045) */
+  --ctl-label-h: 12px;
+  --ctl-value-h: 12px;
+  --ctl-gap: 2px;
+  --fader-track-w: 4px;
+  --thumb-w: 18px;
+  --thumb-h: 8px;
+  --wave-knob-size: 64px;     /* matches the prototype's "Compact" variant */
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--face-bg);
+  color: var(--text);
+  font-family: "IBM Plex Sans Condensed", -apple-system, system-ui, sans-serif;
+  /* Disable text selection across the faceplate — knobs / faders behave more
+     like physical controls than text. */
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.faceplate {
+  width: var(--editor-w);
+  box-sizing: border-box;
+  padding: var(--pad-outer);
+  display: flex;
+  flex-direction: column;
+  gap: var(--row-vgap);
+}
+
+.banner {
+  height: var(--banner-h);
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--panel-corner);
+  color: var(--banner-fg);
+  font-size: 16px;
+  letter-spacing: 3px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Preset bar (0049). Sits in the 30px row between banner and Row 1.
+   Carries the current preset name, prev/next walker buttons over the
+   combined Factory+User list, a Browse toggle (binds to 0050's browser
+   panel), and a Save As button (opens the 0048 floating popup). The
+   status chip is the same `.status-pill` primitive 0046 introduced —
+   re-anchored from the lower-right corner to the right of the name
+   (ticket §Notes). */
+.preset-bar-slot {
+  height: var(--preset-bar-h);
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--panel-corner);
+  display: flex;
+  align-items: center;
+  padding: 0 8px;
+  gap: 6px;
+  box-sizing: border-box;
+  color: var(--text);
+}
+.pbar-btn {
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 2px;
+  color: var(--ctl-label);
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  padding: 2px 8px;
+  height: 18px;
+  cursor: pointer;
+  user-select: none;
+}
+.pbar-btn:hover { border-color: var(--glyph-active); color: #ececec; }
+.pbar-btn.active {
+  background: #1f9cff;
+  border-color: #84cdff;
+  color: #fff;
+}
+.pbar-step { padding: 0 6px; min-width: 18px; text-align: center; }
+.pbar-name {
+  font-size: 12px;
+  color: var(--ctl-value);
+  font-weight: 600;
+  letter-spacing: 0.5px;
+  min-width: 150px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pbar-spacer { flex: 1 1 auto; }
+
+/* Preset browser panel (0050). Floats inside the faceplate document, just
+   below the preset bar. Outside-click + ESC dismiss. Width sized to keep
+   long preset names readable without dominating the row beneath it; height
+   capped so it never reaches Row 4 even when the corpus is dense — content
+   scrolls inside each pane. The container's `.hoverable` doesn't matter
+   here (no Vizia rules in play), and `pointer-events: none` on the
+   anchored `position: relative` ancestor would be wrong anyway: clicks
+   inside the panel must work. */
+.faceplate { position: relative; }
+/* The `hidden` HTML attribute maps to UA `display: none`, but a class-set
+   `display: flex` on the panel beats it. Promote `[hidden]` explicitly so
+   the bootstrap-time render isn't visible before `setOpen(false)` would
+   normally hide it. */
+.browser-panel[hidden],
+.browser-backdrop[hidden] { display: none !important; }
+.browser-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  /* Invisible — its only job is to swallow outside clicks and dispatch
+     them to the close handler. Pointer events stay on so the click lands. */
+}
+.browser-panel {
+  position: absolute;
+  top: calc(var(--pad-outer) + var(--banner-h) + var(--row-vgap)
+           + var(--preset-bar-h) + var(--row-vgap));
+  left: var(--pad-outer);
+  width: 760px;
+  max-width: calc(var(--editor-w) - 2 * var(--pad-outer));
+  height: 420px;
+  z-index: 60;
+  background: var(--panel-bg);
+  border: 1px solid var(--ctl-value);
+  border-radius: var(--panel-corner);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  padding: 8px;
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.browser-close {
+  position: absolute;
+  top: 6px;
+  right: 8px;
+  z-index: 1;
+  background: transparent;
+  border: none;
+  color: var(--ctl-label);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  padding: 2px 4px;
+  cursor: pointer;
+  user-select: none;
+}
+.browser-close:hover { color: #ececec; }
+.browser-search {
+  position: relative;
+  height: 22px;
+  flex: 0 0 auto;
+  /* Width matches the folders pane so the search box reads as a header
+     to the category list, not a panel-wide bar. Clear-X overlays the
+     input's right edge (see `.browser-search-clear`). */
+  width: 220px;
+}
+.browser-search input {
+  width: 100%;
+  background: #0e0e0e;
+  border: 1px solid #2a2a2a;
+  border-radius: 2px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  height: 22px;
+  padding: 0 22px 0 6px; /* right padding leaves room for the in-box clear-X */
+  box-sizing: border-box;
+  outline: none;
+}
+.browser-search input:focus { border-color: var(--glyph-active); }
+.browser-search-clear {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  width: 16px;
+  height: 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 2px;
+  color: var(--ctl-label);
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+  user-select: none;
+}
+.browser-search-clear:hover { color: #ececec; }
+.browser-panes {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  gap: 6px;
+}
+.browser-pane {
+  background: #0e0e0e;
+  border: 1px solid #2a2a2a;
+  border-radius: 2px;
+  overflow-y: auto;
+  padding: 2px;
+  box-sizing: border-box;
+}
+.browser-pane-folders { width: 220px; flex: 0 0 220px; }
+.browser-pane-presets { flex: 1 1 auto; }
+.browser-section {
+  font-size: 9px;
+  color: var(--ctl-value);
+  letter-spacing: 1px;
+  font-weight: 700;
+  text-transform: uppercase;
+  padding: 6px 4px 4px;
+  height: 22px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: flex-end;
+}
+.browser-row {
+  font-size: 12px;
+  color: var(--text);
+  padding: 3px 8px;
+  border-radius: 2px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 16px;
+}
+.browser-row:hover { background: #1c1c1c; }
+.browser-row.selected {
+  background: #1c1c1c;
+  color: #ececec;
+  box-shadow: inset 2px 0 0 var(--ctl-value);
+}
+.browser-row.current {
+  color: var(--ctl-value);
+  font-weight: 600;
+}
+/* HTML5 DnD (0052). `.dragging` dims the source preset row while it's
+   being dragged; `.drag-over` highlights a valid drop target (user
+   folder, not the source); `.drag-blocked` dims the source folder when
+   hovered mid-drag so the user reads the no-op explicitly. Factory
+   folder rows get neither class because their handlers aren't wired —
+   default browser behaviour rejects the drop. */
+.browser-row.dragging { opacity: 0.5; }
+.browser-row.drag-over {
+  background: #2a2a2a;
+  color: #ececec;
+  box-shadow: inset 2px 0 0 var(--glyph-active);
+}
+.browser-row.drag-blocked {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+/* Search-mode rows lay out as `name + muted origin label` so cross-folder
+   matches don't read as ambiguous duplicates ("Brassy" in Factory/Lead
+   vs. user/Bass). The origin pushes right. */
+.browser-row.search-row { display: flex; align-items: baseline; gap: 8px; }
+.browser-row.search-row .browser-row-name {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.browser-row.search-row .browser-row-origin {
+  flex: 0 0 auto;
+  font-size: 10px;
+  color: var(--ctl-label);
+  letter-spacing: 0.3px;
+}
+.browser-empty {
+  font-size: 11px;
+  color: var(--ctl-label);
+  padding: 8px;
+  font-style: italic;
+}
+/* "+ New" button mounted inline with the User section header (0051). The
+   section header is normally `display: flex; align-items: flex-end;` —
+   the button rides the right edge of that row. */
+.browser-section-row {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  padding-right: 4px;
+}
+.browser-section-row .browser-section { flex: 1 1 auto; padding-right: 0; }
+.browser-new-folder {
+  flex: 0 0 auto;
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 2px;
+  color: var(--ctl-label);
+  font: inherit;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  padding: 1px 5px;
+  height: 16px;
+  cursor: pointer;
+  user-select: none;
+  margin-bottom: 4px;
+}
+.browser-new-folder:hover { border-color: var(--glyph-active); color: #ececec; }
+
+/* Right-click context menu (0051). Mounts inside the browser panel as a
+   sibling of the panes; absolutely positioned at the click coordinates
+   (relative to the panel). The "Move to ▸" submenu is a child of its row,
+   shown on hover via CSS — no JS state for hover open. */
+.browser-menu {
+  position: absolute;
+  z-index: 70;
+  background: #1c1c1c;
+  border: 1px solid var(--ctl-value);
+  border-radius: 2px;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.5);
+  padding: 2px 0;
+  min-width: 120px;
+}
+.browser-menu-item {
+  position: relative;
+  font-size: 12px;
+  color: var(--text);
+  padding: 4px 12px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.browser-menu-item:hover { background: #2a2a2a; }
+.browser-menu-item.has-submenu::after {
+  content: '▸';
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--ctl-label);
+  font-size: 10px;
+}
+.browser-submenu {
+  display: none;
+  position: absolute;
+  left: 100%;
+  top: -3px;
+  background: #1c1c1c;
+  border: 1px solid var(--ctl-value);
+  border-radius: 2px;
+  box-shadow: 0 4px 10px rgba(0, 0, 0, 0.5);
+  padding: 2px 0;
+  min-width: 120px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+.browser-menu-item.has-submenu:hover > .browser-submenu { display: block; }
+.browser-submenu-item {
+  font-size: 12px;
+  color: var(--text);
+  padding: 4px 12px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+.browser-submenu-item:hover { background: #2a2a2a; }
+.browser-submenu-empty {
+  font-size: 11px;
+  color: var(--ctl-label);
+  padding: 4px 12px;
+  font-style: italic;
+}
+/* Confirm modal (0051). Centred inside the browser panel; backdrop
+   absorbs clicks so the panel beneath isn't dismissed by a confirm-click.
+   Replaces the Vizia version's two-click row-armed pattern (the right-
+   click menu obscured the row text under it). */
+.browser-modal-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 80;
+  background: rgba(0, 0, 0, 0.55);
+}
+.browser-modal {
+  position: absolute;
+  z-index: 81;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  background: #1c1c1c;
+  border: 1px solid var(--ctl-value);
+  border-radius: var(--panel-corner);
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.6);
+  padding: 14px 18px;
+  min-width: 260px;
+  max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.browser-modal-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--ctl-value);
+}
+.browser-modal-body {
+  font-size: 12px;
+  color: var(--text);
+  line-height: 1.4;
+  word-break: break-word;
+}
+.browser-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.browser-modal-btn {
+  background: #2a2a2a;
+  border: 1px solid #444;
+  border-radius: 2px;
+  color: var(--ctl-label);
+  font: inherit;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  padding: 4px 12px;
+  cursor: pointer;
+  user-select: none;
+}
+.browser-modal-btn:hover { border-color: var(--glyph-active); color: #ececec; }
+.browser-modal-btn.danger {
+  border-color: #ff5050;
+  color: #ff7676;
+}
+.browser-modal-btn.danger:hover {
+  background: #2a1414;
+  color: #ffb0b0;
+}
+.browser-modal-btn.disabled,
+.browser-modal-btn:disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+/* Save As modal form: two-row label + control grid. */
+.save-as-body { display: flex; flex-direction: column; gap: 8px; min-width: 320px; }
+.save-as-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.save-as-label {
+  flex: 0 0 56px;
+  font-size: 10px;
+  color: var(--ctl-label);
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+.save-as-name {
+  flex: 1 1 auto;
+  background: #0e0e0e;
+  border: 1px solid #2a2a2a;
+  border-radius: 2px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.save-as-name.placeholder { color: var(--ctl-label); font-style: italic; }
+.save-as-select {
+  flex: 1 1 auto;
+  background: #0e0e0e;
+  border: 1px solid #2a2a2a;
+  border-radius: 2px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  height: 24px;
+  padding: 0 6px;
+  cursor: pointer;
+}
+.save-as-select:focus { outline: none; border-color: var(--glyph-active); }
+
+.row {
+  display: flex;
+  gap: var(--row-hgap);
+  height: var(--panel-h);
+}
+
+.panel {
+  position: relative;             /* anchor for absolutely-placed .panel-strip */
+  background: var(--panel-bg);
+  border: 1px solid var(--panel-border);
+  border-radius: var(--panel-corner);
+  padding: var(--panel-pad);
+  display: flex;
+  flex-direction: column;
+  gap: var(--panel-vgap);
+  min-width: 0;
+  flex: 1 1 0;
+  box-sizing: border-box;
+}
+
+.panel[data-layered] {}
+
+/* Per-row stretch shares — pulled from `panel_view`'s `match title` block
+   in `crates/vxn-ui-vizia/src/lib.rs`. flex-basis is 0 so `flex-grow`
+   gives a pure ratio. Bend is the only fixed-width panel. */
+.row-1 .panel[data-name="LFO 1"]  { flex-grow: 1.2; }
+.row-1 .panel[data-name="LFO 2"]  { flex-grow: 0.7; }
+.row-1 .panel[data-name="Osc 1"]  { flex-grow: 1.2; }
+.row-1 .panel[data-name="Osc 2"]  { flex-grow: 1.2; }
+.row-1 .panel[data-name="Mixer"]  { flex-grow: 1.1; }
+
+.row-2 .panel[data-name="Env 1"]      { flex-grow: 0.8; }
+.row-2 .panel[data-name="Env 2"]      { flex-grow: 0.8; }
+.row-2 .panel[data-name="VCA"]        { flex-grow: 0.75; }
+.row-2 .panel[data-name="Filter"]     { flex-grow: 1.15; }
+.row-2 .panel[data-name="Filter Mod"] { flex-grow: 1.0; }
+
+.row-3 .panel[data-name="Pitch Mod"] { flex-grow: 1.2; }
+.row-3 .panel[data-name="PWM Mod"]   { flex-grow: 1.0; }
+.row-3 .panel[data-name="Cross Mod"] { flex-grow: 0.55; }
+.row-3 .panel[data-name="Mod Wheel"] { flex-grow: 1.2; }
+.row-3 .panel[data-name="Bend"] { flex: 0 0 54px; }
+
+/* Row 4 — six panels (Keys / Voice / Chorus / Delay / Reverb / Master).
+   Tuned shares so the new Reverb panel doesn't crush the rest; nudge later
+   once seen on the running editor. */
+.row-4 .panel[data-name="Keys"]   { flex-grow: 1.00; }
+.row-4 .panel[data-name="Voice"]  { flex-grow: 0.85; }
+.row-4 .panel[data-name="Chorus"] { flex-grow: 0.80; }
+.row-4 .panel[data-name="Delay"]  { flex-grow: 0.90; }
+.row-4 .panel[data-name="Reverb"] { flex-grow: 0.95; }
+.row-4 .panel[data-name="Master"] { flex-grow: 1.25; }
+
+.panel-header {
+  height: var(--header-h);
+  background: var(--header-bg);
+  color: var(--header-fg);
+  border-radius: 2px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-transform: uppercase;
+}
+
+.panel[data-header-toggle] .panel-header {
+  justify-content: flex-start;
+  padding-left: 3px;
+  gap: 4px;
+}
+.panel[data-header-toggle] .panel-header-toggle-slot {
+  width: var(--header-toggle-slot);
+  height: var(--header-toggle-slot);
+  flex: 0 0 var(--header-toggle-slot);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.panel[data-header-toggle] .panel-header-title {
+  flex: 1 1 auto;
+  text-align: center;
+  margin-right: var(--header-toggle-slot);
+}
+
+.panel-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  gap: 4px;
+  align-items: stretch;
+  justify-content: space-evenly;
+}
+/* Panels whose first body child is a selector buttongroup anchor it to the
+   panel's left edge so the distance from panel padding → first button is
+   uniform across Filter / Cross Mod / Reverb. Subsequent faders flow with
+   a fixed gap rather than the body's default `space-evenly`. */
+.panel-body:has(> .ctl-buttongroup:first-child) {
+  justify-content: flex-start;
+  gap: 10px;
+}
+
+/* ── Control primitives (0041) ──────────────────────────────────────────── */
+
+/* Common cell — a vertical stack of label, control, value. */
+.ctl {
+  position: relative;          /* anchor for the absolute .ctl-value popup */
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  gap: var(--ctl-gap);
+  height: var(--col-h);
+  min-width: 0;
+}
+
+.ctl-label {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--ctl-label);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  height: var(--ctl-label-h);
+  line-height: var(--ctl-label-h);
+}
+
+/* Floating value popup — one shared <div> across every control, anchored
+   at the pointer's entry / grab point in fixed coords so it floats above
+   the layout and can never push siblings around. Style matches the vizia
+   editor's `.value-pop` (dark fill, orange border). */
+.value-pop {
+  position: fixed;
+  display: none;
+  pointer-events: none;
+  background: #0e0e0e;
+  border: 1px solid var(--ctl-value);
+  border-radius: 3px;
+  padding: 2px 5px;
+  font-size: 10px;
+  color: #f6f6f6;
+  white-space: nowrap;
+  z-index: 1000;
+}
+
+/* Status pill (0046) — inline chip in the preset bar, right of the
+   current name (0049 §Notes). Driven by the controller's `Status { line }`
+   ViewEvent (clamp warnings on preset load, save / load messages). Fades
+   after ~3s; pure CSS animation so the JS side just sets the line and
+   toggles the `visible` class. */
+.status-pill {
+  background: #0e0e0e;
+  border: 1px solid var(--glyph-active);
+  border-radius: 3px;
+  padding: 2px 8px;
+  font-size: 10px;
+  color: #f6f6f6;
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 240ms ease-out;
+}
+.status-pill.visible { opacity: 1; }
+
+/* Fader — vertical track + thumb. Pointer ops issue Begin/EndGesture
+   brackets so the host's automation lane records as one event, not a
+   pixel storm. */
+.ctl-fader {
+  position: relative;
+  width: var(--thumb-w);
+  height: var(--fader-h);
+  cursor: ns-resize;
+  /* Hit area extends slightly past the track so a near-miss still grabs. */
+  touch-action: none;
+}
+.ctl-fader-track {
+  position: absolute;
+  left: calc((var(--thumb-w) - var(--fader-track-w)) / 2);
+  top: 0;
+  width: var(--fader-track-w);
+  height: 100%;
+  /* Below-thumb portion paints lighter than above so the slider reads
+     as filled. `--fader-norm` (0..1) is set by setThumb on the cell. */
+  background: linear-gradient(
+    to top,
+    #3a3a3a 0,
+    #3a3a3a calc(var(--fader-norm, 0) * 100%),
+    var(--track-bg) calc(var(--fader-norm, 0) * 100%),
+    var(--track-bg) 100%
+  );
+  border-radius: 2px;
+}
+.ctl-fader-track::before {
+  content: '';
+  position: absolute;
+  left: -3px;
+  right: -3px;
+  top: 50%;
+  height: 1px;
+  background: #3a3a3a;
+}
+.ctl-fader-thumb {
+  position: absolute;
+  left: 0;
+  width: var(--thumb-w);
+  height: var(--thumb-h);
+  background: var(--thumb-bg);
+  border: 1px solid var(--thumb-border);
+  border-radius: 1px;
+  transform: translateY(-50%);
+  top: 50%;
+  pointer-events: none;
+  box-shadow: 0 0 4px rgba(255, 255, 255, 0.15);
+}
+.ctl-fader.dragging .ctl-fader-thumb {
+  box-shadow: 0 0 6px var(--ctl-value);
+}
+
+/* Rotary waveform selector (0041). SVG-based: knob face + rotating
+   indicator + glyph labels arranged at the corners (SW/NW/NE/SE) outside
+   the rim. All visuals + hit-testing live in the SVG; no DOM children to
+   reflow. Layout stability comes for free — the dial occupies a fixed
+   square (--wave-knob-size) regardless of state. */
+.ctl-wave {
+  width: var(--wave-knob-size);
+  height: var(--wave-knob-size);
+  cursor: grab;
+  touch-action: none;
+}
+.ctl-wave.dragging { cursor: grabbing; }
+
+/* Bottom strip — selector/toggle controls (NoiseColor, FilterSlope, etc.)
+   relocated into the panel's free clearance below the main column row.
+   Absolutely placed so it never grows the panel or competes with ctl
+   columns for flex space. Mirrors the vizia editor's strip placement
+   (left: 8px, bottom: 4px). */
+.panel-strip {
+  position: absolute;
+  left: 8px;
+  bottom: 4px;
+  right: 5px;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  pointer-events: none;           /* empty space passes through to body */
+}
+.panel-strip > * { pointer-events: auto; }
+
+/* Master's strip stacks Oversample (horizontal toggle row) over Limit
+   (single toggle) — `panel-strip` defaults to a single horizontal row,
+   so this is the one panel that overrides it. */
+.master-strip {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+}
+
+/* Toggle row — small box + inline label. Matches vizia .tg-row /
+   .tg-box / .tg-lbl exactly (#1f9cff active fill, 9×9 box, 7 px label). */
+.ctl-tg-row {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+.ctl-tg-box {
+  width: 11px;
+  height: 11px;
+  background: #4a4a4a;
+  border: 1px solid #8a8a8a;
+  border-radius: 2px;
+  box-sizing: border-box;
+}
+.ctl-tg-row:hover .ctl-tg-box { border-color: #c4c4c4; }
+.ctl-tg-row.active .ctl-tg-box {
+  background: #1f9cff;
+  border-color: #84cdff;
+  box-shadow: 0 0 6px #36b3ff;
+}
+.ctl-tg-lbl {
+  font-size: 9px;
+  color: #9a9a9a;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  font-weight: 700;
+}
+.ctl-tg-row.active .ctl-tg-lbl { color: #ececec; }
+
+/* ButtonGroup — rendered exactly like a strip of toggles (same `.ctl-tg-row`
+   children) but inside a normal column with a label on top. Used for
+   Oversample / CrossModType / AssignMode. */
+.ctl-buttongroup {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--ctl-gap);
+}
+.ctl-buttongroup .ctl-tg-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: flex-start;
+}
+
+/* Dropdown — native <select> styled to match the dark palette. Fallback for
+   enums that don't fit ButtonGroup (too many variants, or a long name list). */
+.ctl-dropdown {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--ctl-gap);
+}
+.ctl-dropdown select {
+  background: #1c1c1c;
+  color: var(--text);
+  border: 1px solid #444;
+  border-radius: 2px;
+  font-family: inherit;
+  font-size: 10px;
+  padding: 1px 4px;
+}
+.ctl-dropdown select:focus { outline: 1px solid var(--ctl-value); }
+
+/* Dimmed — applied to control cells whose param is gated by a sibling
+   (LFO 1's Delay/Fade dim while Free is on; Filter Slope dims when the
+   mode is Notch, where the DSP's `FilterMode::mix` ignores slope, see
+   vxn-dsp/src/ota_ladder.rs). Visual-only: pointer events still pass
+   through so DAW automation echoes still move the thumb. Same selector
+   covers both panel-body (`.ctl`) and panel-strip (`.ctl-strip`)
+   mounts. */
+.ctl.dimmed, .ctl-strip.dimmed, .route-col.dimmed { opacity: 0.4; }
+
+/* Mod-route column (0044): one column header (LFO / Env) over a
+   horizontal pair — source selector on the left, depth fader on the
+   right — mirroring vxn_ui_vizia's `mod_route_view`. The child
+   buttongroup omits its own label (kept structurally for the variant
+   rows) since the route header already names the source. */
+.route-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--ctl-gap);
+  height: var(--col-h);
+  min-width: 0;
+}
+.route-col-head {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--ctl-label);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  height: var(--ctl-label-h);
+  line-height: var(--ctl-label-h);
+}
+.route-col-body {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 6px;
+}
+.route-col .ctl {
+  height: auto;
+}
+/* Depth fader + Mod switch (0063): the switch lives directly below its
+   depth fader, centred so the toggle box reads as belonging to the
+   slider above it (Pitch LFO Mod / Pitch Env Mod divert their route to
+   the cross-mod modulator). The wrapping column sits in the same row
+   as the source buttongroup. */
+.route-col-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--ctl-gap);
+}
+
+/* Header-switch box (Chorus / Delay, 0045) — a small toggle child of
+   `.panel-header-toggle-slot`. Sized to sit *inside* the 16 px header
+   bar, not fill it, so the box reads as a control on the header rather
+   than the header's whole left edge. Palette matches `.ctl-tg-box` but
+   the inactive border picks up a header-tinted shade so it reads as
+   part of the header chrome. */
+.panel-header-switch {
+  width: 10px;
+  height: 10px;
+  background: #4a4a4a;
+  border: 1px solid #2c4a59;
+  border-radius: 2px;
+  box-sizing: border-box;
+  cursor: pointer;
+}
+.panel-header-switch:hover { border-color: #141414; }
+.panel-header-switch.active {
+  background: #1f9cff;
+  border-color: #84cdff;
+  box-shadow: 0 0 6px #36b3ff;
+}
+
+/* Voice panel's Detune column — a normal fader on top with the Legato
+   toggle beneath it (level with the Solo row in the assign list), so the
+   whole column keeps the same width as a plain fader column (0045). */
+.ctl-detune {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--ctl-gap);
+  height: var(--col-h);
+  min-width: 0;
+}
+.ctl-detune-body {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
+}
+.ctl-detune-legato { margin-top: 4px; }
+.ctl-detune-legato.disabled { opacity: 0.4; pointer-events: none; }
+
+/* Keys panel (0053): mode/edit toggle columns side by side, split slider
+   + note-name readout below, Reset button at the bottom. Mirrors the
+   vizia editor's `keys_panel` shape (mode column on the left, edit column
+   on the right, split slider spanning, Reset stretched full-width). The
+   edit column and the split row reserve their layout slot via
+   `visibility: hidden` rather than `display: none` so the Reset never
+   shifts when the mode flips. */
+.keys-body {
+  flex-direction: column;
+  align-items: stretch;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 4px 6px 4px 6px;
+}
+.keys-top {
+  display: flex;
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 12px;
+}
+.keys-tg-list {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  align-items: flex-start;
+}
+.keys-tg-list .ctl-tg-row { padding: 1px 0; }
+.keys-split-row {
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+}
+.keys-split-slider {
+  flex: 1 1 auto;
+  height: 14px;
+  margin: 0;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+.keys-split-slider::-webkit-slider-runnable-track {
+  height: 4px;
+  background: var(--track-bg);
+  border-radius: 2px;
+}
+.keys-split-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 10px;
+  height: 14px;
+  background: var(--thumb-bg);
+  border: 1px solid var(--thumb-border);
+  border-radius: 1px;
+  margin-top: -5px;
+}
+.keys-split-slider:focus { outline: none; }
+.keys-split-readout {
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--ctl-value);
+  letter-spacing: 0.5px;
+  min-width: 22px;
+  text-align: right;
+}
+.keys-reset {
+  height: 16px;
+  background: #333333;
+  color: #b0b0b0;
+  border: 1px solid #555555;
+  border-radius: 2px;
+  font-family: inherit;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  cursor: pointer;
+  margin-top: auto;
+}
+.keys-reset:hover {
+  background: #3a3a3a;
+  border-color: #c4c4c4;
+  color: #ececec;
+}
