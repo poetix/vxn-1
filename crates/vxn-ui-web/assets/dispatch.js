@@ -1,13 +1,41 @@
 // ─── Init + dispatch ───────────────────────────────────────────────────────
 
+// Cached name → lowest-id index, built once in `init()` against
+// `window.vxn.params`. Null before init or in pure-helper test paths that
+// never call init — the first `paramIdByName` lookup builds it lazily.
+// `window.vxn.params` is set once at editor open and never reassigned; if
+// that ever changes, set `_paramIdByName = null` at the reassign site.
+let _paramIdByName = null;
+// Test-visible counter — increments every time the cache is built.
+// Production code ignores this; the param-id-by-name suite asserts the
+// build happens exactly once per init.
+export let _paramIndexBuilds = 0;
+
+export function buildParamIndex() {
+  _paramIndexBuilds += 1;
+  const ix = new Map();
+  const params = (window.vxn && window.vxn.params) || {};
+  for (const k in params) {
+    const name = params[k].name;
+    if (name != null && !ix.has(name)) ix.set(name, parseInt(k, 10));
+  }
+  return ix;
+}
+
 // Lowest-id name lookup — for a per-patch param this is the Upper-layer id
 // (id < patchCount); for a global it's the global id directly. Layer
 // rebinding (0045) translates Upper → Lower with `+patchCount`.
 export function paramIdByName(name) {
-  for (const k in window.vxn.params) {
-    if (window.vxn.params[k].name === name) return parseInt(k, 10);
-  }
-  return null;
+  if (_paramIdByName == null) _paramIdByName = buildParamIndex();
+  const id = _paramIdByName.get(name);
+  return id == null ? null : id;
+}
+
+// Test-only cache reset. Production code never reassigns `window.vxn.params`,
+// but the unit suite swaps the fixture between tests.
+export function _resetParamIndex() {
+  _paramIdByName = null;
+  _paramIndexBuilds = 0;
 }
 
 // Per-layer name → id lookup. Globals (id ≥ 2·patchCount) are layer-
@@ -324,6 +352,9 @@ export function init() {
     model.cells.push(entry);
   });
   collectDimRuleSpecs();
+  // Build the name → id reverse index once, before the first rebind so
+  // every per-cell `paramIdByName` lookup hits the cached map (N5).
+  _paramIdByName = buildParamIndex();
   rebindAllForLayer(model.currentLayer);
 
   // Dispatch one ViewEvent from Rust. ParamChanged routes by id (with the

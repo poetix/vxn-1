@@ -262,58 +262,75 @@ export const KNOB_INDICATOR_TRANSITION_MS = 120;
 // load-bearing).
 export const TWIN_TOP_CT = 20.0;
 
-// Wires the vertical-drag protocol shared by every fader-shaped control.
+// Generalised pointer-drag protocol. Both fader-shaped controls (vertical
+// linear norm) and the wave knob (vertical pixel-delta off a captured start
+// state) share the same hover / down / capture / move / release lifecycle —
+// they only differ in how pointer position maps to a value.
+//
+// `pointerToValue(ev, ctx)` — required. Runs on `pointerdown` (its return
+//   value is the second arg to `onDown`) and `pointermove` (second arg to
+//   `onMove`). `ctx` is whatever `downContext` returned for this drag.
+// `downContext(ev)` — optional. Runs once on `pointerdown`, before
+//   `pointerToValue`. Lets stateful drags (the wave knob) stash start
+//   coordinates / start value cleanly instead of via closure-scoped lets.
+//
 // Callbacks fire in order:
 //   onEnter(ev)             — hover begins (not during drag)
-//   onDown(ev, norm)        — pointer down, drag starts. `norm` is the
-//                             pointer's [0, 1] vertical position on the
-//                             fader at down-time.
-//   onMove(ev, norm)        — drag-time move. Fires only while dragging.
+//   onDown(ev, value)       — pointer down, drag starts.
+//   onMove(ev, value)       — drag-time move. Fires only while dragging.
 //   onUp(ev)                — drag ends (pointerup or cancel).
 //   onLeave()               — hover ends (not during drag).
 // Returns { isDragging, isHovered } getters for callers whose
 // ParamChanged echoes need to know whether to update the popup.
-export function wireFaderDrag(fader, { onEnter, onDown, onMove, onUp, onLeave }) {
+export function wireDrag(el, { pointerToValue, downContext }, { onEnter, onDown, onMove, onUp, onLeave }) {
   let dragging = false;
   let hovered = false;
-  const norm = (ev) => {
-    const r = fader.getBoundingClientRect();
-    return Math.max(0, Math.min(1, 1 - (ev.clientY - r.top) / r.height));
-  };
-  fader.addEventListener('pointerenter', (ev) => {
+  let ctx = null;
+  el.addEventListener('pointerenter', (ev) => {
     if (dragging) return;
     hovered = true;
     if (onEnter) onEnter(ev);
   });
-  fader.addEventListener('pointerleave', () => {
+  el.addEventListener('pointerleave', () => {
     hovered = false;
     if (!dragging && onLeave) onLeave();
   });
-  fader.addEventListener('pointerdown', (ev) => {
+  el.addEventListener('pointerdown', (ev) => {
     ev.preventDefault();
     dragging = true;
-    fader.classList.add('dragging');
-    fader.setPointerCapture(ev.pointerId);
-    if (onDown) onDown(ev, norm(ev));
+    ctx = downContext ? downContext(ev) : null;
+    el.classList.add('dragging');
+    el.setPointerCapture(ev.pointerId);
+    if (onDown) onDown(ev, pointerToValue(ev, ctx));
   });
-  fader.addEventListener('pointermove', (ev) => {
+  el.addEventListener('pointermove', (ev) => {
     if (!dragging || !onMove) return;
-    onMove(ev, norm(ev));
+    onMove(ev, pointerToValue(ev, ctx));
   });
   const end = (ev) => {
     if (!dragging) return;
     dragging = false;
-    fader.classList.remove('dragging');
-    try { fader.releasePointerCapture(ev.pointerId); } catch (e) {}
+    el.classList.remove('dragging');
+    try { el.releasePointerCapture(ev.pointerId); } catch (e) {}
     if (onUp) onUp(ev);
     if (!hovered && onLeave) onLeave();
   };
-  fader.addEventListener('pointerup', end);
-  fader.addEventListener('pointercancel', end);
+  el.addEventListener('pointerup', end);
+  el.addEventListener('pointercancel', end);
   return {
     isDragging: () => dragging,
     isHovered:  () => hovered,
   };
+}
+
+// Thin wrapper: the fader-shaped controls (Fader, DetuneLegato) all want
+// the same vertical [0, 1] norm.
+export function wireFaderDrag(fader, callbacks) {
+  const pointerToValue = (ev) => {
+    const r = fader.getBoundingClientRect();
+    return Math.max(0, Math.min(1, 1 - (ev.clientY - r.top) / r.height));
+  };
+  return wireDrag(fader, { pointerToValue }, callbacks);
 }
 
 // Attaches the floating value popup's lifecycle to a control. `getLabel()`
@@ -345,11 +362,25 @@ export function attachValuePop(host, getLabel) {
   };
 }
 
+// Paint a vertical fader's thumb at a [0, 1] norm. Norm 0 = bottom, 1 = top.
+// Pins in pixel space against the live element height so the thumb's
+// bounding box stays inside `.ctl-fader` exactly at both ends regardless of
+// `--fader-h` / `--thumb-h` tweaks. Also sets `--fader-norm` for dependent
+// CSS (track fill colour, etc).
+export function paintFader(fader, thumb, norm) {
+  const halfThumb = thumb.offsetHeight / 2;
+  const travel = fader.clientHeight - thumb.offsetHeight;
+  const n = Math.max(0, Math.min(1, norm));
+  thumb.style.top = (halfThumb + (1 - n) * travel) + 'px';
+  fader.style.setProperty('--fader-norm', n);
+}
+
 export function makeFader(el, id, desc, opts) {
+  const noLabel = el.hasAttribute('data-no-label');
   const label = el.dataset.label || desc.label;
   const displayOverride = (opts && opts.displayOverride) || null;
   el.innerHTML = `
-    <div class="ctl-label">${label.toUpperCase()}</div>
+    ${noLabel ? '' : `<div class="ctl-label">${label.toUpperCase()}</div>`}
     <div class="ctl-fader">
       <div class="ctl-fader-track"></div>
       <div class="ctl-fader-thumb"></div>
@@ -358,21 +389,6 @@ export function makeFader(el, id, desc, opts) {
   const fader = el.querySelector('.ctl-fader');
   const thumb = el.querySelector('.ctl-fader-thumb');
   let lastDisplay = '';
-
-  function setThumb(norm) {
-    // Norm 0 = bottom, 1 = top. Clamp the thumb's centre so the thumb's
-    // *bounding box* stays inside `.ctl-fader` — using `top: <pct>%`
-    // with translateY(-50%) put the thumb's top edge 4 px above the
-    // fader at norm=1, which overlapped the label above. Pin in pixel
-    // space against the live element height instead so the clamp is
-    // exact at both ends regardless of --fader-h / --thumb-h tweaks.
-    const halfThumb = thumb.offsetHeight / 2;
-    const travel = fader.clientHeight - thumb.offsetHeight;
-    const n = Math.max(0, Math.min(1, norm));
-    const yPx = halfThumb + (1 - n) * travel;
-    thumb.style.top = yPx + 'px';
-    fader.style.setProperty('--fader-norm', n);
-  }
 
   let drag;
   const pop = attachValuePop({
@@ -384,12 +400,12 @@ export function makeFader(el, id, desc, opts) {
     onLeave: () => pop.markLeft(),
     onDown: (ev, n) => {
       window.vxn.send.beginGesture(id);
-      setThumb(n);                                        // local: no round-trip wait
+      paintFader(fader, thumb, n);                        // local: no round-trip wait
       window.vxn.send.setParamNorm(id, n);
       pop.markGrabbed(ev);                                // re-anchor at the grab point
     },
     onMove: (_ev, n) => {
-      setThumb(n);                                        // local feedback every frame
+      paintFader(fader, thumb, n);                        // local feedback every frame
       window.vxn.send.setParamNorm(id, n);
     },
     onUp: () => {
@@ -402,10 +418,10 @@ export function makeFader(el, id, desc, opts) {
     update(plain, norm, display) {
       // ViewEvent echo — always position the thumb so DAW automation
       // moves it even mid-drag (engine value is authoritative). During a
-      // drag the local pointermove `setThumb` and the round-trip echo
+      // drag the local pointermove `paintFader` and the round-trip echo
       // converge on the same value, so the thumb stays glued to the
       // cursor without flicker.
-      setThumb(norm);
+      paintFader(fader, thumb, norm);
       // Synced LFO rates swap the Hz readout for a subdivision label
       // (0042). The override is null for every other fader, so this
       // collapses to the plain path.
@@ -475,10 +491,6 @@ export function makeWave(el, id, desc) {
 
   let value = 0;
   let displayedAngle = variantDeg(0);
-  let dragging = false;
-  let hovered = false;
-  let dragStartY = 0;
-  let dragStartValue = 0;
   let lastDisplay = variants[0] || '';
 
   const svg = document.createElementNS(SVG_NS, 'svg');
@@ -558,52 +570,33 @@ export function makeWave(el, id, desc) {
   indicatorG.appendChild(indicator);
   svg.appendChild(indicatorG);
 
-  // ── Hover + drag popup ─────────────────────────────────────────────────
-  const pop = attachValuePop({
-    isHovered:  () => hovered,
-    isDragging: () => dragging,
-  }, () => lastDisplay);
-  svg.addEventListener('pointerenter', (ev) => {
-    if (dragging) return;
-    hovered = true;
-    pop.markEntered(ev);
+  // ── Hover + vertical-drag rotation (no wrap) ───────────────────────────
+  // Glyph hits stopPropagation; the knob face falls through to wireDrag.
+  // `downContext` stashes the pixel anchor + the value at grab-time so the
+  // pointer-to-value map is delta-based, not absolute.
+  // `pop` is forward-declared because the drag callbacks reference it but
+  // `attachValuePop` needs the drag's hover/drag getters as its host.
+  let pop;
+  const drag = wireDrag(svg, {
+    downContext: (ev) => ({ y0: ev.clientY, v0: value }),
+    pointerToValue: (ev, ctx) =>
+      clampVariant(ctx.v0 + (ctx.y0 - ev.clientY) / PIXELS_PER_DETENT, variants),
+  }, {
+    onEnter: (ev) => pop.markEntered(ev),
+    onLeave: () => pop.markLeft(),
+    onDown:  (ev) => {
+      window.vxn.send.beginGesture(id);
+      pop.markGrabbed(ev);
+    },
+    onMove:  (_ev, v) => {
+      if (v !== value) window.vxn.send.setParam(id, v);
+    },
+    onUp:    () => {
+      window.vxn.send.endGesture(id);
+      pop.markReleased();
+    },
   });
-  svg.addEventListener('pointerleave', () => {
-    hovered = false;
-    pop.markLeft();
-  });
-
-  // ── Vertical-drag rotation (no wrap) ───────────────────────────────────
-  svg.addEventListener('pointerdown', (ev) => {
-    // Glyph hits stopPropagation; the knob face falls through to here.
-    ev.preventDefault();
-    dragging = true;
-    dragStartY = ev.clientY;
-    dragStartValue = value;
-    svg.classList.add('dragging');
-    svg.setPointerCapture(ev.pointerId);
-    window.vxn.send.beginGesture(id);
-    pop.markGrabbed(ev);
-  });
-  svg.addEventListener('pointermove', (ev) => {
-    if (!dragging) return;
-    const dy = dragStartY - ev.clientY;
-    const raw = dragStartValue + dy / PIXELS_PER_DETENT;
-    const v = clampVariant(raw, variants);
-    if (v !== value) {
-      window.vxn.send.setParam(id, v);
-    }
-  });
-  const endDrag = (ev) => {
-    if (!dragging) return;
-    dragging = false;
-    svg.classList.remove('dragging');
-    try { svg.releasePointerCapture(ev.pointerId); } catch (e) {}
-    window.vxn.send.endGesture(id);
-    pop.markReleased();
-  };
-  svg.addEventListener('pointerup', endDrag);
-  svg.addEventListener('pointercancel', endDrag);
+  pop = attachValuePop(drag, () => lastDisplay);
 
   function applyValue(v, display) {
     value = v;
@@ -644,13 +637,18 @@ export function clampVariant(plain, variants) {
   return Math.max(0, Math.min(variants.length - 1, Math.round(plain)));
 }
 
-export function tgRow(name) {
-  const row = document.createElement('div');
-  row.className = 'ctl-tg-row';
-  row.innerHTML =
+// `tgRow(name)` returns a fresh `.ctl-tg-row` containing the box + label
+// pair. `tgRow(name, { mount })` instead fills the supplied target and
+// returns it — used by composites whose container is already classed
+// (`.ctl-detune-legato.ctl-tg-row`) and need to drop the same inner markup
+// in place.
+export function tgRow(name, opts) {
+  const target = (opts && opts.mount) || document.createElement('div');
+  if (!opts || !opts.mount) target.className = 'ctl-tg-row';
+  target.innerHTML =
     '<div class="ctl-tg-box"></div>' +
     '<div class="ctl-tg-lbl">' + name.toUpperCase() + '</div>';
-  return row;
+  return target;
 }
 
 // `Switch(id, label)` — vertical toggle for bools; also handles 2-variant
@@ -823,9 +821,7 @@ export function makeDetuneLegato(el, ids, descs, modeName, layer) {
   const fader = el.querySelector('.ctl-fader');
   const thumb = el.querySelector('.ctl-fader-thumb');
   const legatoRow = el.querySelector('.ctl-detune-legato');
-  legatoRow.innerHTML =
-    '<div class="ctl-tg-box"></div>' +
-    '<div class="ctl-tg-lbl">LEGATO</div>';
+  tgRow('LEGATO', { mount: legatoRow });
 
   const DESC_TOP = descs.detune.max;
   // Twin's variant index lives in the assign descriptor (current order:
@@ -849,11 +845,7 @@ export function makeDetuneLegato(el, ids, descs, modeName, layer) {
   }
   function setThumbFromPlain(plain) {
     const top = currentTop();
-    const halfThumb = thumb.offsetHeight / 2;
-    const travel = fader.clientHeight - thumb.offsetHeight;
-    const norm = top > 0 ? Math.max(0, Math.min(1, plain / top)) : 0;
-    thumb.style.top = (halfThumb + (1 - norm) * travel) + 'px';
-    fader.style.setProperty('--fader-norm', norm);
+    paintFader(fader, thumb, top > 0 ? plain / top : 0);
   }
 
   let drag;

@@ -18,7 +18,7 @@
   --ctl-value: #d9701b;          /* orange readout — Vizia .ctl-value */
   --track-bg: #0e0e0e;
   --track-fill: #d9701b;
-  --thumb-bg: #c4c4c4;
+  --thumb-bg: #87afb2;
   --thumb-border: #a7cfe2;       /* matches --glyph-active / --knob-indicator */
   --glyph: #888888;
   --glyph-active: #a7cfe2;
@@ -668,7 +668,7 @@ html, body {
   letter-spacing: 0.5px;
   height: var(--ctl-label-h);
   line-height: var(--ctl-label-h);
-  margin-bottom: 2px;
+  margin-bottom: 4px;
 }
 
 /* Floating value popup — one shared <div> across every control, anchored
@@ -742,7 +742,8 @@ html, body {
   left: -3px;
   right: -3px;
   top: 50%;
-  height: 1px;
+  transform: translateY(-50%);
+  height: 3px;
   background: #3a3a3a;
 }
 .ctl-fader-thumb {
@@ -750,6 +751,7 @@ html, body {
   left: 0;
   width: var(--thumb-w);
   height: var(--thumb-h);
+  box-sizing: border-box;
   background: var(--thumb-bg);
   border: 2px solid var(--thumb-border);
   border-radius: 1px;
@@ -899,6 +901,9 @@ html, body {
   letter-spacing: 0.5px;
   height: var(--ctl-label-h);
   line-height: var(--ctl-label-h);
+  /* Matches `.ctl-label`'s margin so faders under a route header line up
+     vertically with faders that sit under a per-control label. */
+  margin-bottom: 4px;
 }
 .route-col-body {
   display: flex;
@@ -919,6 +924,19 @@ html, body {
   flex-direction: column;
   align-items: center;
   gap: var(--ctl-gap);
+}
+/* Mod switch under a depth fader: float the label out of layout flow so
+   the toggle box itself sits on the column's centre axis — i.e. directly
+   under the slider thumb above it — rather than the [box+label] pair
+   centring as a whole (which left the box biased to the left of axis). */
+.route-col-stack .ctl-tg-row { position: relative; }
+.route-col-stack .ctl-tg-lbl {
+  position: absolute;
+  left: 100%;
+  margin-left: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  white-space: nowrap;
 }
 
 /* Header-switch box (Chorus / Delay, 0045) — a small toggle child of

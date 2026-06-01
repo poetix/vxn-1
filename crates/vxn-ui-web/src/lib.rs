@@ -1324,10 +1324,10 @@ mod tests {
         assert!(assembled().contains("browserPanel.openSaveAs"));
         assert!(assembled().contains("ev.kind === 'preset_loaded'"));
         assert!(assembled().contains("presetBar.setName"));
-        // 0050: Browse toggles the panel itself; `_browserOpen` mirrors
-        // open/close so external code (tests, integrations) can observe it.
+        // 0050: Browse toggles the panel itself via `browserPanel.setOpen`;
+        // the `onOpenChange` callback drives the bar's active-class mirror.
+        // (0081 dropped the dead `window.vxn._browserOpen` write.)
         assert!(assembled().contains("browserPanel.setOpen"));
-        assert!(assembled().contains("window.vxn._browserOpen"));
     }
 
     #[test]
@@ -1618,16 +1618,12 @@ mod tests {
         // break the HTML.
         for (kind, name, label) in [
             // Pitch Mod
-            ("fader",       "pitch_lfo_depth",    "Depth"),
             ("buttongroup", "pitch_lfo_src",      "LFO"),
             ("switch",      "pitch_lfo_mod_only", "Mod"),
-            ("fader",       "pitch_env_depth",    "Depth"),
             ("buttongroup", "pitch_env_src",      "Env"),
             ("switch",      "pitch_env_mod_only", "Mod"),
             // PWM Mod
-            ("fader",       "pwm_lfo_depth", "Depth"),
             ("buttongroup", "pwm_lfo_src",   "LFO"),
-            ("fader",       "pwm_env_depth", "Depth"),
             ("buttongroup", "pwm_env_src",   "Env"),
             // Cross Mod
             ("buttongroup", "cross_mod_type",       "Type"),
@@ -1646,6 +1642,27 @@ mod tests {
             assert!(
                 assembled().contains(&marker),
                 "Row 3 mount point missing: {marker}",
+            );
+        }
+        // Pitch Mod / PWM Mod depth faders carry `data-no-label` — the
+        // route header (LFO / Env) is the only column label, matching the
+        // source buttongroup beside them.
+        for name in [
+            "pitch_lfo_depth",
+            "pitch_env_depth",
+            "pwm_lfo_depth",
+            "pwm_env_depth",
+        ] {
+            let marker = format!(
+                r#"data-control="fader" data-param="{name}" data-dim-when-src-off="#,
+            );
+            assert!(
+                assembled().contains(&marker),
+                "Pitch Mod depth fader missing: {marker}",
+            );
+            assert!(
+                !assembled().contains(&format!(r#"data-param="{name}" data-label="#)),
+                "Pitch Mod depth fader {name} should not carry data-label",
             );
         }
     }
@@ -1809,10 +1826,20 @@ mod tests {
             // LFO 2 source → fader dims on Off).
             ("amp_lfo_depth",   "amp_lfo_src"),
         ] {
-            assert!(
-                assembled().contains(&format!(
+            // Pitch Mod / PWM Mod depth faders dropped their `data-label`
+            // (route header names the column), so the marker between
+            // data-param and data-dim-when-src-off differs from the others.
+            let marker = if depth.starts_with("pitch_") || depth.starts_with("pwm_") {
+                format!(
+                    r#"data-param="{depth}" data-dim-when-src-off="{src}""#,
+                )
+            } else {
+                format!(
                     r#"data-param="{depth}" data-label="Depth" data-dim-when-src-off="{src}""#,
-                )),
+                )
+            };
+            assert!(
+                assembled().contains(&marker),
                 "route depth {depth} missing dim-when-src-off=\"{src}\"",
             );
         }

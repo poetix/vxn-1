@@ -449,7 +449,6 @@ export const browserPanel = (() => {
     isOpen = !!open;
     panelEl.hidden = !isOpen;
     backdropEl.hidden = !isOpen;
-    window.vxn._browserOpen = isOpen;
     if (isOpen) {
       renderFolders();
       renderPresets();
@@ -493,7 +492,7 @@ export const browserPanel = (() => {
 
     // Rename — both targets use the same op shape internals; preset takes
     // `path`, folder takes `old_name`.
-    const renameLabel = target.kind === 'preset' ? target.name : target.name;
+    const renameLabel = target.name;
     appendMenuItem(m, 'Rename', () => {
       closeMenu();
       window.vxn.promptText('Rename', renameLabel, (value) => {
