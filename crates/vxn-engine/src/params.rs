@@ -5,14 +5,15 @@
 //! so the audio code can resolve enum-valued params back to their `vxn_dsp`
 //! types without a second match table.
 
+use crate::reverb_macro::ReverbType;
 use vxn_dsp::{AdsrShape, FilterMode, FilterSlope, LfoShape, NoiseColor, Waveform};
 
 // Re-export the param model surface so engine call sites keep their paths.
 pub use vxn_app::{
     AssignMode, CrossModType, DEFAULT_SPLIT_POINT, EnvSel, GLOBAL_COUNT, GLOBAL_PARAMS,
     GlobalParam, KeyMode, Layer, LfoSel, PATCH_COUNT, PATCH_PARAMS, ParamDesc, ParamKind, ParamRef,
-    PatchParam, TOTAL_PARAMS, Taper, desc_for_clap_id, global_clap_id, module_for_clap_id,
-    param_ref, patch_clap_id,
+    PatchParam, REVERB_TYPE_LABELS, TOTAL_PARAMS, Taper, desc_for_clap_id, global_clap_id,
+    module_for_clap_id, param_ref, patch_clap_id,
 };
 
 #[inline]
@@ -188,6 +189,13 @@ impl GlobalValues {
 
     pub fn lfo2_shape(&self) -> LfoShape {
         LfoShape::ALL[enum_index(self.get(GlobalParam::Lfo2Shape), LfoShape::ALL.len() - 1)]
+    }
+
+    pub fn reverb_type(&self) -> ReverbType {
+        ReverbType::from_index(enum_index(
+            self.get(GlobalParam::ReverbType),
+            ReverbType::COUNT - 1,
+        ))
     }
 }
 

@@ -16,10 +16,10 @@
 use vxn_dsp::{
     AdsrCore, AdsrShape, AdsrStage, CHANNELS_PER_LAYER, CONTROL_BLOCK, FilterMode, FilterSlope,
     LfoCore, LfoShape, NoiseColor, OtaLadderCoeffs, PolyHpf, PolyNoiseBank, PolyOscillator,
-    PolyOtaLadder, Waveform, fast_exp2, note_to_hz, poly_ring_mod, xorshift64,
+    PolyOtaLadder, Waveform, fast_exp2, note_to_hz, poly_ring_mod, poly_sub_square, xorshift64,
 };
 
-use crate::params::{AssignMode, EnvSel, LfoSel};
+use crate::params::{AssignMode, CrossModType, EnvSel, LfoSel};
 
 /// One [`VoiceBank`] is a single layer: its channels render together as a
 /// homogeneous group (ADR 0003 §10).
@@ -102,8 +102,13 @@ pub struct BlockCtx {
     pub osc2_wave: Waveform,
     pub osc1_level: f32,
     pub osc2_level: f32,
-    /// Ring-modulator (osc1×osc2) mix level (0021). 0 = the cheap no-op path.
-    pub ring_level: f32,
+    /// Sub-oscillator mix level (square one octave below osc1, phase-locked).
+    /// 0 = no-op path (no sub kernel, no flipflop read).
+    pub sub_level: f32,
+    /// `CrossModType::Ring` engaged: osc1×osc2 ring displaces osc1 in the
+    /// mixer slot at full amplitude (osc1_level then sets the ring's mix).
+    /// Mutually exclusive with `sync` / `pm_index`; off = the fast path.
+    pub ring_mode: bool,
     /// Noise source mix level. 0 = the cheap no-op path (no PRNG/pink work).
     pub noise_level: f32,
     /// Noise colour (White / Pink); layer-wide, so the branch hoists.
@@ -139,6 +144,13 @@ pub struct BlockCtx {
     /// Through-zero phase-mod index (`CrossModType::Pm` ? amount : 0). 0 = off.
     /// Engages the coupled osc path; mutually exclusive with `sync` at the engine.
     pub pm_index: f32,
+    /// Cross-mod selector value (Off / Sync / Pm / Ring). Drives the routing
+    /// decisions for env→pitch (when `pitch_env_mod_only`) and the mod-wheel
+    /// sweep — both target the "modulator" oscillator under Sync (osc1) and
+    /// Pm (osc2). The kernel dispatch keeps using `sync` / `pm_index` so an
+    /// FM patch with amount = 0 still takes the cheap fast path, but the
+    /// routing here must read the *mode*, not the amount.
+    pub cross_mod_type: CrossModType,
     /// Portamento glide time (s); 0 = off/instant (no separate on/off). Per
     /// channel, resolved at
     /// control-block rate so it feeds osc pitch, sync and PM consistently.
@@ -149,8 +161,20 @@ pub struct BlockCtx {
     /// Common pitch channel (vibrato-scaled — moves both oscillators).
     pub pitch_lfo_sel: LfoSel,
     pub pitch_lfo_depth: f32,
+    /// When true the LFO→pitch contribution is diverted to the cross-mod
+    /// "modulator" oscillator (same routing as [`Self::pitch_env_mod_only`]).
+    /// Lets the player vibrato the modulator (e.g. FM index wobble) without
+    /// moving the carrier pitch.
+    pub pitch_lfo_mod_only: bool,
     pub pitch_env_sel: EnvSel,
     pub pitch_env_depth: f32,
+    /// When true the env→pitch contribution is routed to the cross-mod
+    /// "modulator" oscillator only: Sync → osc1 (slave whose pitch creates the
+    /// sync sweep), PM → osc2 (modulator whose pitch sets the FM index); Off /
+    /// Ring have no modulator role, so the env falls back to both oscillators
+    /// (no-op vs. the toggle off). When false the env always moves both
+    /// oscillators like pitch-wheel.
+    pub pitch_env_mod_only: bool,
     /// Pitch-wheel contribution (bend × wheel depth, semitones), both oscillators.
     pub pitch_extra: f32,
     /// PWM channel.
@@ -171,11 +195,10 @@ pub struct BlockCtx {
     /// Filter key-track: when on, cutoff shifts exactly 1 octave per key octave
     /// above C0 (12 st cutoff per 12 st key).
     pub filter_key_track: bool,
-    /// Wide osc-2 pitch channel (octave range — moves osc2 only).
-    pub osc2_pitch_env_sel: EnvSel,
-    pub osc2_pitch_env_depth: f32,
-    /// Mod-wheel → osc2 pitch contribution (semitones).
-    pub osc2_pitch_extra: f32,
+    /// Mod-wheel → sweep contribution (semitones). Target depends on cross-mod
+    /// mode: Off → both oscs, Sync → osc1 (slave/carrier whose pitch creates the
+    /// sync sweep), PM → osc2 (modulator whose pitch sets the FM index/spectrum).
+    pub sweep_extra: f32,
     // ── VCA modulation ──
     /// LFO source for amp tremolo ({Off/LFO1/LFO2}); always applied on top of the
     /// amp envelope / gate.
@@ -685,8 +708,40 @@ impl VoiceBank {
             self.glide_semi[v] += glide_coeff * (target - self.glide_semi[v]);
             let nf = self.glide_semi[v];
             let detune = self.detune_cents[v] * 0.01; // cents → semitones (Unison)
-            let s1 = ctx.base_semis + nf + ctx.osc1_semi + m.pitch_mod + detune;
-            let s2 = ctx.base_semis + nf + ctx.osc2_semi + m.pitch_mod + m.osc2_pitch_mod + detune;
+            // Env/LFO→pitch with the "Mod" switch on: isolate to the
+            // modulator oscillator. Default modulator = osc2; Sync flips to
+            // osc1 (the slave that drives the sweep). Off / Ring have no
+            // cross-mod role but the toggle is still a user-visible
+            // "isolate to one osc" affordance, so it routes to osc2 — same
+            // as Pm — instead of falling back to both oscs (which would
+            // make the switch a no-op when no cross-mod is in play).
+            let (mod_only_to_osc1, mod_only_to_osc2) = match ctx.cross_mod_type {
+                CrossModType::Sync => (m.pitch_mod_only, 0.0),
+                _ => (0.0, m.pitch_mod_only),
+            };
+            // Mod-wheel cross-mod sweep follows the *cross-mod role*
+            // strictly: Off / Ring sweep both oscs (whole-note pitch
+            // effect, no modulator); Sync sweeps the slave (osc1); Pm
+            // sweeps the modulator (osc2) for FM index/spectrum.
+            let (sweep_to_osc1, sweep_to_osc2) = match ctx.cross_mod_type {
+                CrossModType::Off | CrossModType::Ring => (m.sweep_mod, m.sweep_mod),
+                CrossModType::Sync => (m.sweep_mod, 0.0),
+                CrossModType::Pm => (0.0, m.sweep_mod),
+            };
+            let s1 = ctx.base_semis
+                + nf
+                + ctx.osc1_semi
+                + m.pitch_mod
+                + mod_only_to_osc1
+                + sweep_to_osc1
+                + detune;
+            let s2 = ctx.base_semis
+                + nf
+                + ctx.osc2_semi
+                + m.pitch_mod
+                + mod_only_to_osc2
+                + sweep_to_osc2
+                + detune;
             self.osc1.inc[v] = note_to_hz(s1) / ctx.os_sample_rate;
             self.osc2.inc[v] = note_to_hz(s2) / ctx.os_sample_rate;
             pw1[v] = (ctx.osc1_pw + m.pwm_mod).clamp(0.05, 0.95);
@@ -723,18 +778,24 @@ impl VoiceBank {
         let mut o1 = [0.0f32; N];
         let mut o2 = [0.0f32; N];
         let mut ring = [0.0f32; N];
+        let mut sub = [0.0f32; N];
         let mut noise = [0.0f32; N];
         let mut mix = [0.0f32; N];
         let mut hp = [0.0f32; N];
         let mut filt = [0.0f32; N];
         let mut amp = [0.0f32; N];
 
-        // Ring modulator (0021): osc1×osc2 through the Parker diode bridge, mixed
-        // by `ring_level`. Zero level skips the diode maths entirely (fast path).
-        let ring_on = ctx.ring_level != 0.0;
+        // Ring modulator (0021, 0061): osc1×osc2 through the Parker diode bridge,
+        // routed into the osc1 mixer slot when `CrossModType::Ring` is engaged.
+        // Off (any other cross-mod mode) skips the diode maths entirely.
+        let ring_on = ctx.ring_mode;
         let ring_gain = 10.0f32.powf(RING_DRIVE_DB / 20.0);
         // Noise source mixed into the source bus; zero level skips PRNG/pink work.
         let noise_on = ctx.noise_level != 0.0;
+        // Sub-osc (0062): square one octave below the source osc, phase-locked
+        // to its flipflop. Source is osc2 under Sync (audible period = master),
+        // osc1 otherwise (Off/Ring/FM). Zero level skips the kernel.
+        let sub_on = ctx.sub_level != 0.0;
 
         // Envelope block-skip (see `envelopes_static`): when nothing triggers and
         // every active voice holds both envelopes in Sustain, the env levels are
@@ -801,14 +862,30 @@ impl VoiceBank {
                     self.osc1.process(ctx.osc1_wave, &pw1, &mut o1);
                     self.osc2.process(ctx.osc2_wave, &pw2, &mut o2);
                 }
-                for v in 0..N {
-                    mix[v] = o1[v] * ctx.osc1_level + o2[v] * ctx.osc2_level;
-                }
-                // Ring contribution (osc1×osc2), summed in alongside the oscs.
+                // Ring displaces osc1 in the mixer slot when engaged — osc1_level
+                // then controls the ring's loudness; osc2 stays independently mixable.
                 if ring_on {
                     poly_ring_mod(&o1, &o2, ring_gain, &mut ring);
                     for v in 0..N {
-                        mix[v] += ring[v] * ctx.ring_level;
+                        mix[v] = ring[v] * ctx.osc1_level + o2[v] * ctx.osc2_level;
+                    }
+                } else {
+                    for v in 0..N {
+                        mix[v] = o1[v] * ctx.osc1_level + o2[v] * ctx.osc2_level;
+                    }
+                }
+                // Sub: keyed to osc2 under Sync (audible period = master), osc1
+                // otherwise. The flipflop the source kernel toggled lives on osc1
+                // (the audible carrier) in all modes.
+                if sub_on {
+                    let (sp, sdt) = if ctx.sync {
+                        (&self.osc2.phase, &self.osc2.inc)
+                    } else {
+                        (&self.osc1.phase, &self.osc1.inc)
+                    };
+                    poly_sub_square(sp, sdt, &self.osc1.sub_flipflop, &mut sub);
+                    for v in 0..N {
+                        mix[v] += sub[v] * ctx.sub_level;
                     }
                 }
                 // Noise contribution: one decorrelated stream per voice, summed in.
@@ -916,11 +993,18 @@ struct ModSources {
     note: u8,
 }
 
-/// Resolved per-channel mod offsets: pitch / osc2-pitch / cutoff in semitones,
-/// pwm as a pulse-width fraction.
+/// Resolved per-channel mod offsets: pitch / cross-mod-sweep / cutoff in semitones,
+/// pwm as a pulse-width fraction. `pitch_mod` is the common pitch channel
+/// (LFO + env when neither is mod-only + pitch wheel) added to both oscs;
+/// `pitch_mod_only` is the sum of LFO and Env contributions whose "Mod"
+/// switch is on, routed to the cross-mod modulator in `render_block` (Sync →
+/// osc1, FM → osc2, Off/Ring → both). `sweep_mod` is the mod-wheel cross-mod
+/// sweep channel; its osc target depends on cross-mod mode (gated in
+/// `render_block`).
 struct ModOut {
     pitch_mod: f32,
-    osc2_pitch_mod: f32,
+    pitch_mod_only: f32,
+    sweep_mod: f32,
     pwm_mod: f32,
     cutoff_mod: f32,
 }
@@ -936,13 +1020,27 @@ fn resolve_mod(ctx: &BlockCtx, s: &ModSources) -> ModOut {
     } else {
         0.0
     };
+    // LFO→pitch and Env→pitch are each split: diverted to the cross-mod
+    // "modulator" channel when their "Mod" switch is on, else joining the
+    // common-pitch channel (both oscs). Pitch-wheel always moves both oscs.
+    let pitch_lfo = lfo_src(ctx.pitch_lfo_sel, s.lfo1, s.lfo2) * ctx.pitch_lfo_depth;
+    let (pitch_lfo_common, pitch_lfo_mod) = if ctx.pitch_lfo_mod_only {
+        (0.0, pitch_lfo)
+    } else {
+        (pitch_lfo, 0.0)
+    };
+    let pitch_env = env_src(ctx.pitch_env_sel, s.e1, s.e2) * ctx.pitch_env_depth;
+    let (pitch_env_common, pitch_env_mod) = if ctx.pitch_env_mod_only {
+        (0.0, pitch_env)
+    } else {
+        (pitch_env, 0.0)
+    };
     ModOut {
-        pitch_mod: lfo_src(ctx.pitch_lfo_sel, s.lfo1, s.lfo2) * ctx.pitch_lfo_depth
-            + env_src(ctx.pitch_env_sel, s.e1, s.e2) * ctx.pitch_env_depth
-            + ctx.pitch_extra,
-        // Wide osc-2 pitch (sync sweeps): osc2 only, added on top of common pitch.
-        osc2_pitch_mod: env_src(ctx.osc2_pitch_env_sel, s.e1, s.e2) * ctx.osc2_pitch_env_depth
-            + ctx.osc2_pitch_extra,
+        pitch_mod: pitch_lfo_common + pitch_env_common + ctx.pitch_extra,
+        pitch_mod_only: pitch_lfo_mod + pitch_env_mod,
+        // Mod-wheel cross-mod sweep (sync sweeps / FM index / both-osc pitch).
+        // The target osc(s) are chosen in `render_block` per cross-mod mode.
+        sweep_mod: ctx.sweep_extra,
         pwm_mod: lfo_src(ctx.pwm_lfo_sel, s.lfo1, s.lfo2) * ctx.pwm_lfo_depth
             + env_src(ctx.pwm_env_sel, s.e1, s.e2) * ctx.pwm_env_depth
             + ctx.pwm_extra,
@@ -1400,7 +1498,8 @@ mod mod_tests {
             osc2_wave: Waveform::Saw,
             osc1_level: 1.0,
             osc2_level: 1.0,
-            ring_level: 0.0,
+            sub_level: 0.0,
+            ring_mode: false,
             noise_level: 0.0,
             noise_color: NoiseColor::White,
             osc1_pw: 0.5,
@@ -1421,11 +1520,14 @@ mod mod_tests {
             lfo2_val: 0.0,
             sync: false,
             pm_index: 0.0,
+            cross_mod_type: CrossModType::Off,
             portamento_time: 0.0,
             pitch_lfo_sel: LfoSel::Off,
             pitch_lfo_depth: 0.0,
+            pitch_lfo_mod_only: false,
             pitch_env_sel: EnvSel::Off,
             pitch_env_depth: 0.0,
+            pitch_env_mod_only: false,
             pitch_extra: 0.0,
             pwm_lfo_sel: LfoSel::Off,
             pwm_lfo_depth: 0.0,
@@ -1438,9 +1540,7 @@ mod mod_tests {
             cutoff_vel_depth: 0.0,
             cutoff_extra: 0.0,
             filter_key_track: false,
-            osc2_pitch_env_sel: EnvSel::Off,
-            osc2_pitch_env_depth: 0.0,
-            osc2_pitch_extra: 0.0,
+            sweep_extra: 0.0,
             amp_lfo_sel: LfoSel::Off,
             amp_lfo_depth: 0.0,
             amp_env_bypass: false,
@@ -1470,7 +1570,7 @@ mod mod_tests {
         let ctx = neutral_ctx();
         let m = resolve_mod(&ctx, &src(1.0, 1.0, 1.0, 1.0, 1.0, 72));
         assert_eq!(m.pitch_mod, 0.0);
-        assert_eq!(m.osc2_pitch_mod, 0.0);
+        assert_eq!(m.sweep_mod, 0.0);
         assert_eq!(m.pwm_mod, 0.0);
         assert_eq!(m.cutoff_mod, 0.0);
     }
@@ -1518,16 +1618,78 @@ mod mod_tests {
     }
 
     #[test]
-    fn osc2_pitch_route_is_env_plus_extra_independent_of_common_pitch() {
+    fn sweep_route_is_mod_wheel_only_independent_of_common_pitch() {
         let ctx = ctx_with(|c| {
-            c.osc2_pitch_env_sel = EnvSel::Env2;
-            c.osc2_pitch_env_depth = 12.0; // 0.5 → +6 st
-            c.osc2_pitch_extra = 1.0;
+            c.sweep_extra = 1.0;
             c.pitch_lfo_sel = LfoSel::Lfo1; // common-pitch route must not bleed in
             c.pitch_lfo_depth = 10.0;
         });
         let m = resolve_mod(&ctx, &src(0.0, 0.5, 1.0, 0.0, 0.0, 60));
-        assert!((m.osc2_pitch_mod - 7.0).abs() < 1e-6);
+        assert!((m.sweep_mod - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pitch_env_mod_only_diverts_env_to_modulator_channel() {
+        // Toggle off: env joins the common pitch channel (both oscs).
+        let common = ctx_with(|c| {
+            c.pitch_env_sel = EnvSel::Env1;
+            c.pitch_env_depth = 4.0; // 0.5 → +2 st
+            c.pitch_env_mod_only = false;
+        });
+        let m = resolve_mod(&common, &src(0.5, 0.0, 0.0, 0.0, 0.0, 60));
+        assert!((m.pitch_mod - 2.0).abs() < 1e-6);
+        assert_eq!(m.pitch_mod_only, 0.0);
+        // Toggle on: env leaves common-pitch and rides the mod-only channel;
+        // the per-mode osc routing is applied downstream in render_block.
+        let mod_only = ctx_with(|c| {
+            c.pitch_env_sel = EnvSel::Env1;
+            c.pitch_env_depth = 4.0;
+            c.pitch_env_mod_only = true;
+        });
+        let m = resolve_mod(&mod_only, &src(0.5, 0.0, 0.0, 0.0, 0.0, 60));
+        assert_eq!(m.pitch_mod, 0.0);
+        assert!((m.pitch_mod_only - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pitch_lfo_mod_only_diverts_lfo_to_modulator_channel() {
+        // Toggle off: LFO joins the common pitch channel (both oscs).
+        let common = ctx_with(|c| {
+            c.pitch_lfo_sel = LfoSel::Lfo1;
+            c.pitch_lfo_depth = 2.0; // 0.5 → +1 st
+            c.pitch_lfo_mod_only = false;
+        });
+        let m = resolve_mod(&common, &src(0.0, 0.0, 0.5, 0.0, 0.0, 60));
+        assert!((m.pitch_mod - 1.0).abs() < 1e-6);
+        assert_eq!(m.pitch_mod_only, 0.0);
+        // Toggle on: LFO rides the mod-only channel; the cross-mod target is
+        // applied downstream in `render_block`.
+        let mod_only = ctx_with(|c| {
+            c.pitch_lfo_sel = LfoSel::Lfo1;
+            c.pitch_lfo_depth = 2.0;
+            c.pitch_lfo_mod_only = true;
+        });
+        let m = resolve_mod(&mod_only, &src(0.0, 0.0, 0.5, 0.0, 0.0, 60));
+        assert_eq!(m.pitch_mod, 0.0);
+        assert!((m.pitch_mod_only - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn pitch_mod_only_sums_env_and_lfo() {
+        // Both mod-only switches on: the channel carries env + LFO contributions
+        // summed; pitch wheel still rides the common channel.
+        let ctx = ctx_with(|c| {
+            c.pitch_lfo_sel = LfoSel::Lfo1;
+            c.pitch_lfo_depth = 2.0; // 0.5 → +1
+            c.pitch_lfo_mod_only = true;
+            c.pitch_env_sel = EnvSel::Env1;
+            c.pitch_env_depth = 4.0; // 0.5 → +2
+            c.pitch_env_mod_only = true;
+            c.pitch_extra = 0.25;
+        });
+        let m = resolve_mod(&ctx, &src(0.5, 0.0, 0.5, 0.0, 0.0, 60));
+        assert!((m.pitch_mod_only - 3.0).abs() < 1e-6);
+        assert!((m.pitch_mod - 0.25).abs() < 1e-6); // wheel only
     }
 
     #[test]
@@ -1588,7 +1750,7 @@ mod mod_tests {
         assert!((m.pitch_mod - 0.7).abs() < 1e-6);
         assert!((m.pwm_mod - 0.3).abs() < 1e-6);
         assert!((m.cutoff_mod - 0.2).abs() < 1e-6);
-        assert_eq!(m.osc2_pitch_mod, 0.0);
+        assert_eq!(m.sweep_mod, 0.0);
     }
 
     // ── block_glide ──

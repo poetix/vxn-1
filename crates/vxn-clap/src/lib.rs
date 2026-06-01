@@ -169,6 +169,10 @@ impl<'a> VxnMainThread<'a> {
         };
         let model = &*self.shared.params;
         let n = ParamModel::total(model).min(self.last_seen.len());
+        // Sync flips refresh their rate partner's display label even though
+        // the rate's value didn't change. Collect those first, then emit
+        // after the main pass.
+        let mut force_rate_refresh: Vec<usize> = Vec::new();
         for i in 0..n {
             let id = ParamId::new(i);
             let plain = ParamModel::get(model, id);
@@ -179,9 +183,22 @@ impl<'a> VxnMainThread<'a> {
             }
             self.last_seen[i] = plain;
             let norm = ParamModel::get_normalized(model, id);
-            let display = ParamModel::descriptor(model, id)
-                .map(|d| d.display(plain))
-                .unwrap_or_default();
+            let display = sync_aware_display(&self.shared.params, i, plain);
+            handle.push_view_event(ViewEvent::ParamChanged {
+                id,
+                plain,
+                norm,
+                display,
+            });
+            if let Some(rate_id) = vxn_app::sync::rate_partner_clap_id(i) {
+                force_rate_refresh.push(rate_id);
+            }
+        }
+        for rate_id in force_rate_refresh {
+            let id = ParamId::new(rate_id);
+            let plain = ParamModel::get(model, id);
+            let norm = ParamModel::get_normalized(model, id);
+            let display = sync_aware_display(&self.shared.params, rate_id, plain);
             handle.push_view_event(ViewEvent::ParamChanged {
                 id,
                 plain,
@@ -421,6 +438,23 @@ fn format_value(desc: &ParamDesc, value: f64, writer: &mut ParamDisplayWriter) -
     write!(writer, "{}", desc.display(value as f32))
 }
 
+/// Sync-aware display string for a CLAP param. When `id` is an LFO/Delay
+/// rate/time whose sync partner reads on, returns the matching subdivision
+/// label; otherwise the normal unit-formatted display. Shared by the host
+/// `value_to_text` path and the editor `ParamChanged` broadcast so both
+/// readouts agree.
+fn sync_aware_display(params: &SharedParams, clap_id: usize, value: f32) -> String {
+    let Some(desc) = desc_for_clap_id(clap_id) else {
+        return String::new();
+    };
+    if let Some(sync_id) = vxn_app::sync::sync_partner_clap_id(clap_id) {
+        if params.get(sync_id) >= 0.5 {
+            return vxn_app::sync::synced_label_for(desc, value).to_string();
+        }
+    }
+    desc.display(value)
+}
+
 impl PluginMainThreadParams for VxnMainThread<'_> {
     fn count(&mut self) -> u32 {
         TOTAL_PARAMS as u32
@@ -464,10 +498,22 @@ impl PluginMainThreadParams for VxnMainThread<'_> {
         value: f64,
         writer: &mut ParamDisplayWriter,
     ) -> std::fmt::Result {
-        match desc_for_clap_id(param_id.get() as usize) {
-            Some(desc) => format_value(desc, value, writer),
-            None => Err(std::fmt::Error),
+        let id = param_id.get() as usize;
+        let Some(desc) = desc_for_clap_id(id) else {
+            return Err(std::fmt::Error);
+        };
+        // Synced rate/time params display their subdivision label (E004 /
+        // 0015), so the host's value readouts match the editor's popup.
+        if let Some(sync_id) = vxn_app::sync::sync_partner_clap_id(id) {
+            if self.shared.params.get(sync_id) >= 0.5 {
+                return write!(
+                    writer,
+                    "{}",
+                    vxn_app::sync::synced_label_for(desc, value as f32)
+                );
+            }
         }
+        format_value(desc, value, writer)
     }
 
     fn text_to_value(&mut self, _param_id: ClapId, text: &CStr) -> Option<f64> {

@@ -103,17 +103,23 @@ pub enum CrossModType {
     Off,
     Sync,
     Pm,
+    Ring,
 }
 
 impl CrossModType {
-    pub const COUNT: usize = 3;
-    pub const ALL: [CrossModType; Self::COUNT] =
-        [CrossModType::Off, CrossModType::Sync, CrossModType::Pm];
+    pub const COUNT: usize = 4;
+    pub const ALL: [CrossModType; Self::COUNT] = [
+        CrossModType::Off,
+        CrossModType::Sync,
+        CrossModType::Pm,
+        CrossModType::Ring,
+    ];
 
     pub fn from_index(i: usize) -> CrossModType {
         match i {
             1 => CrossModType::Sync,
             2 => CrossModType::Pm,
+            3 => CrossModType::Ring,
             _ => CrossModType::Off,
         }
     }
@@ -137,9 +143,9 @@ pub enum PatchParam {
     Osc2Octave,
     Osc2Level,
     Osc2PulseWidth,
+    SubLevel,
     CrossModType,
     CrossModAmount,
-    RingLevel,
     NoiseLevel,
     NoiseColor,
     Cutoff,
@@ -170,8 +176,10 @@ pub enum PatchParam {
     Lfo1FreeRun,
     PitchLfoSrc,
     PitchLfoDepth,
+    PitchLfoModOnly,
     PitchEnvSrc,
     PitchEnvDepth,
+    PitchEnvModOnly,
     PitchWheelDepth,
     PwmLfoSrc,
     PwmLfoDepth,
@@ -181,12 +189,10 @@ pub enum PatchParam {
     CutoffLfo2Depth,
     CutoffEnvDepth,
     VelCutoffDepth,
-    Osc2PitchEnvSrc,
-    Osc2PitchEnvDepth,
     ModWheelPwm,
     ModWheelCutoff,
     ModWheelReso,
-    ModWheelOsc2Pitch,
+    ModWheelCrossModSweep,
     AssignMode,
     Legato,
     UnisonDetune,
@@ -242,6 +248,10 @@ pub enum GlobalParam {
     DelayMix,
     DelayPingPong,
     DelaySync,
+    ReverbOn,
+    ReverbType,
+    ReverbDepth,
+    ReverbMix,
     LimiterOn,
     Oversample,
     Lfo2Shape,
@@ -463,11 +473,12 @@ const NOISE_LABELS: &[&str] = &["White", "Pink"];
 const SHAPE_LABELS: &[&str] = &["Lin", "Exp"];
 const LFO_LABELS: &[&str] = &["Sine", "Tri", "Saw+", "Saw-", "Square", "S&H"];
 const OVERSAMPLE_LABELS: &[&str] = &["O/S OFF", "2x", "4x", "8x"];
+pub const REVERB_TYPE_LABELS: &[&str] = &["Plate", "Room", "Hall", "Large"];
 const ASSIGN_LABELS: &[&str] = &["Poly", "Unison", "Solo", "Twin"];
 const LFO_SEL_LABELS: &[&str] = &["Off", "LFO 1", "LFO 2"];
 const ENV_SEL_LABELS: &[&str] = &["Off", "Env 1", "Env 2"];
 /// PM is labelled "FM" in the table — players expect that name (ADR 0004 §3).
-const CROSS_MOD_LABELS: &[&str] = &["Off", "Sync", "FM"];
+const CROSS_MOD_LABELS: &[&str] = &["Off", "Sync", "FM", "Ring"];
 
 const fn f(
     name: &'static str,
@@ -610,6 +621,7 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
         Taper::Linear,
     ),
     f("osc2_pw", "Osc 2 PW", 0.05, 0.95, 0.5, "", Taper::Linear),
+    f("sub_level", "Sub Level", 0.0, 1.0, 0.0, "", Taper::Linear),
     e("cross_mod_type", "Cross Mod", CROSS_MOD_LABELS, 0.0),
     f(
         "cross_mod_amount",
@@ -620,7 +632,6 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
         "",
         Taper::Linear,
     ),
-    f("ring_level", "Ring Level", 0.0, 1.0, 0.0, "", Taper::Linear),
     f(
         "noise_level",
         "Noise Level",
@@ -763,8 +774,10 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
     b("lfo1_free_run", "LFO 1 Free", 0.0),
     lfosel("pitch_lfo_src", "Pitch LFO", 1.0),
     mp_vib_lfo("pitch_lfo_depth", "Pitch LFO Dep", 0.05),
+    b("pitch_lfo_mod_only", "Pitch LFO Mod", 0.0),
     envsel("pitch_env_src", "Pitch Env"),
     mp_vib("pitch_env_depth", "Pitch Env Dep", 0.0),
+    b("pitch_env_mod_only", "Pitch Env Mod", 0.0),
     f(
         "pitch_wheel_depth",
         "Pitch Wheel",
@@ -782,8 +795,6 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
     mcu("cutoff_lfo2_depth", "Cutoff LFO2 Dep"),
     mc("cutoff_env_depth", "Cutoff Env Dep"),
     mc("vel_cutoff_depth", "Vel→Cutoff"),
-    envsel("osc2_pitch_env_src", "Osc2 Pitch Env"),
-    mp_wide("osc2_pitch_env_depth", "Osc2 Pitch Dep"),
     mw("mod_wheel_pwm", "Wheel→PWM"),
     mc("mod_wheel_cutoff", "Wheel→Cutoff"),
     f(
@@ -795,7 +806,7 @@ pub static PATCH_PARAMS: [ParamDesc; PatchParam::COUNT] = [
         "",
         Taper::Linear,
     ),
-    mp_wide("mod_wheel_osc2_pitch", "Wheel→Osc2"),
+    mp_wide("mod_wheel_cross_mod_sweep", "Wheel→X-Mod"),
     e("assign_mode", "Assign", ASSIGN_LABELS, 0.0),
     b("legato", "Legato", 0.0),
     f(
@@ -871,6 +882,10 @@ pub static GLOBAL_PARAMS: [ParamDesc; GlobalParam::COUNT] = [
     f("delay_mix", "Delay Mix", 0.0, 1.0, 0.25, "", Taper::Linear),
     b("delay_pingpong", "Ping-Pong", 1.0),
     b("delay_sync", "Delay Sync", 0.0),
+    b("reverb_on", "Reverb", 0.0),
+    e("reverb_type", "Reverb Type", REVERB_TYPE_LABELS, 0.0),
+    f("reverb_depth", "Reverb Depth", 0.0, 1.0, 0.5, "", Taper::Linear),
+    f("reverb_mix", "Reverb Mix", 0.0, 1.0, 0.3, "", Taper::Linear),
     b("limiter_on", "Limiter", 0.0),
     e("oversample", "Oversample", OVERSAMPLE_LABELS, 1.0),
     e("lfo2_shape", "LFO 2 Shape", LFO_LABELS, 0.0),

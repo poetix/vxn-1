@@ -8,6 +8,10 @@
 //! The LFO core stays Hz-driven (ADR 0002 §Consequences): sync is purely a rate
 //! computation here, isolated from [`vxn_dsp::LfoCore`].
 
+use crate::params::{
+    GlobalParam, ParamDesc, ParamRef, PatchParam, global_clap_id, param_ref, patch_clap_id,
+};
+
 /// Fallback tempo when the host provides none (no `HAS_TEMPO`). A sane musical
 /// default so a synced LFO never stalls or NaNs absent transport.
 pub const DEFAULT_TEMPO_BPM: f32 = 120.0;
@@ -63,6 +67,52 @@ pub fn synced_hz(tempo_bpm: f32, index: usize) -> f32 {
     let beats = SUBDIVISIONS[index.min(SUBDIVISIONS.len() - 1)].beats;
     // beats/sec ÷ beats/cycle = cycles/sec (Hz).
     (tempo_bpm / 60.0) / beats
+}
+
+/// Sync partner CLAP id for a rate/time param — returns the matching sync
+/// toggle's id when the input is one of the sync-pairable rate/time params
+/// (LFO 1 / LFO 2 rate, Delay time). `None` for anything else.
+///
+/// Mirrors the editor's `locateSyncPartners` so the host's `value_to_text`
+/// and the engine's `ParamChanged` broadcast can render subdivisions when
+/// sync is on, matching the editor's value popup.
+pub fn sync_partner_clap_id(id: usize) -> Option<usize> {
+    match param_ref(id)? {
+        ParamRef::Patch(layer, PatchParam::LfoRate) => {
+            Some(patch_clap_id(layer, PatchParam::LfoSync))
+        }
+        ParamRef::Global(GlobalParam::Lfo2Rate) => Some(global_clap_id(GlobalParam::Lfo2Sync)),
+        ParamRef::Global(GlobalParam::DelayTime) => Some(global_clap_id(GlobalParam::DelaySync)),
+        _ => None,
+    }
+}
+
+/// Inverse of [`sync_partner_clap_id`]: given a sync flag's CLAP id, returns
+/// its rate/time partner's id. Used to refresh a synced rate fader's display
+/// when its sync toggle flips while the rate value itself hasn't changed.
+pub fn rate_partner_clap_id(id: usize) -> Option<usize> {
+    match param_ref(id)? {
+        ParamRef::Patch(layer, PatchParam::LfoSync) => {
+            Some(patch_clap_id(layer, PatchParam::LfoRate))
+        }
+        ParamRef::Global(GlobalParam::Lfo2Sync) => Some(global_clap_id(GlobalParam::Lfo2Rate)),
+        ParamRef::Global(GlobalParam::DelaySync) => Some(global_clap_id(GlobalParam::DelayTime)),
+        _ => None,
+    }
+}
+
+/// Whether `id` is a sync toggle whose rate partner needs a display refresh
+/// on flip. Convenience over [`rate_partner_clap_id`] returning a bool.
+pub fn is_sync_flag(id: usize) -> bool {
+    rate_partner_clap_id(id).is_some()
+}
+
+/// Subdivision label corresponding to a rate/time param value, using the
+/// fader-position mapping the engine's sync resolution applies (`to_fader`
+/// → `index_from_norm`). Caller has already determined sync is on.
+pub fn synced_label_for(desc: &ParamDesc, value: f32) -> &'static str {
+    let pos = desc.to_fader(value);
+    SUBDIVISIONS[index_from_norm(pos)].label
 }
 
 /// Resolve a subdivision (by index) at `tempo_bpm` to a **duration in seconds**
@@ -122,6 +172,49 @@ mod tests {
                 assert!((synced_seconds(bpm, idx) - 1.0 / synced_hz(bpm, idx)).abs() < 1e-4);
             }
         }
+    }
+
+    #[test]
+    fn sync_partner_maps_both_layers_and_globals() {
+        use crate::domain::Layer;
+        let up_rate = patch_clap_id(Layer::Upper, PatchParam::LfoRate);
+        let up_sync = patch_clap_id(Layer::Upper, PatchParam::LfoSync);
+        let lo_rate = patch_clap_id(Layer::Lower, PatchParam::LfoRate);
+        let lo_sync = patch_clap_id(Layer::Lower, PatchParam::LfoSync);
+        assert_eq!(sync_partner_clap_id(up_rate), Some(up_sync));
+        assert_eq!(sync_partner_clap_id(lo_rate), Some(lo_sync));
+        assert_eq!(rate_partner_clap_id(up_sync), Some(up_rate));
+        assert_eq!(rate_partner_clap_id(lo_sync), Some(lo_rate));
+        let lfo2_r = global_clap_id(GlobalParam::Lfo2Rate);
+        let lfo2_s = global_clap_id(GlobalParam::Lfo2Sync);
+        let dly_t = global_clap_id(GlobalParam::DelayTime);
+        let dly_s = global_clap_id(GlobalParam::DelaySync);
+        assert_eq!(sync_partner_clap_id(lfo2_r), Some(lfo2_s));
+        assert_eq!(sync_partner_clap_id(dly_t), Some(dly_s));
+        assert_eq!(rate_partner_clap_id(lfo2_s), Some(lfo2_r));
+        assert_eq!(rate_partner_clap_id(dly_s), Some(dly_t));
+        // Non-sync-pairable params return None.
+        assert_eq!(
+            sync_partner_clap_id(patch_clap_id(Layer::Upper, PatchParam::Cutoff)),
+            None
+        );
+        assert_eq!(
+            rate_partner_clap_id(patch_clap_id(Layer::Upper, PatchParam::Cutoff)),
+            None
+        );
+        assert!(is_sync_flag(up_sync));
+        assert!(!is_sync_flag(up_rate));
+    }
+
+    #[test]
+    fn synced_label_for_picks_via_fader_position() {
+        // Mirrors the engine's `lfo_rate_from` path: `to_fader` → `index_from_norm`
+        // → SUBDIVISIONS[idx].label. Anchors at the table ends.
+        let rate = PatchParam::LfoRate.desc();
+        let lo = synced_label_for(rate, rate.min);
+        let hi = synced_label_for(rate, rate.max);
+        assert_eq!(lo, SUBDIVISIONS[0].label);
+        assert_eq!(hi, SUBDIVISIONS[SUBDIVISIONS.len() - 1].label);
     }
 
     #[test]

@@ -18,11 +18,13 @@ delay_mix = 0.18
 oversample = "4x"
 
 [performance.upper]
-osc2_coarse = 7
-osc2_octave = 0
+# osc1 = slave/carrier (audible sync sound); osc2 = master.
+osc1_coarse = 7
+osc1_octave = 0
 cross_mod_type = "Sync"
-osc2_pitch_env_src = "Env 1"
-osc2_pitch_env_depth = 12.0
+pitch_env_src = "Env 1"
+pitch_env_depth = 12.0
+pitch_env_mod_only = true
 cutoff = 6000.0
 resonance = 0.3
 drive = 1.5

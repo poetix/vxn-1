@@ -50,25 +50,30 @@ unmodulated rate. The polyBLEP residual *is* the mild analog "softening" of the
 reset edge; it is not a separate effect. Sync-off stays bit-identical to the
 independent fast path.
 
-### 2. Ring modulator (0021)
+### 2. Ring modulator (0021, amended by 0061)
 
 Add osc1×osc2 ring modulation using the **Parker diode-bridge model**
 (`patches-modules::modulators::ring_mod`, DAFx-11): `diode_block(sig+½c) −
 diode_block(sig−½c)`, with a diode I–V polynomial + tanh shaping whose `drive`
 sets near-linear vs harmonically-coloured behaviour. Ported to the SoA poly
-kernel, mixed by a new **RingLevel** alongside osc1/osc2/noise. Aliasing-prone
-like sync/PM; leans on the engine oversampling for v1.
+kernel. Aliasing-prone like sync/PM; leans on the engine oversampling for v1.
+
+**0061 amendment:** ring is exposed through `CrossModType::Ring` rather than
+its own mixer fader. When engaged the ring signal displaces osc1 in the mixer
+slot, so `osc1_level` sets ring loudness; osc2 stays independently mixable.
+Ring, Sync and PM are mutually exclusive at the engine.
 
 ### 3. Cross-mod as a type selector
 
 Replace the independent `OscSync` (bool) + `CrossMod` (amount) with
-**`CrossModType` {Off, Sync, PM}** + **`CrossModAmount`**. The three modes are
-mutually exclusive: Off = independent fast path (bit-identical), Sync = the
-band-limited hard sync of decision 1, PM = the through-zero phase modulation of
-decision 7 at the set index. (The UI may keep an "FM"-style label since players
-expect that name; the engine implements PM — see decision 7.) We accept losing
-the (rarely useful) ability to run sync and modulation simultaneously in
-exchange for a clearer control.
+**`CrossModType` {Off, Sync, PM, Ring}** + **`CrossModAmount`**. The four
+modes are mutually exclusive: Off = independent fast path (bit-identical),
+Sync = the band-limited hard sync of decision 1, PM = the through-zero phase
+modulation of decision 7 at the set index, Ring = the diode-bridge ring of
+decision 2 routed into the osc1 mixer slot (0061). (The UI may keep an "FM"-
+style label since players expect that name; the engine implements PM — see
+decision 7.) We accept losing the (rarely useful) ability to run sync,
+modulation and ring simultaneously in exchange for a clearer control.
 
 ### 7. Cross-mod is phase modulation, not exponential FM
 
@@ -155,11 +160,12 @@ selector). Brown noise and its filter state are removed.
 ## Panel layout
 
 - **Osc 1:** wave, octave/coarse/fine, PW.
-- **Osc 2:** wave, octave/coarse/fine, PW, cross-mod type {Off/Sync/PM} + amount.
+- **Osc 2:** wave, octave/coarse/fine, PW, cross-mod type {Off/Sync/PM/Ring} + amount.
 - **Osc mod:** Pitch (vibrato, both osc) ← LFO/env (+pitch-wheel); PWM ←
   LFO/env; Osc 2 pitch (wide) ← env.
-- **Mixer:** osc1 / osc2 / ring / noise levels + noise type (White/Pink, two
-  buttons).
+- **Mixer:** osc1 / osc2 / noise levels + noise type (White/Pink, two
+  buttons). Ring lives on the Osc 2 panel's cross-mod selector (0061) —
+  engaging it displaces osc1 in this strip.
 - **Filter:** HP cutoff, LP cutoff, resonance, drive, key-track on/off.
 - **Filter mod:** Cutoff ← velocity / LFO 1 / LFO 2 / Env 1 (four fixed depths;
   no source selectors — see amendment).
@@ -235,3 +241,47 @@ The panel rows are re-laid (UI only, no param change):
 
 Chorus / Delay move their on/off into the panel header (a toggle on the orange
 title bar, left of the title) rather than a cell in the control row.
+
+## Amendment — 2026-06-01 (osc1=carrier convention; wide channel = X-Mod sweep)
+
+§3 and §5 are amended so that **osc1 is always the carrier** (the modulated /
+audible side) across both cross-mod modes, and the wide pitch route becomes a
+mode-gated **Cross-Mod Sweep** channel rather than an osc2-only channel.
+
+### Sync convention flipped (§3)
+
+Sync now treats **osc1 as the slave/carrier** (its phase is reset by osc2's
+wrap; its waveform is the audible sync timbre) and **osc2 as the master** (its
+wrap drives reset; its waveform is typically inaudible or low-mix). This matches
+PM mode where osc1 is already the carrier whose read phase is offset by osc2.
+
+Net: across Off / Sync / PM, osc1 is *always* the audible carrier and osc2 is
+*always* the silent modulating signal (driver). The `process_pair` /
+`process_sync` / `process_pm` kernels in `vxn-dsp::poly` are rewritten so
+`self`=osc1=carrier-or-slave and the second arg=osc2=modulator-or-master.
+
+### Wide channel renamed: Osc 2 Pitch → X-Mod Sweep (§5)
+
+The wide (octave-range) pitch route is renamed and made mode-aware. Its target
+follows the cross-mod mode:
+
+| Mode | Wide channel target               | Why                                                |
+| ---- | --------------------------------- | -------------------------------------------------- |
+| Off  | both osc1 + osc2                  | env-driven whole-note pitch effects                |
+| Sync | osc1 only (slave/carrier)         | sweeping the slave creates the sync sweep timbre   |
+| PM   | osc2 only (modulator)             | sweeping the modulator sets the FM index/spectrum  |
+
+Params: `Osc2PitchEnvSrc` / `Osc2PitchEnvDepth` / `ModWheelOsc2Pitch` →
+`CrossModSweepEnvSrc` / `CrossModSweepEnvDepth` / `ModWheelCrossModSweep`. TOML
+keys: `osc2_pitch_env_{src,depth}` / `mod_wheel_osc2_pitch` →
+`cross_mod_sweep_env_{src,depth}` / `mod_wheel_cross_mod_sweep`. UI labels
+become "X-Mod Env" / "X-Mod Dep" / "Wheel→X-Mod".
+
+### Factory preset migration
+
+Sync presets (Sync Lead, Mark Will Sync Us, Sync Hole, Glass Pad, Clean Sweep,
+Great Divide) had osc1↔osc2 swapped (wave / coarse / fine / octave / level /
+pulse_width) so the audible patch is preserved under the new convention. The
+wide-channel keys were also renamed. One Off-mode preset (Tropical Pluckstorm)
+that used the wide channel for an osc2-only pluck pitch effect now drops both
+oscs together — the patch is rebalanced, change accepted.

@@ -54,6 +54,7 @@ pub const MAX_OVERSAMPLE: usize = 8;
 pub const CONTROL_BLOCK: usize = 32;
 
 pub use adsr::{AdsrCore, AdsrShape, AdsrStage};
+pub use bbd::StereoVReverb;
 pub use chorus::StereoChorus;
 pub use delay::{DelayLine, StereoDelay};
 pub use halfband::{HalfbandFir, Oversampler};
@@ -65,7 +66,7 @@ pub use noise::{NoiseColor, PolyNoise};
 pub use oscillator::{Oscillator, Waveform};
 pub use ota_ladder::{FilterMode, FilterSlope, OtaLadderCoeffs, OtaLadderKernel};
 pub use phase::{MonoPhaseAccumulator, polyblep};
-pub use poly::{PolyNoiseBank, PolyOscillator, PolyOtaLadder, poly_ring_mod};
+pub use poly::{PolyNoiseBank, PolyOscillator, PolyOtaLadder, poly_ring_mod, poly_sub_square};
 pub use smoothing::{Smoothed, ms_to_samples, one_pole_coeff};
 
 /// Flush x86/ARM denormals-to-zero on the current thread, without restoring the

@@ -4,22 +4,24 @@ schema = 1
 name = "Glass Pad"
 author = "Vulpus Labs"
 category = "Pad"
-comment = "Evolving sync pad — Env 1 sweeps osc 2's pitch under hard sync for a glassy formant motion, a whisper of noise on the attack."
+comment = "Evolving sync pad — Env 1 drives the cross-mod sweep under hard sync for a glassy formant motion, a whisper of noise on the attack."
 
 [performance]
 key_mode = "Whole"
 split_point = 60
 
 [performance.upper]
-osc1_wave = "Pulse"
-osc1_pw = 0.35
-osc1_level = 0.85
-osc2_wave = "Saw"
-osc2_octave = 0
-osc2_level = 0.6
+# osc1 = slave/carrier (audible sync sound); osc2 = master.
+osc1_wave = "Saw"
+osc1_octave = 0
+osc1_level = 0.6
+osc2_wave = "Pulse"
+osc2_pw = 0.35
+osc2_level = 0.85
 cross_mod_type = "Sync"
-osc2_pitch_env_src = "Env 1"
-osc2_pitch_env_depth = 24.0
+pitch_env_src = "Env 1"
+pitch_env_depth = 12.0
+pitch_env_mod_only = true
 noise_level = 0.08
 cutoff = 5000.0
 resonance = 0.2

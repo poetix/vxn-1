@@ -4,7 +4,7 @@ schema = 1
 name = "FM Growl"
 author = "Vulpus Labs"
 category = "Bass"
-comment = "Aggressive cross-mod (FM) bass — osc 2 modulates osc 1, ring and a dusting of pink noise add grit."
+comment = "Aggressive cross-mod (FM) bass — osc 2 modulates osc 1, with a dusting of pink noise adding grit."
 
 [performance]
 key_mode = "Whole"
@@ -18,7 +18,6 @@ osc2_octave = 0
 osc2_level = 0.0
 cross_mod_type = "FM"
 cross_mod_amount = 2.0
-ring_level = 0.3
 noise_level = 0.15
 noise_color = "Pink"
 cutoff = 900.0

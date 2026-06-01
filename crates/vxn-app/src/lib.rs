@@ -23,7 +23,8 @@ pub use events::{HostEvent, PresetSource, UiEvent, ViewEvent};
 pub use model::{ParamId, ParamModel};
 pub use params::{
     AssignMode, CrossModType, EnvSel, GLOBAL_PARAMS, GLOBAL_COUNT, GlobalParam, LfoSel,
-    PATCH_COUNT, PATCH_PARAMS, ParamDesc, ParamKind, ParamRef, PatchParam, TOTAL_PARAMS, Taper,
-    desc_for_clap_id, global_clap_id, module_for_clap_id, param_ref, patch_clap_id,
+    PATCH_COUNT, PATCH_PARAMS, ParamDesc, ParamKind, ParamRef, PatchParam, REVERB_TYPE_LABELS,
+    TOTAL_PARAMS, Taper, desc_for_clap_id, global_clap_id, module_for_clap_id, param_ref,
+    patch_clap_id,
 };
 pub use preset::{PresetCorpus, PresetLoad, PresetStore, UserFolderEntry, UserPresetEntry};

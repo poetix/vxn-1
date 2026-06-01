@@ -8,6 +8,7 @@ pub mod factory;
 pub mod params;
 pub mod preset;
 pub mod preset_io;
+pub mod reverb_macro;
 pub mod shared;
 pub mod smoothing;
 pub mod state;
@@ -25,6 +26,7 @@ pub use params::{
 };
 pub use factory::{FactoryPreset, factory};
 pub use preset::{Meta, Performance, PresetError};
+pub use reverb_macro::{ReverbType, ReverbVoicing, reverb_macro};
 pub use preset_io::{
     EnginePresetStore, LoadError, UserFolder, UserPreset, create_user_folder, delete_user_folder,
     delete_user_preset, ensure_user_dir, list_user_presets, list_user_tree, load_preset_file,
@@ -42,7 +44,7 @@ pub use state::PluginState;
 use voice::{BlockCtx, Lfo1Trigger, VoiceBank};
 use vxn_dsp::{
     AdsrShape, CONTROL_BLOCK, LfoCore, MAX_OVERSAMPLE, Oversampler, Smoothed, StereoChorus,
-    StereoDelay, StereoLimiter, note_to_hz,
+    StereoDelay, StereoLimiter, StereoVReverb, note_to_hz,
 };
 
 /// Mod-wheel (CC1) glide time (ms), applied at the control-block rate. Rounds
@@ -75,6 +77,10 @@ const LFO2_SEED: u64 = 0x7E5D;
 /// Per-layer RNG seeds (decorrelate the two layers' S&H LFO PRNGs).
 const RNG_SEEDS: [u64; LAYERS] = [0x9E37_79B9, 0x2545_F491];
 
+/// Stable seed for the reverb's BBD clock jitter walk (parked off in v1 but
+/// the engine still wants a deterministic init).
+const REVERB_SEED: u32 = 0xBBD0_0040;
+
 /// The complete VXN1 instrument.
 pub struct Synth {
     sample_rate: f32,
@@ -91,6 +97,12 @@ pub struct Synth {
     lfo2: LfoCore,
     chorus: StereoChorus,
     delay: StereoDelay,
+    /// MN3011-style BBD tap-comb reverb. Sits post-delay, pre-limiter in the
+    /// FX chain; runs only when [`GlobalParam::ReverbOn`] is set.
+    reverb: StereoVReverb,
+    /// Voicing type used last block; on change, `reverb.reset()` clears the tail
+    /// before the next process so a Plate's ring can't bleed into a Hall.
+    reverb_was_type: Option<ReverbType>,
     /// Optional brickwall limiter on the master bus (last in the FX chain). Run
     /// only when [`GlobalParam::LimiterOn`] is set; bypassed otherwise.
     limiter: StereoLimiter,
@@ -139,6 +151,8 @@ impl Synth {
             lfo2: LfoCore::new(control_rate, LFO2_SEED),
             chorus: StereoChorus::new(sample_rate),
             delay: StereoDelay::new(sample_rate, 2.0),
+            reverb: StereoVReverb::new(sample_rate, REVERB_SEED),
+            reverb_was_type: None,
             limiter: StereoLimiter::new(sample_rate),
             limiter_was_on: false,
             oversampler: Oversampler::new(),
@@ -166,6 +180,8 @@ impl Synth {
         self.lfo2 = LfoCore::new(control_rate, LFO2_SEED);
         self.chorus = StereoChorus::new(sample_rate);
         self.delay = StereoDelay::new(sample_rate, 2.0);
+        self.reverb = StereoVReverb::new(sample_rate, REVERB_SEED);
+        self.reverb_was_type = None;
         self.limiter = StereoLimiter::new(sample_rate);
         self.limiter_was_on = false;
         self.oversampler.reset();
@@ -446,6 +462,31 @@ impl Synth {
                 }
             }
 
+            // Reverb (post-delay): wet from the line, blend with smoothed mix.
+            // Skipped when off so the engine stays sample-exact against a build
+            // with reverb absent.
+            let reverb_on = self.params.global().bool(GlobalParam::ReverbOn);
+            if reverb_on {
+                let mut dry_in = [0f32; CONTROL_BLOCK];
+                let dry_in = &mut dry_in[..block];
+                for i in 0..block {
+                    dry_in[i] = 0.5 * (l_out[i] + r_out[i]);
+                }
+                let mut wet_l = [0f32; CONTROL_BLOCK];
+                let mut wet_r = [0f32; CONTROL_BLOCK];
+                let (wl, wr) = (&mut wet_l[..block], &mut wet_r[..block]);
+                self.reverb.process_block(dry_in, wl, wr);
+                let mix = self
+                    .smoother
+                    .values()
+                    .global()
+                    .get(GlobalParam::ReverbMix);
+                for i in 0..block {
+                    l_out[i] += mix * (wl[i] - l_out[i]);
+                    r_out[i] += mix * (wr[i] - r_out[i]);
+                }
+            }
+
             // Master limiter (last in the chain): clear stale lookahead state on
             // the off→on edge so re-engaging it can't leak an old transient.
             let limiter_on = self.params.global().bool(GlobalParam::LimiterOn);
@@ -509,6 +550,21 @@ impl Synth {
             g.get(GlobalParam::DelayMix),
             g.bool(GlobalParam::DelayPingPong),
         );
+
+        // Reverb: resolve the macro UI (Type + Depth) into the six underlying
+        // knobs and push to the engine. Type lives unsmoothed (it's a discrete
+        // switch), so read from `params` rather than the smoother. On a Type
+        // change clear the tail so the previous voicing doesn't bleed.
+        let t = self.params.global().reverb_type();
+        if self.reverb_was_type != Some(t) {
+            self.reverb.reset();
+            self.reverb_was_type = Some(t);
+        }
+        let depth = g.get(GlobalParam::ReverbDepth);
+        let v = reverb_macro::reverb_macro(t, depth);
+        self.reverb
+            .set_params(v.size, v.decay, v.damping, v.mod_rate, v.mod_depth, 0.0);
+        self.reverb.set_diffusion(v.diffusion);
     }
 
     /// Build one layer's control-block context from its param source (§3) and the
@@ -533,12 +589,14 @@ impl Synth {
         // shape + onset times. LFO 2 is the global LFO, already sampled.
         let lfo1_rate_hz = lfo_rate(p, PatchParam::LfoRate, PatchParam::LfoSync, tempo);
 
-        // Cross-mod type selector → (sync flag, PM index). Off zeroes both, so
-        // the voice keeps the independent fast path; Sync and PM never coexist.
-        let (sync, pm_index) = match p.cross_mod_type() {
-            CrossModType::Off => (false, 0.0),
-            CrossModType::Sync => (true, 0.0),
-            CrossModType::Pm => (false, p.get(PatchParam::CrossModAmount)),
+        // Cross-mod type selector → (sync flag, PM index, ring flag). Off zeroes
+        // sync/PM and disables ring, so the voice keeps the independent fast
+        // path; the four variants are mutually exclusive.
+        let (sync, pm_index, ring_mode) = match p.cross_mod_type() {
+            CrossModType::Off => (false, 0.0, false),
+            CrossModType::Sync => (true, 0.0, false),
+            CrossModType::Pm => (false, p.get(PatchParam::CrossModAmount), false),
+            CrossModType::Ring => (false, 0.0, true),
         };
 
         // Mod wheel (CC1) is a global control applied once per block, folded into
@@ -553,7 +611,8 @@ impl Synth {
             osc2_wave: p.osc_wave(PatchParam::Osc2Wave),
             osc1_level: p.get(PatchParam::Osc1Level),
             osc2_level: p.get(PatchParam::Osc2Level),
-            ring_level: p.get(PatchParam::RingLevel),
+            sub_level: p.get(PatchParam::SubLevel),
+            ring_mode,
             noise_level: p.get(PatchParam::NoiseLevel),
             noise_color: p.noise_color(),
             osc1_pw: p.get(PatchParam::Osc1PulseWidth),
@@ -581,12 +640,15 @@ impl Synth {
             lfo2_val,
             sync,
             pm_index,
+            cross_mod_type: p.cross_mod_type(),
             portamento_time: p.get(PatchParam::PortamentoTime),
             // Fixed routes (ADR 0004 §4).
             pitch_lfo_sel: p.lfo_sel(PatchParam::PitchLfoSrc),
             pitch_lfo_depth: p.get(PatchParam::PitchLfoDepth),
+            pitch_lfo_mod_only: p.bool(PatchParam::PitchLfoModOnly),
             pitch_env_sel: p.env_sel(PatchParam::PitchEnvSrc),
             pitch_env_depth: p.get(PatchParam::PitchEnvDepth),
+            pitch_env_mod_only: p.bool(PatchParam::PitchEnvModOnly),
             pitch_extra: self.bend_norm * p.get(PatchParam::PitchWheelDepth),
             pwm_lfo_sel: p.lfo_sel(PatchParam::PwmLfoSrc),
             pwm_lfo_depth: p.get(PatchParam::PwmLfoDepth),
@@ -599,9 +661,7 @@ impl Synth {
             cutoff_vel_depth: p.get(PatchParam::VelCutoffDepth),
             cutoff_extra: wheel * p.get(PatchParam::ModWheelCutoff),
             filter_key_track: p.bool(PatchParam::FilterKeyTrack),
-            osc2_pitch_env_sel: p.env_sel(PatchParam::Osc2PitchEnvSrc),
-            osc2_pitch_env_depth: p.get(PatchParam::Osc2PitchEnvDepth),
-            osc2_pitch_extra: wheel * p.get(PatchParam::ModWheelOsc2Pitch),
+            sweep_extra: wheel * p.get(PatchParam::ModWheelCrossModSweep),
             amp_lfo_sel: p.lfo_sel(PatchParam::AmpLfoSrc),
             amp_lfo_depth: p.get(PatchParam::AmpLfoDepth),
             amp_env_bypass: p.bool(PatchParam::AmpEnvBypass),
@@ -976,27 +1036,30 @@ mod tests {
     }
 
     #[test]
-    fn ring_level_mixes_in_and_zero_is_inert() {
-        // RingLevel > 0 mixes the osc1×osc2 ring signal in alongside the oscs,
-        // changing the timbre and staying finite; RingLevel 0 is the inert
-        // fast path (its output matches a no-ring render exactly).
-        fn render_ring(level: f32) -> Vec<f32> {
+    fn ring_mode_displaces_osc1_and_off_is_inert() {
+        // `CrossModType::Ring` routes osc1×osc2 into the osc1 mixer slot, so the
+        // patch's timbre shifts vs. the Off render and stays finite. Off is the
+        // inert fast path (its output is bit-identical across renders).
+        fn render_ring(on: bool) -> Vec<f32> {
             let mut s = pitched_synth();
             s.set_param(pp(PatchParam::Osc1Wave), 0.0); // sine
             s.set_param(pp(PatchParam::Osc2Wave), 0.0);
             s.set_param(pp(PatchParam::Osc1Level), 0.5);
             s.set_param(pp(PatchParam::Osc2Level), 0.5);
             s.set_param(pp(PatchParam::Osc2Coarse), 5.0); // inharmonic vs osc1
-            s.set_param(pp(PatchParam::RingLevel), level);
+            s.set_param(
+                pp(PatchParam::CrossModType),
+                if on { 3.0 } else { 0.0 },
+            );
             s.note_on(45, 1.0);
             render(&mut s, 12_000).0
         }
-        let dry = render_ring(0.0);
-        assert_eq!(dry, render_ring(0.0), "RingLevel 0 path not deterministic");
-        let wet = render_ring(0.8);
+        let dry = render_ring(false);
+        assert_eq!(dry, render_ring(false), "Ring off path not deterministic");
+        let wet = render_ring(true);
         assert!(wet.iter().all(|x| x.is_finite()), "ring output not finite");
         let diff = mean_abs_diff(&dry[4800..], &wet[4800..]);
-        assert!(diff > 1e-3, "RingLevel did not change the output: {diff}");
+        assert!(diff > 1e-3, "Ring mode did not change the output: {diff}");
     }
 
     #[test]
@@ -1210,15 +1273,17 @@ mod tests {
     }
 
     #[test]
-    fn mod_wheel_osc2_pitch_shifts_osc2() {
-        // Wheel→Osc2 pitch depth 12 st, wheel full → osc2 up an octave (×2).
+    fn mod_wheel_cross_mod_sweep_shifts_audible_osc() {
+        // Wheel→X-Mod sweep depth 12 st, wheel full → +1 oct on the targeted
+        // osc(s). In Off mode the sweep hits both oscs; here osc1 is muted, so
+        // only osc2 is audible — its freq should double.
         let mut base = osc2_sine_synth();
         base.note_on(57, 1.0); // 220 Hz
         let (l0, _) = render(&mut base, 24_000);
         let f0 = dominant_hz(&l0[4800..], 48_000.0);
 
         let mut up = osc2_sine_synth();
-        up.set_param(pp(PatchParam::ModWheelOsc2Pitch), 12.0);
+        up.set_param(pp(PatchParam::ModWheelCrossModSweep), 12.0);
         up.set_mod_wheel(1.0);
         up.note_on(57, 1.0);
         let (l1, _) = render(&mut up, 24_000);
@@ -1226,7 +1291,77 @@ mod tests {
 
         assert!(
             (f1 / f0 - 2.0).abs() < 0.05,
-            "wheel→osc2 +12 st should double osc2 freq: {f0} -> {f1}"
+            "wheel→x-mod +12 st should double audible osc freq: {f0} -> {f1}"
+        );
+    }
+
+    #[test]
+    fn fm_mode_pitch_env_mod_only_modulates_osc2_not_osc1() {
+        // The "Mod" switch isolates env→pitch to the modulator oscillator.
+        // Modulator = osc2 by default; Sync flips to osc1. Verify by
+        // silencing osc2 and listening to osc1 alone: a hot env→pitch
+        // (+12 st) must NOT shift the carrier in Off / Ring / Pm modes
+        // (all of which route to osc2). Sync's osc1-routing is covered
+        // separately.
+        fn carrier_pitch(cross_mod: f32, amount: f32) -> f32 {
+            let mut s = Synth::new(48_000.0);
+            s.set_param(pp(PatchParam::Osc1Wave), 0.0); // sine carrier
+            s.set_param(pp(PatchParam::Osc1Level), 0.8);
+            s.set_param(pp(PatchParam::Osc2Wave), 0.0); // sine modulator
+            s.set_param(pp(PatchParam::Osc2Level), 0.0); // silent — only osc1 audible
+            s.set_param(pp(PatchParam::PitchLfoDepth), 0.0);
+            s.set_param(gp(GlobalParam::ChorusOn), 0.0);
+            s.set_param(pp(PatchParam::CrossModType), cross_mod);
+            s.set_param(pp(PatchParam::CrossModAmount), amount);
+            // Env 1 → pitch, +12 st, mod-only ON. Hot AD + full sustain so
+            // env_1 sits at 1.0 across the capture window.
+            s.set_param(pp(PatchParam::PitchEnvSrc), 1.0); // Env 1
+            s.set_param(pp(PatchParam::PitchEnvDepth), 12.0);
+            s.set_param(pp(PatchParam::PitchEnvModOnly), 1.0);
+            s.set_param(pp(PatchParam::Env1Attack), 0.001);
+            s.set_param(pp(PatchParam::Env1Decay), 0.001);
+            s.set_param(pp(PatchParam::Env1Sustain), 1.0);
+            s.set_param(pp(PatchParam::Env2Attack), 0.001);
+            s.note_on(57, 1.0); // A3 ≈ 220 Hz
+            let (l, _) = render(&mut s, 24_000);
+            dominant_hz(&l[4800..], 48_000.0)
+        }
+        // Reference: plain A3 carrier, no env→pitch.
+        let clean = {
+            let mut s = Synth::new(48_000.0);
+            s.set_param(pp(PatchParam::Osc1Wave), 0.0);
+            s.set_param(pp(PatchParam::Osc1Level), 0.8);
+            s.set_param(pp(PatchParam::Osc2Level), 0.0);
+            s.set_param(pp(PatchParam::PitchLfoDepth), 0.0);
+            s.set_param(gp(GlobalParam::ChorusOn), 0.0);
+            s.set_param(pp(PatchParam::Env2Attack), 0.001);
+            s.note_on(57, 1.0);
+            let (l, _) = render(&mut s, 24_000);
+            dominant_hz(&l[4800..], 48_000.0)
+        };
+        // FM at amount = 0 must still route env to osc2 — the mode is FM
+        // regardless of depth (the kernel takes the fast path at 0, but the
+        // semantic routing still picks osc2 as the modulator).
+        let fm_zero = carrier_pitch(2.0, 0.0);
+        assert!(
+            (fm_zero / clean - 1.0).abs() < 0.03,
+            "FM amount=0 + mod-only shifted carrier (routing read amount, \
+             not mode): clean {clean}, fm0 {fm_zero}",
+        );
+        // FM with low pm_index keeps the carrier the dominant FFT peak; env
+        // should leave it untouched (routes to silent osc2).
+        let fm = carrier_pitch(2.0, 0.1);
+        assert!(
+            (fm / clean - 1.0).abs() < 0.03,
+            "FM + mod-only shifted carrier (env leaked to osc1): clean {clean}, fm {fm}",
+        );
+        // Off mode: mod-only routes to osc2 (default modulator) — same as
+        // Pm — so the audible osc1 stays put. Without this isolation the
+        // Mod switch would be a no-op when no cross-mod is in play.
+        let off = carrier_pitch(0.0, 0.0);
+        assert!(
+            (off / clean - 1.0).abs() < 0.03,
+            "Off + mod-only shifted carrier (env leaked to osc1): clean {clean}, off {off}",
         );
     }
 
@@ -2216,6 +2351,84 @@ mod tests {
         assert!(
             l.iter().chain(r.iter()).all(|x| x.is_finite()),
             "non-finite output"
+        );
+    }
+
+    /// Run a short note through the engine with the FX block to default-off
+    /// state except for the parameters the caller pre-set.
+    fn render_short_note(s: &mut Synth, frames: usize) -> (Vec<f32>, Vec<f32>) {
+        s.set_param(pp(PatchParam::Env2Attack), 0.001);
+        s.set_param(pp(PatchParam::Env2Release), 0.01);
+        s.set_param(gp(GlobalParam::ChorusOn), 0.0);
+        s.note_on(69, 1.0);
+        render(s, frames)
+    }
+
+    #[test]
+    fn reverb_off_passes_dry_unchanged() {
+        // With reverb_on=0 the reverb branch is gated off, so the dry chain
+        // output must not depend on reverb_type / depth / mix. Compare two
+        // runs that differ only in those three knobs.
+        let mut a = Synth::new(48_000.0);
+        a.set_param(gp(GlobalParam::ReverbOn), 0.0);
+        a.set_param(gp(GlobalParam::ReverbType), 0.0); // Plate
+        a.set_param(gp(GlobalParam::ReverbDepth), 0.0);
+        a.set_param(gp(GlobalParam::ReverbMix), 0.0);
+        let (al, ar) = render_short_note(&mut a, 4800);
+
+        let mut b = Synth::new(48_000.0);
+        b.set_param(gp(GlobalParam::ReverbOn), 0.0);
+        b.set_param(gp(GlobalParam::ReverbType), 3.0); // Large
+        b.set_param(gp(GlobalParam::ReverbDepth), 1.0);
+        b.set_param(gp(GlobalParam::ReverbMix), 1.0);
+        let (bl, br) = render_short_note(&mut b, 4800);
+
+        assert_eq!(al, bl, "reverb_off path is not dry-pass on L");
+        assert_eq!(ar, br, "reverb_off path is not dry-pass on R");
+    }
+
+    #[test]
+    fn reverb_type_switch_resets_tail() {
+        // Charge a Plate tail with high decay (Large in the macro table),
+        // then switch the Type and assert the engine's reset clears the
+        // line — silent input post-switch produces silent output for the
+        // first block, where previously it would have rung out.
+        let mut s = Synth::new(48_000.0);
+        s.set_param(gp(GlobalParam::ChorusOn), 0.0);
+        s.set_param(gp(GlobalParam::DelayOn), 0.0);
+        s.set_param(gp(GlobalParam::ReverbOn), 1.0);
+        s.set_param(gp(GlobalParam::ReverbType), 3.0); // Large = longest decay
+        s.set_param(gp(GlobalParam::ReverbDepth), 1.0);
+        s.set_param(gp(GlobalParam::ReverbMix), 1.0);
+        s.set_param(pp(PatchParam::Env2Attack), 0.001);
+        s.set_param(pp(PatchParam::Env2Release), 0.01);
+        // Excite the line with a short note, then release fully.
+        s.note_on(69, 1.0);
+        let _ = render(&mut s, 9600);
+        s.note_off(69);
+        let _ = render(&mut s, 9600);
+
+        // Tail is non-trivial at this point — confirm by capturing one block.
+        let (tail_l, tail_r) = render(&mut s, 256);
+        let tail_peak = tail_l
+            .iter()
+            .chain(tail_r.iter())
+            .fold(0.0_f32, |m, &x| m.max(x.abs()));
+        assert!(
+            tail_peak > 1e-4,
+            "test precondition failed: tail too quiet ({tail_peak}) — won't detect a reset regression"
+        );
+
+        // Switch Type — engine should reset() before the next block.
+        s.set_param(gp(GlobalParam::ReverbType), 1.0); // Room
+        let (post_l, post_r) = render(&mut s, 256);
+        let post_peak = post_l
+            .iter()
+            .chain(post_r.iter())
+            .fold(0.0_f32, |m, &x| m.max(x.abs()));
+        assert!(
+            post_peak < 1e-5,
+            "Type switch did not reset reverb tail: peak={post_peak}, was tail_peak={tail_peak}"
         );
     }
 }

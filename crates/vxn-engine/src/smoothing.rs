@@ -68,21 +68,23 @@ enum Glide {
 fn patch_glide(p: PatchParam) -> Glide {
     use PatchParam::*;
     match p {
-        Osc1Level | Osc2Level | RingLevel | NoiseLevel | Osc1PulseWidth | Osc2PulseWidth
+        Osc1Level | Osc2Level | SubLevel | NoiseLevel | Osc1PulseWidth | Osc2PulseWidth
         | CrossModAmount | PitchLfoDepth | PitchEnvDepth | PitchWheelDepth | PwmLfoDepth
         | PwmEnvDepth | CutoffLfo1Depth | CutoffLfo2Depth | CutoffEnvDepth | VelCutoffDepth
-        | Osc2PitchEnvDepth | ModWheelPwm | ModWheelCutoff | ModWheelReso | ModWheelOsc2Pitch
+        | ModWheelPwm | ModWheelCutoff | ModWheelReso | ModWheelCrossModSweep
         | AmpLfoDepth => Glide::Block,
         _ => Glide::Snap,
     }
 }
 
 /// Classification for a global param. Master volume is glided per-sample by the
-/// dedicated [`Smoothed`]; the rest snap (FX read snapped values each block).
+/// dedicated [`Smoothed`]; reverb mix / depth glide at block rate because the
+/// engine reads them straight into a per-sample blend; the rest snap.
 #[inline]
 fn global_glide(g: GlobalParam) -> Glide {
     match g {
         GlobalParam::MasterVolume => Glide::PerSample,
+        GlobalParam::ReverbMix | GlobalParam::ReverbDepth => Glide::Block,
         _ => Glide::Snap,
     }
 }
@@ -212,20 +214,20 @@ mod tests {
     #[test]
     fn block_param_settles_exactly_to_zero() {
         // A block-rate glide must reach its target *exactly* in bounded time,
-        // not crawl down the one-pole tail forever. RingLevel / CrossModAmount
+        // not crawl down the one-pole tail forever. CrossModAmount / NoiseLevel
         // gate expensive paths off `!= 0.0`, so a residual epsilon would keep
         // them armed and CPU pinned after the param is zeroed.
-        let start = patch_target(PatchParam::RingLevel, 1.0);
+        let start = patch_target(PatchParam::NoiseLevel, 1.0);
         let mut s = ParamSmoother::new(48_000.0, &start);
-        let zero = ParamValues::default(); // RingLevel target 0.0
+        let zero = ParamValues::default(); // NoiseLevel target 0.0
         let mut blocks = 0;
         loop {
             s.tick_block(&zero);
             blocks += 1;
-            if s.values().layer(Layer::Upper).get(PatchParam::RingLevel) == 0.0 {
+            if s.values().layer(Layer::Upper).get(PatchParam::NoiseLevel) == 0.0 {
                 break;
             }
-            assert!(blocks < 1000, "RingLevel never reached exactly 0.0");
+            assert!(blocks < 1000, "NoiseLevel never reached exactly 0.0");
         }
         // 10 ms time constant at the control rate settles well under 1000 blocks.
         assert!(blocks < 1000);
@@ -248,7 +250,7 @@ mod tests {
         assert_eq!(patch_glide(PatchParam::CutoffLfo1Depth), Glide::Block);
         assert_eq!(patch_glide(PatchParam::CutoffLfo2Depth), Glide::Block);
         assert_eq!(patch_glide(PatchParam::PitchEnvDepth), Glide::Block);
-        assert_eq!(patch_glide(PatchParam::RingLevel), Glide::Block);
+        assert_eq!(patch_glide(PatchParam::NoiseLevel), Glide::Block);
         // Selectors snap (discrete).
         assert_eq!(patch_glide(PatchParam::PitchLfoSrc), Glide::Snap);
     }

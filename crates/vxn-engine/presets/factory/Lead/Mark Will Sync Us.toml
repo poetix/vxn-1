@@ -1,9 +1,10 @@
 schema = 1
 
 [meta]
-name = "Sync or Swim"
+name = "Mark Will Sync Us"
 author = "Vulpus Labs"
 category = "Lead"
+tags = ["sync", "lead"]
 comment = "Surging negative-envelope sync lead — sharp attack, the sync sweep diving downward via an inverted (negative) pitch-env depth. Raise Oversample for clean sync."
 
 [performance]
@@ -11,11 +12,13 @@ key_mode = "Whole"
 split_point = 60
 
 [performance.upper]
-osc2_coarse = 5
-osc2_octave = 0
+# osc1 = slave/carrier (audible sync sound); osc2 = master.
+osc1_coarse = 5
+osc1_octave = 0
 cross_mod_type = "Sync"
-osc2_pitch_env_src = "Env 1"
-osc2_pitch_env_depth = -24.0
+pitch_env_src = "Env 1"
+pitch_env_depth = -12.0
+pitch_env_mod_only = true
 env1_attack = 0.001
 env1_decay = 0.25
 cutoff = 5500.0

@@ -4,7 +4,7 @@ schema = 1
 name = "Tropical Pluckstorm"
 author = "Vulpus Labs"
 category = "Keys"
-comment = "Bright sweeping pluck with a sharp attack — a downward Env-1 chirp on osc 2 gives a negative-envelope sweep over a snappy filter bite. Negative pitch-env depth for the downward sweep."
+comment = "Bright sweeping pluck with a sharp attack — a downward Env-1 chirp on both oscillators gives a negative-envelope sweep over a snappy filter bite. Negative pitch-env depth for the downward sweep."
 
 [performance]
 key_mode = "Whole"
@@ -15,8 +15,8 @@ osc2_octave = 0
 osc2_fine = 5.0
 cutoff = 4000.0
 resonance = 0.35
-osc2_pitch_env_src = "Env 1"
-osc2_pitch_env_depth = -24.0
+pitch_env_src = "Env 1"
+pitch_env_depth = -12.0
 env1_attack = 0.001
 env1_decay = 0.18
 cutoff_env_depth = 30.0

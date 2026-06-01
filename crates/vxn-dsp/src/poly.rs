@@ -53,12 +53,6 @@ fn tanh_c(x: f32) -> f32 {
     x * (10395.0 + 1260.0 * x2 + 21.0 * x4) / (10395.0 + 4725.0 * x2 + 210.0 * x4 + 4.0 * x6)
 }
 
-#[inline(always)]
-fn advance(phase: f32, inc: f32) -> f32 {
-    let np = phase + inc;
-    np - (np >= 1.0) as u32 as f32
-}
-
 /// Naive (pre-BLEP) oscillator value — the raw, discontinuous waveform. Used to
 /// size the value jump across a hard-sync reset; the polyBLEP residual then
 /// band-limits that jump. The slave's *own* wrap BLEP lives in [`osc_sample`],
@@ -194,10 +188,11 @@ macro_rules! with_wave {
 /// (PWM modulation differs per voice).
 ///
 /// `sync_resid` / `sync_pending` carry hard-sync polyBLEP state across samples:
-/// when [`process_pair`](Self::process_pair) resets this oscillator (as the
-/// slave) sub-sample on sample *n*, the discontinuity falls between samples *n*
-/// and *n+1*, so the band-limited post-reset value is emitted on *n+1*. Unused
-/// (always 0) on the fast [`process`](Self::process) path.
+/// when [`process_pair`](Self::process_pair) resets this oscillator (it is the
+/// slave on osc1, with osc2 as master) sub-sample on sample *n*, the
+/// discontinuity falls between samples *n* and *n+1*, so the band-limited
+/// post-reset value is emitted on *n+1*. Unused (always 0) on the fast
+/// [`process`](Self::process) path and on osc2 (which is never the slave).
 #[derive(Clone)]
 pub struct PolyOscillator {
     pub phase: [f32; N],
@@ -207,6 +202,11 @@ pub struct PolyOscillator {
     /// 1.0 on the sample following a sync reset (emit the bare post value, not
     /// the `osc_sample` free value), else 0.0.
     sync_pending: [f32; N],
+    /// Sub-osc flipflop (0.0 / 1.0), toggled by the kernel that advances the
+    /// phase keying it: own wrap on the independent / PM paths, master wrap on
+    /// the sync path. Stored as `f32` so the lane loop stays branchless and
+    /// vectorises (matches `sync_pending`). Read by [`poly_sub_square`].
+    pub sub_flipflop: [f32; N],
 }
 
 impl Default for PolyOscillator {
@@ -222,6 +222,7 @@ impl PolyOscillator {
             inc: [0.0; N],
             sync_resid: [0.0; N],
             sync_pending: [0.0; N],
+            sub_flipflop: [0.0; N],
         }
     }
 
@@ -229,32 +230,45 @@ impl PolyOscillator {
     pub fn reset(&mut self, v: usize) {
         self.sync_resid[v] = 0.0;
         self.sync_pending[v] = 0.0;
+        self.sub_flipflop[v] = 0.0;
         self.phase[v] = 0.0;
     }
 
     /// Produce one sample per voice into `out`, advancing all phases. `wave` is
-    /// global; `pw` is per-voice pulse width.
+    /// global; `pw` is per-voice pulse width. Toggles [`sub_flipflop`] on each
+    /// own-wrap (drives the sub-osc on Off / Ring; unused for osc2, harmless).
     #[inline]
     pub fn process(&mut self, wave: Waveform, pw: &[f32; N], out: &mut [f32; N]) {
         match wave {
             Waveform::Sine => {
                 for v in 0..N {
-                    out[v] = fast_sine(self.phase[v]);
-                    self.phase[v] = advance(self.phase[v], self.inc[v]);
+                    let p = self.phase[v];
+                    out[v] = fast_sine(p);
+                    let np = p + self.inc[v];
+                    let wrapped = (np >= 1.0) as u32 as f32;
+                    self.phase[v] = np - wrapped;
+                    self.sub_flipflop[v] += wrapped - 2.0 * self.sub_flipflop[v] * wrapped;
                 }
             }
             Waveform::Triangle => {
                 for v in 0..N {
                     let p = self.phase[v];
                     out[v] = 1.0 - 4.0 * (p - 0.5).abs();
-                    self.phase[v] = advance(p, self.inc[v]);
+                    let np = p + self.inc[v];
+                    let wrapped = (np >= 1.0) as u32 as f32;
+                    self.phase[v] = np - wrapped;
+                    self.sub_flipflop[v] += wrapped - 2.0 * self.sub_flipflop[v] * wrapped;
                 }
             }
             Waveform::Saw => {
                 for v in 0..N {
                     let p = self.phase[v];
-                    out[v] = (2.0 * p - 1.0) - pblep(p, self.inc[v]);
-                    self.phase[v] = advance(p, self.inc[v]);
+                    let dt = self.inc[v];
+                    out[v] = (2.0 * p - 1.0) - pblep(p, dt);
+                    let np = p + dt;
+                    let wrapped = (np >= 1.0) as u32 as f32;
+                    self.phase[v] = np - wrapped;
+                    self.sub_flipflop[v] += wrapped - 2.0 * self.sub_flipflop[v] * wrapped;
                 }
             }
             Waveform::Pulse => {
@@ -268,30 +282,34 @@ impl PolyOscillator {
                         x - x.floor()
                     };
                     out[v] = naive + pblep(p, dt) - pblep(pf, dt);
-                    self.phase[v] = advance(p, dt);
+                    let np = p + dt;
+                    let wrapped = (np >= 1.0) as u32 as f32;
+                    self.phase[v] = np - wrapped;
+                    self.sub_flipflop[v] += wrapped - 2.0 * self.sub_flipflop[v] * wrapped;
                 }
             }
         }
     }
 
-    /// Coupled master(self=osc1)→slave(osc2) path carrying **hard sync** and
+    /// Coupled carrier(self=osc1)←modulator(osc2) path carrying **hard sync** and
     /// **through-zero phase modulation** (JP-8 VCO-2 sync + Cross Mod; ADR 0004
-    /// §7):
+    /// §7). osc1 is always the audible carrier (modulated thing); osc2 is always
+    /// the silent modulator (driving signal).
     ///
     /// - **Phase mod** (`pm_index` = phase-deviation index, cycles): osc2's
     ///   current output offsets osc1's **read phase** only — `o1 =
-    ///   osc_sample(wave1, frac(phase1 + pm_index·o2), …)` — while osc1's phase
+    ///   osc_sample(wave1, frac(phase_s + pm_index·o2), …)` — while osc1's phase
     ///   accumulator advances at its **unmodulated base increment**. The read
     ///   uses a **two-sided wrap** (`x − x.floor()`) so the pointer can run
     ///   backward through zero (through-zero PM); the carrier accumulator keeps
     ///   its one-sided wrap. PM ≡ FM spectrally for these timbres but with no
-    ///   pitch drift and a constant `dt` (keeps polyBLEP valid and the sync
-    ///   master `dt` = base increment). At `pm_index == 0`, `read == phase1`
-    ///   exactly, so the output is untouched.
-    /// - **Sync** (`sync`): when the master's phase wraps **sub-sample** at
-    ///   fraction `frac ∈ (0,1]` into the sample, the slave resets to
+    ///   pitch drift and a constant `dt` (keeps polyBLEP valid and the master
+    ///   `dt` = base increment). At `pm_index == 0`, `read == phase_s` exactly,
+    ///   so the output is untouched.
+    /// - **Sync** (`sync`): when osc2's (master) phase wraps **sub-sample** at
+    ///   fraction `frac ∈ (0,1]` into the sample, osc1 (slave) resets to
     ///   `(1−frac)·inc` (the remainder of the current sample) instead of a hard
-    ///   0, and the slave's value jump across that reset is band-limited with a
+    ///   0, and osc1's value jump across that reset is band-limited with a
     ///   polyBLEP residual. This is the sub-sample path ported from
     ///   `patches-dsp` — the reset lands at the exact fractional crossing and
     ///   the edge is BLEP-softened, cutting the aliasing the sample-accurate
@@ -303,8 +321,13 @@ impl PolyOscillator {
     /// kernels (each sheds the other's work); this combined form is kept as the
     /// readable reference and the differential-test oracle. It handles both at
     /// once and stays finite.
-    /// osc2 is evaluated first because it is the PM source for osc1. This is the
-    /// slow path, taken only when `sync` is on **or** `pm_index != 0`; plain
+    ///
+    /// Convention: `self` is **osc1** — always the audible carrier (PM target
+    /// in PM mode, sync slave in sync mode). The `other` argument is **osc2**
+    /// — always the modulator (PM source in PM mode, sync master in sync mode).
+    /// osc2 is evaluated first because it is the PM source feeding osc1's read
+    /// offset and the master whose wrap drives osc1's sub-sample reset. This is
+    /// the slow path, taken only when `sync` is on **or** `pm_index != 0`; plain
     /// patches keep the vectorised [`process`](Self::process) fast path. The
     /// reset and residual are mask-selected (not branched) so the lane loop still
     /// vectorises. High-index PM is still alias-prone; v1 leans on the engine's
@@ -313,7 +336,7 @@ impl PolyOscillator {
     #[allow(clippy::too_many_arguments)] // two waves + two pw/out arrays is the coupled shape
     pub fn process_pair(
         &mut self,
-        slave: &mut PolyOscillator,
+        other: &mut PolyOscillator,
         sync: bool,
         pm_index: f32,
         wave1: Waveform,
@@ -325,87 +348,95 @@ impl PolyOscillator {
     ) {
         let sync_f = sync as u32 as f32;
         for v in 0..N {
-            let dt2 = slave.inc[v];
-            let p2 = slave.phase[v];
+            let dt_m = other.inc[v];
+            let p_m = other.phase[v];
+            let dt_s = self.inc[v];
+            let p_s = self.phase[v];
 
-            // osc2 (slave) first — it is the PM source for osc1, and its output.
-            // On the sample *after* a sync reset (`sync_pending`), the slave sits
-            // at the sub-sample reset phase, so emit the **bare** waveform value
-            // plus the deferred polyBLEP residual rather than `osc_sample`'s
-            // free value (whose own-wrap BLEP assumes a 1→0 wrap of fixed height,
-            // not this reset). Otherwise the normal free-running value.
-            let pend = slave.sync_pending[v];
-            let free_val = osc_sample(wave2, p2, pw2[v], dt2);
-            let bare_val = naive_osc(wave2, p2, pw2[v]) + slave.sync_resid[v];
-            let s2 = free_val * (1.0 - pend) + bare_val * pend;
-            o2[v] = s2;
+            // osc2 (master / PM source) first — its free-running value is osc2's
+            // output AND the PM source for osc1's read offset below.
+            let s_m = osc_sample(wave2, p_m, pw2[v], dt_m);
+            o2[v] = s_m;
 
-            // osc1 (master): through-zero phase modulation. The carrier advances
-            // at its base increment (also the polyBLEP `dt` and the master `dt`
-            // for the wrap maths); osc2 offsets only the read phase. The summed
+            // osc1 (slave / carrier): through-zero phase modulation on the read,
+            // plus deferred sub-sample sync reset on the bare-value path.
+            // Carrier advances at its base increment (also the polyBLEP `dt` and
+            // the sub-sample maths); osc2 offsets only the read phase. The summed
             // read wraps two-sided so it can run backward through zero, while the
             // accumulator below keeps its one-sided wrap. `pm_index == 0` leaves
-            // `read == phase1`, so the fast path is reproduced bit-for-bit.
-            let inc1 = self.inc[v];
+            // `read == phase_s`, so the fast path is reproduced bit-for-bit.
+            // On the sample *after* a sync reset (`sync_pending`), osc1 sits at
+            // the sub-sample reset phase, so emit the **bare** waveform value plus
+            // the deferred polyBLEP residual rather than `osc_sample`'s free
+            // value (whose own-wrap BLEP assumes a 1→0 wrap of fixed height, not
+            // this reset).
+            let pend = self.sync_pending[v];
             let read = {
-                let x = self.phase[v] + pm_index * s2;
+                let x = p_s + pm_index * s_m;
                 x - x.floor()
             };
-            o1[v] = osc_sample(wave1, read, pw1[v], inc1);
+            let free_val = osc_sample(wave1, read, pw1[v], dt_s);
+            let bare_val = naive_osc(wave1, p_s, pw1[v]) + self.sync_resid[v];
+            let s_s = free_val * (1.0 - pend) + bare_val * pend;
+            o1[v] = s_s;
 
-            // Advance the master, capturing the wrap and its sub-sample fraction:
-            // when `np1 ≥ 1`, the wrap fell `frac ∈ (0,1]` into this sample,
-            // `frac = 1 − (np1−1)/inc1`. The `.max` guard keeps `frac` finite on
-            // frozen lanes (`inc1 = 0`, which never wrap); the reset mask drops
-            // it there regardless.
-            let np1 = self.phase[v] + inc1;
-            let wrapped = (np1 >= 1.0) as u32 as f32;
-            self.phase[v] = np1 - wrapped;
-            let frac = (1.0 - (np1 - 1.0) / inc1.max(1.0e-12)).clamp(f32::MIN_POSITIVE, 1.0);
+            // Advance the master (osc2), capturing the wrap and its sub-sample
+            // fraction: when `np_m ≥ 1`, the wrap fell `frac ∈ (0,1]` into this
+            // sample, `frac = 1 − (np_m−1)/dt_m`. The `.max` guard keeps `frac`
+            // finite on frozen lanes (`dt_m = 0`, which never wrap); the reset
+            // mask drops it there regardless.
+            let np_m = p_m + dt_m;
+            let wrapped = (np_m >= 1.0) as u32 as f32;
+            other.phase[v] = np_m - wrapped;
+            let frac = (1.0 - (np_m - 1.0) / dt_m.max(1.0e-12)).clamp(f32::MIN_POSITIVE, 1.0);
 
-            // On a synced master wrap, reset the slave sub-sample to `(1−frac)·inc`
-            // (remainder of the current sample). The master wrapped *inside* this
-            // sample, so the discontinuity falls between this sample and the next:
-            // defer the band-limited post value to the next sample via
-            // `sync_pending` / `sync_resid`. `delta = pre − post` is the bare
-            // waveform jump across the reset — `pre` the slave value at the
-            // crossing instant (`p2 + frac·dt`), `post` the value at the reset
-            // phase. Mask-selected by `wrapped · sync`, so cross-mod-only patches
-            // leave the slave free and the fast path stays bit-identical.
+            // On a synced master wrap, reset the slave (osc1, `self`) sub-sample
+            // to `(1−frac)·dt_s` (remainder of the current sample). The master
+            // wrapped *inside* this sample, so the discontinuity falls between
+            // this sample and the next: defer the band-limited post value to the
+            // next sample via `sync_pending` / `sync_resid`. `delta = pre − post`
+            // is the bare waveform jump across the reset — `pre` the slave value
+            // at the crossing instant (`p_s + frac·dt_s`), `post` the value at
+            // the reset phase. Mask-selected by `wrapped · sync`, so cross-mod-
+            // only patches leave the slave free and the fast path stays bit-
+            // identical.
             let reset = wrapped * sync_f;
-            let post_phase = (1.0 - frac) * dt2;
-            let pre_raw = p2 + frac * dt2;
+            let post_phase = (1.0 - frac) * dt_s;
+            let pre_raw = p_s + frac * dt_s;
             let pre_phase = pre_raw - (pre_raw >= 1.0) as u32 as f32;
-            let delta = naive_osc(wave2, pre_phase, pw2[v]) - naive_osc(wave2, post_phase, pw2[v]);
-            slave.sync_resid[v] = -pblep(post_phase, dt2) * 0.5 * delta;
-            slave.sync_pending[v] = reset;
+            let delta = naive_osc(wave1, pre_phase, pw1[v]) - naive_osc(wave1, post_phase, pw1[v]);
+            self.sync_resid[v] = -pblep(post_phase, dt_s) * 0.5 * delta;
+            self.sync_pending[v] = reset;
             // Before-side polyBLEP on the current sample (the step falls `frac`
             // into it; phase `1 − frac·dt` sits in pblep's falling region).
-            let before_phase = 1.0 - frac * dt2;
-            o2[v] -= pblep(before_phase, dt2) * 0.5 * delta * reset;
+            let before_phase = 1.0 - frac * dt_s;
+            o1[v] -= pblep(before_phase, dt_s) * 0.5 * delta * reset;
 
             // Slave phase for the next sample: free advance, or the reset phase
             // (un-advanced — the next sample reads it to emit the deferred post
             // value, then advances normally).
-            let np2 = p2 + dt2;
-            let free_phase = np2 - (np2 >= 1.0) as u32 as f32;
-            slave.phase[v] = free_phase * (1.0 - reset) + post_phase * reset;
+            let np_s = p_s + dt_s;
+            let free_phase = np_s - (np_s >= 1.0) as u32 as f32;
+            self.phase[v] = free_phase * (1.0 - reset) + post_phase * reset;
         }
     }
 
     /// Sync-only specialisation of [`process_pair`](Self::process_pair) (the
     /// engine picks Sync **or** PM, never both, so PM is statically absent here).
-    /// Identical to the combined kernel with `pm_index == 0`: the master read
+    /// Identical to the combined kernel with `pm_index == 0`: the carrier read
     /// phase is just its accumulator phase (no PM offset, no two-sided wrap), and
-    /// `reset == wrapped` since sync is always on. Drops the dead `pm_index · s2`
+    /// `reset == wrapped` since sync is always on. Drops the dead `pm_index · s_m`
     /// term and its `floor` per voice per sample; the band-limited sub-sample sync
     /// machinery is all live and kept verbatim. Profiled as the dominant hot path
     /// for sync patches (`busy_profile`), so it sheds exactly the PM-only work.
+    ///
+    /// Convention (see [`process_pair`](Self::process_pair)): `self` is osc1 =
+    /// slave/carrier (audible); `other` is osc2 = master (drives reset).
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn process_sync(
         &mut self,
-        slave: &mut PolyOscillator,
+        other: &mut PolyOscillator,
         wave1: Waveform,
         wave2: Waveform,
         pw1: &[f32; N],
@@ -415,77 +446,86 @@ impl PolyOscillator {
     ) {
         // Resolve both waveforms to marker types once, outside the lane loop, so
         // the loop body is monomorphised and branch-free (see [`WaveKind`]).
-        with_wave!(wave1, M => with_wave!(wave2, S => {
-            self.process_sync_w::<M, S>(slave, pw1, pw2, o1, o2)
+        with_wave!(wave1, W1 => with_wave!(wave2, W2 => {
+            self.process_sync_w::<W1, W2>(other, pw1, pw2, o1, o2)
         }))
     }
 
-    /// Monomorphised sync lane loop for master waveform `M`, slave waveform `S`.
+    /// Monomorphised sync lane loop. `W1` is the osc1 (slave/carrier) waveform,
+    /// `W2` is the osc2 (master) waveform.
     #[inline(always)]
-    fn process_sync_w<M: WaveKind, S: WaveKind>(
+    fn process_sync_w<W1: WaveKind, W2: WaveKind>(
         &mut self,
-        slave: &mut PolyOscillator,
+        other: &mut PolyOscillator,
         pw1: &[f32; N],
         pw2: &[f32; N],
         o1: &mut [f32; N],
         o2: &mut [f32; N],
     ) {
         for v in 0..N {
-            let dt2 = slave.inc[v];
-            let p2 = slave.phase[v];
+            let dt_m = other.inc[v];
+            let p_m = other.phase[v];
+            let dt_s = self.inc[v];
+            let p_s = self.phase[v];
 
-            // osc2 (slave): free value, or the deferred bare post-reset value on
-            // the sample after a sub-sample sync reset (`sync_pending`).
-            let pend = slave.sync_pending[v];
-            let free_val = S::sample(p2, pw2[v], dt2);
-            let bare_val = S::naive(p2, pw2[v]) + slave.sync_resid[v];
-            let s2 = free_val * (1.0 - pend) + bare_val * pend;
-            o2[v] = s2;
+            // osc1 (slave/carrier): free value, or the deferred bare post-reset
+            // value on the sample after a sub-sample sync reset (`sync_pending`).
+            let pend = self.sync_pending[v];
+            let free_val = W1::sample(p_s, pw1[v], dt_s);
+            let bare_val = W1::naive(p_s, pw1[v]) + self.sync_resid[v];
+            let s_s = free_val * (1.0 - pend) + bare_val * pend;
+            o1[v] = s_s;
 
-            // osc1 (master): no PM, so the read phase is the accumulator phase.
-            let inc1 = self.inc[v];
-            o1[v] = M::sample(self.phase[v], pw1[v], inc1);
+            // osc2 (master): no PM, so the read phase is the accumulator phase.
+            o2[v] = W2::sample(p_m, pw2[v], dt_m);
 
             // Advance the master, capturing the wrap and its sub-sample fraction.
-            let np1 = self.phase[v] + inc1;
-            let wrapped = (np1 >= 1.0) as u32 as f32;
-            self.phase[v] = np1 - wrapped;
-            let frac = (1.0 - (np1 - 1.0) / inc1.max(1.0e-12)).clamp(f32::MIN_POSITIVE, 1.0);
+            let np_m = p_m + dt_m;
+            let wrapped = (np_m >= 1.0) as u32 as f32;
+            other.phase[v] = np_m - wrapped;
+            let frac = (1.0 - (np_m - 1.0) / dt_m.max(1.0e-12)).clamp(f32::MIN_POSITIVE, 1.0);
+            // Sub flipflop is keyed to the master wrap under sync (the audible
+            // period is osc2's, so the sub sits an octave below that).
+            self.sub_flipflop[v] += wrapped - 2.0 * self.sub_flipflop[v] * wrapped;
 
             // Sync always on here: the reset mask is the bare master wrap.
             let reset = wrapped;
-            let post_phase = (1.0 - frac) * dt2;
-            let pre_raw = p2 + frac * dt2;
+            let post_phase = (1.0 - frac) * dt_s;
+            let pre_raw = p_s + frac * dt_s;
             let pre_phase = pre_raw - (pre_raw >= 1.0) as u32 as f32;
-            let delta = S::naive(pre_phase, pw2[v]) - S::naive(post_phase, pw2[v]);
-            slave.sync_resid[v] = -pblep(post_phase, dt2) * 0.5 * delta;
-            slave.sync_pending[v] = reset;
-            let before_phase = 1.0 - frac * dt2;
-            o2[v] -= pblep(before_phase, dt2) * 0.5 * delta * reset;
+            let delta = W1::naive(pre_phase, pw1[v]) - W1::naive(post_phase, pw1[v]);
+            self.sync_resid[v] = -pblep(post_phase, dt_s) * 0.5 * delta;
+            self.sync_pending[v] = reset;
+            let before_phase = 1.0 - frac * dt_s;
+            o1[v] -= pblep(before_phase, dt_s) * 0.5 * delta * reset;
 
-            let np2 = p2 + dt2;
-            let free_phase = np2 - (np2 >= 1.0) as u32 as f32;
-            slave.phase[v] = free_phase * (1.0 - reset) + post_phase * reset;
+            let np_s = p_s + dt_s;
+            let free_phase = np_s - (np_s >= 1.0) as u32 as f32;
+            self.phase[v] = free_phase * (1.0 - reset) + post_phase * reset;
         }
     }
 
     /// Phase-mod-only specialisation of [`process_pair`](Self::process_pair).
-    /// With sync statically off the slave is a plain free-running oscillator (its
-    /// output is the PM source), so the entire sub-sample reset apparatus — the
-    /// `frac` solve, the `delta` (two extra [`naive_osc`]), the two [`pblep`]
+    /// With sync statically off the modulator is a plain free-running oscillator
+    /// (its output is the PM source), so the entire sub-sample reset apparatus —
+    /// the `frac` solve, the `delta` (two extra [`naive_osc`]), the two [`pblep`]
     /// residuals — collapses to nothing and is dropped. That dead-but-computed
     /// work was ~half the combined kernel's cost (see `busy_profile`), so PM
     /// patches roughly halve their oscillator time.
     ///
     /// Bit-identical to the combined kernel in steady PM state: there `sync == 0`
-    /// forces `reset == 0`, so `sync_pending` reads 0 and the slave emits its free
-    /// value. The one stored `sync_pending = 0` keeps a later switch back to sync
+    /// forces `reset == 0`, so `sync_pending` reads 0 and the carrier emits its
+    /// free value. The one stored `sync_pending = 0` (on the carrier — `self`
+    /// is the slave when sync is engaged) keeps a later switch back to sync
     /// clean (a fresh note resets the rest via [`reset`](Self::reset)).
+    ///
+    /// Convention (see [`process_pair`](Self::process_pair)): `self` is osc1 =
+    /// carrier (PM target); `other` is osc2 = modulator (PM source).
     #[inline]
     #[allow(clippy::too_many_arguments)]
     pub fn process_pm(
         &mut self,
-        slave: &mut PolyOscillator,
+        other: &mut PolyOscillator,
         pm_index: f32,
         wave1: Waveform,
         wave2: Waveform,
@@ -494,16 +534,17 @@ impl PolyOscillator {
         o1: &mut [f32; N],
         o2: &mut [f32; N],
     ) {
-        with_wave!(wave1, M => with_wave!(wave2, S => {
-            self.process_pm_w::<M, S>(slave, pm_index, pw1, pw2, o1, o2)
+        with_wave!(wave1, W1 => with_wave!(wave2, W2 => {
+            self.process_pm_w::<W1, W2>(other, pm_index, pw1, pw2, o1, o2)
         }))
     }
 
-    /// Monomorphised PM lane loop for master waveform `M`, slave waveform `S`.
+    /// Monomorphised PM lane loop. `W1` is the osc1 (carrier) waveform, `W2`
+    /// is the osc2 (modulator) waveform.
     #[inline(always)]
-    fn process_pm_w<M: WaveKind, S: WaveKind>(
+    fn process_pm_w<W1: WaveKind, W2: WaveKind>(
         &mut self,
-        slave: &mut PolyOscillator,
+        other: &mut PolyOscillator,
         pm_index: f32,
         pw1: &[f32; N],
         pw2: &[f32; N],
@@ -511,29 +552,66 @@ impl PolyOscillator {
         o2: &mut [f32; N],
     ) {
         for v in 0..N {
-            let dt2 = slave.inc[v];
-            let p2 = slave.phase[v];
+            let dt_m = other.inc[v];
+            let p_m = other.phase[v];
 
-            // osc2 (slave): free-running PM source. No sync ⇒ no deferred reset;
-            // clear any `sync_pending` a prior sync block left so a later switch
-            // back to sync starts clean.
-            let s2 = S::sample(p2, pw2[v], dt2);
-            o2[v] = s2;
-            slave.sync_pending[v] = 0.0;
-            let np2 = p2 + dt2;
-            slave.phase[v] = np2 - (np2 >= 1.0) as u32 as f32;
+            // osc2 (modulator): free-running PM source.
+            let s_m = W2::sample(p_m, pw2[v], dt_m);
+            o2[v] = s_m;
+            let np_m = p_m + dt_m;
+            let wrapped_m = (np_m >= 1.0) as u32 as f32;
+            other.phase[v] = np_m - wrapped_m;
+            other.sub_flipflop[v] += wrapped_m - 2.0 * other.sub_flipflop[v] * wrapped_m;
 
-            // osc1 (master): through-zero phase mod. The accumulator advances at
-            // the base increment; the slave offsets only the read, which wraps
-            // two-sided so it can run backward through zero.
-            let inc1 = self.inc[v];
+            // osc1 (carrier): through-zero phase mod. The accumulator advances at
+            // the base increment; the modulator offsets only the read, which wraps
+            // two-sided so it can run backward through zero. Clear any
+            // `sync_pending` left on the carrier by a prior sync block so a later
+            // switch back to sync starts clean. The sub-osc flipflop tracks the
+            // carrier's accumulator wrap (PM doesn't modulate it), so sub
+            // frequency stays at `osc1_accumulator / 2` regardless of `pm_index`.
+            let p_s = self.phase[v];
+            let inc_c = self.inc[v];
             let read = {
-                let x = self.phase[v] + pm_index * s2;
+                let x = p_s + pm_index * s_m;
                 x - x.floor()
             };
-            o1[v] = M::sample(read, pw1[v], inc1);
-            self.phase[v] = advance(self.phase[v], inc1);
+            o1[v] = W1::sample(read, pw1[v], inc_c);
+            self.sync_pending[v] = 0.0;
+            let np_s = p_s + inc_c;
+            let wrapped_s = (np_s >= 1.0) as u32 as f32;
+            self.phase[v] = np_s - wrapped_s;
+            self.sub_flipflop[v] += wrapped_s - 2.0 * self.sub_flipflop[v] * wrapped_s;
         }
+    }
+}
+
+// ── Sub-osc (Juno-style square one octave below the source) ────────────────
+
+/// Band-limited square at half the source frequency, phase-locked to the
+/// source via a flipflop toggled on each source wrap. `phase`/`inc` are the
+/// source oscillator's (osc1's accumulator on Off/Ring/PM, osc2's master on
+/// Sync); `flip` is the per-voice flipflop the source's kernel toggles. The
+/// sub phase is `source_phase/2 + flip·½` and the increment is `source_inc/2`,
+/// so two source wraps make one full sub cycle (sub period = 2× source).
+/// PolyBLEP is applied on both the sub's wrap and the half-cycle duty edge.
+/// Branchless, vectorising.
+#[inline]
+pub fn poly_sub_square(
+    phase: &[f32; N],
+    inc: &[f32; N],
+    flip: &[f32; N],
+    out: &mut [f32; N],
+) {
+    for v in 0..N {
+        let sp = phase[v] * 0.5 + flip[v] * 0.5;
+        let sdt = inc[v] * 0.5;
+        let naive = 1.0 - 2.0 * (sp >= 0.5) as u32 as f32;
+        let pf = {
+            let x = sp - 0.5 + 1.0;
+            x - x.floor()
+        };
+        out[v] = naive + pblep(sp, sdt) - pblep(pf, sdt);
     }
 }
 
@@ -568,7 +646,7 @@ fn ring_diode_block(x: f32, gain: f32) -> f32 {
 /// `out[v] = diode_block(o1 + ½·o2) − diode_block(o1 − ½·o2)`. Zero on either
 /// input ⇒ ~silence (a zero carrier makes the two blocks equal; the block is
 /// even, so a zero signal does too). `gain` is the diode operating point. The
-/// caller scales the result by `RingLevel` and sums it into the mixer.
+/// caller mixes the result into the osc1 slot when `CrossModType::Ring` is on.
 #[inline]
 pub fn poly_ring_mod(o1: &[f32; N], o2: &[f32; N], gain: f32, out: &mut [f32; N]) {
     for v in 0..N {
@@ -938,15 +1016,16 @@ mod tests {
 
     #[test]
     fn synced_slave_locks_to_master_period() {
-        // Master at a power-of-two sample period (512, so 1/512 is exact in f32
-        // and the master wrap fraction repeats bit-exactly); slave tuned well
-        // above and not a divisor of it. With sync, the slave resets at every
-        // master wrap, so its output is exactly periodic at the master's period.
+        // Master (osc2) at a power-of-two sample period (512, so 1/512 is exact
+        // in f32 and the master wrap fraction repeats bit-exactly); slave (osc1)
+        // tuned well above and not a divisor of it. With sync, the slave resets
+        // at every master wrap, so its output is exactly periodic at the master's
+        // period.
         let period = 512usize;
         let mut osc1 = PolyOscillator::new();
         let mut osc2 = PolyOscillator::new();
-        osc1.inc[0] = 1.0 / period as f32;
-        osc2.inc[0] = 1.0 / 63.0; // ~7.6× master, non-divisor
+        osc1.inc[0] = 1.0 / 63.0; // slave: ~7.6× master, non-divisor
+        osc2.inc[0] = 1.0 / period as f32; // master
         let pw = [0.5; N];
         let (mut o1, mut o2) = ([0.0; N], [0.0; N]);
 
@@ -957,15 +1036,15 @@ mod tests {
                 &mut osc2,
                 true,
                 0.0,
-                Waveform::Saw,
-                Waveform::Sine,
+                Waveform::Sine, // osc1 (slave/carrier — audible)
+                Waveform::Saw,  // osc2 (master)
                 &pw,
                 &pw,
                 &mut o1,
                 &mut o2,
             );
             if i >= period {
-                log.push(o2[0]);
+                log.push(o1[0]); // slave output is the audible sync sound
             }
         }
         // Slave output repeats with the master's period (sync lock).
@@ -999,32 +1078,33 @@ mod tests {
         // Old sample-accurate path: hard reset to 0 on the master wrap, no
         // residual. Mirrors the pre-0020 `process_pair` slave handling.
         fn process_naive(
-            master: &mut PolyOscillator,
             slave: &mut PolyOscillator,
-            o2: &mut [f32; N],
+            master: &mut PolyOscillator,
+            o_s: &mut [f32; N],
         ) {
             for v in 0..N {
-                o2[v] = osc_sample(Waveform::Saw, slave.phase[v], 0.5, slave.inc[v]);
-                let np1 = master.phase[v] + master.inc[v];
-                let wrapped = (np1 >= 1.0) as u32 as f32;
-                master.phase[v] = np1 - wrapped;
-                let np2 = slave.phase[v] + slave.inc[v];
-                slave.phase[v] = (np2 - (np2 >= 1.0) as u32 as f32) * (1.0 - wrapped);
+                o_s[v] = osc_sample(Waveform::Saw, slave.phase[v], 0.5, slave.inc[v]);
+                let np_m = master.phase[v] + master.inc[v];
+                let wrapped = (np_m >= 1.0) as u32 as f32;
+                master.phase[v] = np_m - wrapped;
+                let np_s = slave.phase[v] + slave.inc[v];
+                slave.phase[v] = (np_s - (np_s >= 1.0) as u32 as f32) * (1.0 - wrapped);
             }
         }
 
         fn render(subsample: bool, f_master: f32, f_slave: f32) -> Vec<f32> {
-            let mut m = PolyOscillator::new();
-            let mut s = PolyOscillator::new();
-            m.inc[0] = f_master / SR;
-            s.inc[0] = f_slave / SR;
+            // osc1 = slave/carrier (audible), osc2 = master.
+            let mut slave = PolyOscillator::new();
+            let mut master = PolyOscillator::new();
+            slave.inc[0] = f_slave / SR;
+            master.inc[0] = f_master / SR;
             let pw = [0.5; N];
             let (mut o1, mut o2) = ([0.0; N], [0.0; N]);
             // Warm up past the initial transient, then capture one window.
             for _ in 0..NFFT {
                 if subsample {
-                    m.process_pair(
-                        &mut s,
+                    slave.process_pair(
+                        &mut master,
                         true,
                         0.0,
                         Waveform::Saw,
@@ -1035,14 +1115,14 @@ mod tests {
                         &mut o2,
                     );
                 } else {
-                    process_naive(&mut m, &mut s, &mut o2);
+                    process_naive(&mut slave, &mut master, &mut o1);
                 }
             }
             let mut out = Vec::with_capacity(NFFT);
             for _ in 0..NFFT {
                 if subsample {
-                    m.process_pair(
-                        &mut s,
+                    slave.process_pair(
+                        &mut master,
                         true,
                         0.0,
                         Waveform::Saw,
@@ -1053,9 +1133,9 @@ mod tests {
                         &mut o2,
                     );
                 } else {
-                    process_naive(&mut m, &mut s, &mut o2);
+                    process_naive(&mut slave, &mut master, &mut o1);
                 }
-                out.push(o2[0]);
+                out.push(o1[0]); // slave output is the audible sync sound
             }
             out
         }
@@ -1104,14 +1184,15 @@ mod tests {
     fn synced_pair_all_lanes_finite() {
         // Mixed waveforms, varied tunings, and a frozen (inc = 0) lane: the
         // coupled path must stay finite, including the masked phase reset.
+        // osc1 = slave/carrier (high freq), osc2 = master (low freq).
         let mut osc1 = PolyOscillator::new();
         let mut osc2 = PolyOscillator::new();
         for v in 0..N {
-            osc1.inc[v] = (40.0 + v as f32 * 30.0) / 48_000.0;
-            osc2.inc[v] = (300.0 + v as f32 * 90.0) / 48_000.0;
+            osc1.inc[v] = (300.0 + v as f32 * 90.0) / 48_000.0; // slave/carrier
+            osc2.inc[v] = (40.0 + v as f32 * 30.0) / 48_000.0; // master
         }
-        osc1.inc[3] = 0.0; // frozen master lane
-        osc2.inc[5] = 0.0; // frozen slave lane
+        osc1.inc[3] = 0.0; // frozen slave lane
+        osc2.inc[5] = 0.0; // frozen master lane
         let pw = [0.5; N];
         let (mut o1, mut o2) = ([0.0; N], [0.0; N]);
         for (w1, w2) in [
@@ -1251,6 +1332,252 @@ mod tests {
             out.iter().all(|y| y.abs() > 1e-4),
             "expected nonzero output"
         );
+    }
+
+    /// Naive DFT magnitude at a single bin (used by the sub-osc pitch tests —
+    /// avoids pulling in a full FFT for a few hundred samples).
+    fn dft_mag(x: &[f32], k: usize) -> f64 {
+        let n = x.len();
+        let w = std::f64::consts::TAU * k as f64 / n as f64;
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        for (i, &s) in x.iter().enumerate() {
+            let ph = w * i as f64;
+            re += s as f64 * ph.cos();
+            im -= s as f64 * ph.sin();
+        }
+        (re * re + im * im).sqrt()
+    }
+
+    /// Bin with the largest magnitude (excluding DC).
+    fn peak_bin(x: &[f32]) -> usize {
+        let n = x.len();
+        let (mut best_k, mut best) = (0usize, 0.0f64);
+        for k in 1..n / 2 {
+            let m = dft_mag(x, k);
+            if m > best {
+                best = m;
+                best_k = k;
+            }
+        }
+        best_k
+    }
+
+    #[test]
+    fn poly_sub_square_matches_scalar_within_tolerance() {
+        // Mirror `poly_saw_matches_scalar_within_tolerance`: drive lane 0 of a
+        // PolyOscillator on the saw fast path; the same flipflop-toggle and
+        // half-rate comparator built scalar-side must track within 1e-5.
+        for f_hz in [220.0_f32, 750.0, 1234.0] {
+            let inc = f_hz / 48_000.0;
+            let mut poly = PolyOscillator::new();
+            poly.inc[0] = inc;
+            let mut sp_ref = 0.0f32;
+            let mut flip_ref = 0.0f32;
+            let pw = [0.5; N];
+            let mut osc_out = [0.0; N];
+            let mut sub_out = [0.0; N];
+            let mut max_diff = 0.0f32;
+            for _ in 0..4800 {
+                poly.process(Waveform::Saw, &pw, &mut osc_out);
+                poly_sub_square(&poly.phase, &poly.inc, &poly.sub_flipflop, &mut sub_out);
+                // Advance scalar source identically (emit-then-advance order).
+                let np = sp_ref + inc;
+                let wrapped = (np >= 1.0) as u32 as f32;
+                sp_ref = np - wrapped;
+                flip_ref += wrapped - 2.0 * flip_ref * wrapped;
+                // Compute scalar sub at the post-advance state (matches kernel).
+                let sp = sp_ref * 0.5 + flip_ref * 0.5;
+                let sdt = inc * 0.5;
+                let naive = 1.0 - 2.0 * (sp >= 0.5) as u32 as f32;
+                let pf = {
+                    let x = sp - 0.5 + 1.0;
+                    x - x.floor()
+                };
+                let want = naive + pblep(sp, sdt) - pblep(pf, sdt);
+                max_diff = max_diff.max((sub_out[0] - want).abs());
+            }
+            assert!(max_diff < 1e-5, "f={f_hz}: diff {max_diff}");
+        }
+    }
+
+    #[test]
+    fn sub_pitch_off_is_source_half() {
+        // Off / Ring path uses `process`; sub frequency = osc1 / 2.
+        const SR: f32 = 48_000.0;
+        const NFFT: usize = 1024;
+        const K: usize = 32; // even → K/2 integer; f_src = 1500 Hz, sub = 750 Hz
+        let f_src = K as f32 * SR / NFFT as f32;
+        let mut osc = PolyOscillator::new();
+        osc.inc[0] = f_src / SR;
+        let pw = [0.5; N];
+        let mut o = [0.0; N];
+        let mut sub = [0.0; N];
+        for _ in 0..NFFT {
+            osc.process(Waveform::Sine, &pw, &mut o);
+        }
+        let mut buf = Vec::with_capacity(NFFT);
+        for _ in 0..NFFT {
+            osc.process(Waveform::Sine, &pw, &mut o);
+            poly_sub_square(&osc.phase, &osc.inc, &osc.sub_flipflop, &mut sub);
+            buf.push(sub[0]);
+        }
+        assert_eq!(peak_bin(&buf), K / 2, "sub fundamental not at source/2");
+    }
+
+    #[test]
+    fn sub_pitch_under_pm_independent_of_amount() {
+        // FM path uses `process_pm`; PM offsets only the read phase, not the
+        // accumulator that drives the flipflop, so sub pitch is constant
+        // regardless of `pm_index`.
+        const SR: f32 = 48_000.0;
+        const NFFT: usize = 1024;
+        const K: usize = 32;
+        let f1 = K as f32 * SR / NFFT as f32;
+        let f2 = f1 * 1.618_034; // inharmonic — keeps modulator out of K/2
+        let pw = [0.5; N];
+        for amt in [0.0_f32, 0.5, 1.5, 3.0] {
+            let mut o1 = PolyOscillator::new();
+            let mut o2 = PolyOscillator::new();
+            o1.inc[0] = f1 / SR;
+            o2.inc[0] = f2 / SR;
+            let mut a = [0.0; N];
+            let mut b = [0.0; N];
+            let mut sub = [0.0; N];
+            for _ in 0..NFFT {
+                o1.process_pm(
+                    &mut o2,
+                    amt,
+                    Waveform::Sine,
+                    Waveform::Sine,
+                    &pw,
+                    &pw,
+                    &mut a,
+                    &mut b,
+                );
+            }
+            let mut buf = Vec::with_capacity(NFFT);
+            for _ in 0..NFFT {
+                o1.process_pm(
+                    &mut o2,
+                    amt,
+                    Waveform::Sine,
+                    Waveform::Sine,
+                    &pw,
+                    &pw,
+                    &mut a,
+                    &mut b,
+                );
+                poly_sub_square(&o1.phase, &o1.inc, &o1.sub_flipflop, &mut sub);
+                buf.push(sub[0]);
+            }
+            assert_eq!(peak_bin(&buf), K / 2, "amt {amt}: sub pitch moved");
+        }
+    }
+
+    #[test]
+    fn sub_pitch_under_sync_locks_to_master_half() {
+        // Sync path uses `process_sync`; the flipflop toggles on osc2 (master)
+        // wraps, and the sub is read using osc2's phase/inc. Sub pitch = osc2/2,
+        // independent of osc1's tuning above master.
+        const SR: f32 = 48_000.0;
+        const NFFT: usize = 1024;
+        const K_M: usize = 32;
+        let f_m = K_M as f32 * SR / NFFT as f32;
+        let pw = [0.5; N];
+        for ratio in [1.5_f32, 2.5, 3.7] {
+            let f_s = f_m * ratio;
+            let mut o1 = PolyOscillator::new();
+            let mut o2 = PolyOscillator::new();
+            o1.inc[0] = f_s / SR;
+            o2.inc[0] = f_m / SR;
+            let mut a = [0.0; N];
+            let mut b = [0.0; N];
+            let mut sub = [0.0; N];
+            for _ in 0..NFFT {
+                o1.process_sync(
+                    &mut o2,
+                    Waveform::Saw,
+                    Waveform::Saw,
+                    &pw,
+                    &pw,
+                    &mut a,
+                    &mut b,
+                );
+            }
+            let mut buf = Vec::with_capacity(NFFT);
+            for _ in 0..NFFT {
+                o1.process_sync(
+                    &mut o2,
+                    Waveform::Saw,
+                    Waveform::Saw,
+                    &pw,
+                    &pw,
+                    &mut a,
+                    &mut b,
+                );
+                // Engine routes osc2 phase/inc into the sub under sync; the
+                // flipflop lives on osc1 in all modes.
+                poly_sub_square(&o2.phase, &o2.inc, &o1.sub_flipflop, &mut sub);
+                buf.push(sub[0]);
+            }
+            assert_eq!(peak_bin(&buf), K_M / 2, "ratio {ratio}: sub not locked");
+        }
+    }
+
+    #[test]
+    fn sub_square_polyblep_beats_naive_aliasing() {
+        // BLEP-smoothed sub has materially less high-band energy than the bare
+        // comparator at the same flipflop pattern (mirrors the methodology of
+        // `subsample_sync_beats_sample_accurate_aliasing`, scoped to the sub).
+        const SR: f32 = 48_000.0;
+        const NFFT: usize = 4096;
+        let f_src = 1234.5_f32; // not bin-aligned, transitions land off-grid
+        let mut osc = PolyOscillator::new();
+        osc.inc[0] = f_src / SR;
+        let pw = [0.5; N];
+        let mut o = [0.0; N];
+        let mut sub = [0.0; N];
+        for _ in 0..NFFT {
+            osc.process(Waveform::Sine, &pw, &mut o);
+        }
+        let mut blep = Vec::with_capacity(NFFT);
+        let mut naive = Vec::with_capacity(NFFT);
+        for _ in 0..NFFT {
+            osc.process(Waveform::Sine, &pw, &mut o);
+            poly_sub_square(&osc.phase, &osc.inc, &osc.sub_flipflop, &mut sub);
+            blep.push(sub[0]);
+            // Bare comparator — same flipflop, no BLEP residual.
+            let sp = osc.phase[0] * 0.5 + osc.sub_flipflop[0] * 0.5;
+            naive.push(1.0 - 2.0 * (sp >= 0.5) as u32 as f32);
+        }
+        let band = |x: &[f32]| -> f64 {
+            (3 * NFFT / 8..NFFT / 2).map(|k| dft_mag(x, k)).sum()
+        };
+        let blep_hi = band(&blep);
+        let naive_hi = band(&naive);
+        assert!(
+            blep.iter().all(|v| v.is_finite()),
+            "non-finite sub samples"
+        );
+        assert!(
+            naive_hi > blep_hi * 1.4,
+            "BLEP didn't beat naive (blep {blep_hi}, naive {naive_hi})"
+        );
+    }
+
+    #[test]
+    fn sub_no_op_with_zero_inc_stays_finite() {
+        // Frozen lane (inc = 0): no wraps, flipflop never toggles, sub stays
+        // at the comparator's resting value (+1 since sp = 0 < 0.5).
+        let mut osc = PolyOscillator::new();
+        let pw = [0.5; N];
+        let mut o = [0.0; N];
+        let mut sub = [0.0; N];
+        for _ in 0..200 {
+            osc.process(Waveform::Pulse, &pw, &mut o);
+            poly_sub_square(&osc.phase, &osc.inc, &osc.sub_flipflop, &mut sub);
+            assert!(sub.iter().all(|s| s.is_finite()));
+        }
     }
 
     #[test]
